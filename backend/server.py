@@ -858,6 +858,13 @@ async def get_specialities():
             "Sherwani", "Alteration", "Dress", "Salwar Kameez", "Anarkali"]
 
 
+@api_router.get("/cities")
+async def get_cities():
+    """Get list of cities where tailors are available"""
+    cities = await db.users.distinct("city", {"role": "tailor", "status": "active", "city": {"$ne": ""}})
+    return sorted(cities)
+
+
 # ===================== SETUP =====================
 
 app.include_router(api_router)
