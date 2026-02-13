@@ -8,6 +8,9 @@ export type User = {
   email: string;
   phone: string;
   role: string;
+  city: string;
+  pincode: string;
+  address: string;
   location: string;
   rating: number;
   rating_count: number;
