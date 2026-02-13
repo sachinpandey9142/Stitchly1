@@ -218,6 +218,8 @@ async def list_tailors(
     min_rating: Optional[float] = None,
     max_price: Optional[float] = None,
     location: Optional[str] = None,
+    city: Optional[str] = None,
+    pincode: Optional[str] = None,
     search: Optional[str] = None,
 ):
     query = {"role": "tailor", "status": "active"}
@@ -225,13 +227,25 @@ async def list_tailors(
         query["specialities"] = {"$in": [specialty]}
     if min_rating:
         query["rating"] = {"$gte": min_rating}
-    if location:
-        query["location"] = {"$regex": location, "$options": "i"}
-    if search:
+    if city:
+        query["city"] = {"$regex": f"^{city}$", "$options": "i"}
+    elif pincode:
+        query["pincode"] = pincode
+    elif location:
         query["$or"] = [
-            {"name": {"$regex": search, "$options": "i"}},
-            {"specialities": {"$in": [search]}},
+            {"city": {"$regex": location, "$options": "i"}},
+            {"pincode": {"$regex": location, "$options": "i"}},
+            {"location": {"$regex": location, "$options": "i"}},
         ]
+    if search:
+        search_cond = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"specialities": {"$elemMatch": {"$regex": search, "$options": "i"}}},
+        ]
+        if "$or" in query:
+            query["$and"] = [{"$or": query.pop("$or")}, {"$or": search_cond}]
+        else:
+            query["$or"] = search_cond
 
     tailors = await db.users.find(query, {"_id": 0, "password_hash": 0}).to_list(100)
     for tailor in tailors:
