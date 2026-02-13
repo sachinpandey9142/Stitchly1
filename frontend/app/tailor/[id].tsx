@@ -39,8 +39,9 @@ export default function TailorDetail() {
             <Text style={styles.ratingCount}>({tailor.rating_count} reviews)</Text>
           </View>
           <View style={styles.metaRow}>
-            <Feather name="map-pin" size={14} color={Colors.textMuted} /><Text style={styles.metaText}>{tailor.location || 'N/A'}</Text>
+            <Feather name="map-pin" size={14} color={Colors.primary} /><Text style={styles.metaTextBold}>{tailor.city}{tailor.pincode ? `, ${tailor.pincode}` : ''}</Text>
           </View>
+          {tailor.address ? <View style={styles.metaRow}><Feather name="home" size={14} color={Colors.textMuted} /><Text style={styles.metaText}>{tailor.address}</Text></View> : null}
           <View style={styles.metaRow}>
             <Feather name="clock" size={14} color={Colors.textMuted} /><Text style={styles.metaText}>{tailor.experience || 'Experience not listed'}</Text>
           </View>
