@@ -736,15 +736,20 @@ async def seed_data():
         tailors.append(tailor)
 
     customer_data = [
-        {"name": "Anita Desai", "email": "anita@test.com", "phone": "9800000001", "location": "Mumbai, Maharashtra"},
-        {"name": "Rahul Verma", "email": "rahul@test.com", "phone": "9800000002", "location": "Delhi, NCR"},
+        {"name": "Anita Desai", "email": "anita@test.com", "phone": "9800000001",
+         "city": "Mumbai", "pincode": "400001", "address": "123 Marine Drive, Mumbai",
+         "location": "Mumbai, 400001"},
+        {"name": "Rahul Verma", "email": "rahul@test.com", "phone": "9800000002",
+         "city": "Delhi", "pincode": "110001", "address": "56 Connaught Place, Delhi",
+         "location": "Delhi, 110001"},
     ]
     customers = []
     for cd in customer_data:
         customer = {
             "id": str(uuid.uuid4()), "name": cd["name"], "email": cd["email"],
             "phone": cd["phone"], "password_hash": hash_password("customer123"),
-            "role": "customer", "location": cd["location"], "rating": 0.0,
+            "role": "customer", "city": cd["city"], "pincode": cd["pincode"],
+            "address": cd["address"], "location": cd["location"], "rating": 0.0,
             "rating_count": 0, "status": "active", "specialities": [],
             "experience": "", "working_hours": {}, "profile_photo": "",
             "created_at": datetime.now(timezone.utc).isoformat()
@@ -754,13 +759,25 @@ async def seed_data():
     delivery = {
         "id": str(uuid.uuid4()), "name": "Suresh Driver", "email": "suresh@stitchly.com",
         "phone": "9800000003", "password_hash": hash_password("delivery123"),
-        "role": "delivery", "location": "Mumbai, Maharashtra", "rating": 4.2,
+        "role": "delivery", "city": "Mumbai", "pincode": "400001",
+        "address": "Andheri East, Mumbai", "location": "Mumbai, 400001",
+        "rating": 4.2,
         "rating_count": 45, "status": "active", "specialities": [],
         "experience": "", "working_hours": {}, "profile_photo": "",
         "created_at": datetime.now(timezone.utc).isoformat()
     }
 
-    all_users = [admin] + tailors + customers + [delivery]
+    delivery2 = {
+        "id": str(uuid.uuid4()), "name": "Amit Courier", "email": "amit@stitchly.com",
+        "phone": "9800000004", "password_hash": hash_password("delivery123"),
+        "role": "delivery", "city": "Delhi", "pincode": "110001",
+        "address": "Karol Bagh, Delhi", "location": "Delhi, 110001",
+        "rating": 4.0, "rating_count": 22, "status": "active", "specialities": [],
+        "experience": "", "working_hours": {}, "profile_photo": "",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    all_users = [admin] + tailors + customers + [delivery, delivery2]
     await db.users.insert_many(all_users)
 
     service_data = [
