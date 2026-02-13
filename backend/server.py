@@ -697,20 +697,25 @@ async def seed_data():
     admin = {
         "id": str(uuid.uuid4()), "name": "Admin", "email": "admin@stitchly.com",
         "phone": "9999999999", "password_hash": hash_password("admin123"),
-        "role": "admin", "location": "Mumbai", "rating": 0.0, "rating_count": 0,
+        "role": "admin", "city": "Mumbai", "pincode": "400001",
+        "address": "Stitchly HQ, BKC, Mumbai", "location": "Mumbai, 400001",
+        "rating": 0.0, "rating_count": 0,
         "status": "active", "specialities": [], "experience": "",
         "working_hours": {}, "profile_photo": "", "created_at": datetime.now(timezone.utc).isoformat()
     }
 
     tailor_data = [
         {"name": "Ravi Kumar", "email": "ravi@stitchly.com", "phone": "9876543210",
-         "location": "Mumbai, Maharashtra", "specialities": ["Blouse", "Lehenga", "Saree Draping"],
+         "city": "Mumbai", "pincode": "400001", "address": "Shop 12, Crawford Market, Mumbai",
+         "location": "Mumbai, 400001", "specialities": ["Blouse", "Lehenga", "Saree Draping"],
          "experience": "15 years", "rating": 4.8, "rating_count": 124},
         {"name": "Priya Sharma", "email": "priya@stitchly.com", "phone": "9876543211",
-         "location": "Delhi, NCR", "specialities": ["Men's Suit", "Kurta", "Sherwani"],
+         "city": "Delhi", "pincode": "110001", "address": "45 Chandni Chowk, Old Delhi",
+         "location": "Delhi, 110001", "specialities": ["Men's Suit", "Kurta", "Sherwani"],
          "experience": "10 years", "rating": 4.5, "rating_count": 89},
         {"name": "Mohammed Iqbal", "email": "iqbal@stitchly.com", "phone": "9876543212",
-         "location": "Mumbai, Maharashtra", "specialities": ["Alteration", "Blouse", "Dress"],
+         "city": "Mumbai", "pincode": "400050", "address": "Bandra West, Linking Road, Mumbai",
+         "location": "Mumbai, 400050", "specialities": ["Alteration", "Blouse", "Dress"],
          "experience": "8 years", "rating": 4.6, "rating_count": 56},
     ]
     tailors = []
@@ -718,7 +723,9 @@ async def seed_data():
         tailor = {
             "id": str(uuid.uuid4()), "name": td["name"], "email": td["email"],
             "phone": td["phone"], "password_hash": hash_password("tailor123"),
-            "role": "tailor", "location": td["location"], "rating": td["rating"],
+            "role": "tailor", "city": td["city"], "pincode": td["pincode"],
+            "address": td["address"], "location": td["location"],
+            "rating": td["rating"],
             "rating_count": td["rating_count"], "status": "active",
             "specialities": td["specialities"], "experience": td["experience"],
             "working_hours": {"monday": "9:00-18:00", "tuesday": "9:00-18:00",
