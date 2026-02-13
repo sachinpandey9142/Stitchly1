@@ -42,6 +42,9 @@ class UserRegister(BaseModel):
     phone: str
     password: str
     role: str
+    city: str = ""
+    pincode: str = ""
+    address: str = ""
 
 class UserLogin(BaseModel):
     email: str
@@ -51,6 +54,9 @@ class UserProfileUpdate(BaseModel):
     name: Optional[str] = None
     phone: Optional[str] = None
     location: Optional[str] = None
+    city: Optional[str] = None
+    pincode: Optional[str] = None
+    address: Optional[str] = None
     experience: Optional[str] = None
     profile_photo: Optional[str] = None
     specialities: Optional[List[str]] = None
