@@ -1,12 +1,15 @@
 """Stitchly Backend API - 3-Sided Tailoring Marketplace"""
 
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Body, Query
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Body, Query, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import HTMLResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 import uuid
+import hmac
+import hashlib
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -14,6 +17,7 @@ from datetime import datetime, timezone
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import razorpay
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -23,6 +27,10 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALGORITHM = "HS256"
+
+RAZORPAY_KEY_ID = os.environ['RAZORPAY_KEY_ID']
+RAZORPAY_KEY_SECRET = os.environ['RAZORPAY_KEY_SECRET']
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
