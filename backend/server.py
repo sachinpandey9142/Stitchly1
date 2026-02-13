@@ -199,6 +199,11 @@ async def get_me(user=Depends(get_current_user)):
 @api_router.put("/auth/profile")
 async def update_profile(data: UserProfileUpdate, user=Depends(get_current_user)):
     update = {k: v for k, v in data.dict(exclude_unset=True).items() if v is not None}
+    # Auto-compute location from city + pincode if provided
+    if "city" in update or "pincode" in update:
+        city = update.get("city", user.get("city", ""))
+        pincode = update.get("pincode", user.get("pincode", ""))
+        update["location"] = f"{city}, {pincode}".strip(", ") if city or pincode else ""
     if update:
         await db.users.update_one({"id": user["id"]}, {"$set": update})
     updated = await db.users.find_one({"id": user["id"]}, {"_id": 0, "password_hash": 0})
