@@ -890,6 +890,9 @@ async def startup():
     await db.reviews.create_index("id", unique=True)
     await db.reviews.create_index("tailor_id")
     await db.withdrawals.create_index("id", unique=True)
+    await db.users.create_index("city")
+    await db.users.create_index("pincode")
+    await db.users.create_index([("role", 1), ("city", 1), ("status", 1)])
     logger.info("Stitchly API started - indexes created")
 
 @app.on_event("shutdown")
