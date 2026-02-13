@@ -36,14 +36,24 @@ export default function CustomerProfile() {
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Account Details</Text>
           <View style={styles.infoRow}>
+            <Feather name="map-pin" size={18} color={Colors.primary} />
+            <Text style={styles.infoLabel}>City</Text>
+            <Text style={styles.infoValue}>{user?.city || 'Not set'}</Text>
+          </View>
+          <View style={styles.infoRow}>
+            <Feather name="hash" size={18} color={Colors.textMuted} />
+            <Text style={styles.infoLabel}>Pincode</Text>
+            <Text style={styles.infoValue}>{user?.pincode || 'Not set'}</Text>
+          </View>
+          <View style={styles.infoRow}>
+            <Feather name="home" size={18} color={Colors.textMuted} />
+            <Text style={styles.infoLabel}>Address</Text>
+            <Text style={styles.infoValue}>{user?.address || 'Not set'}</Text>
+          </View>
+          <View style={styles.infoRow}>
             <Feather name="phone" size={18} color={Colors.textMuted} />
             <Text style={styles.infoLabel}>Phone</Text>
             <Text style={styles.infoValue}>{user?.phone || 'Not set'}</Text>
-          </View>
-          <View style={styles.infoRow}>
-            <Feather name="map-pin" size={18} color={Colors.textMuted} />
-            <Text style={styles.infoLabel}>Location</Text>
-            <Text style={styles.infoValue}>{user?.location || 'Not set'}</Text>
           </View>
         </View>
 
