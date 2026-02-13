@@ -124,4 +124,6 @@ const styles = StyleSheet.create({
   priceValue: { fontFamily: Fonts.bodyBold, fontSize: 15, color: Colors.text },
   reviewBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: Colors.secondary, borderRadius: Radius.full, paddingVertical: 16, marginHorizontal: Spacing.containerPadding },
   reviewBtnText: { fontFamily: Fonts.bodyBold, fontSize: 16, color: Colors.textInverted, marginLeft: 8 },
+  payNowBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: Colors.primary, borderRadius: Radius.full, paddingVertical: 16, marginHorizontal: Spacing.containerPadding, marginBottom: 12, shadowColor: Colors.primary, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.2, shadowRadius: 8, elevation: 4 },
+  payNowBtnText: { fontFamily: Fonts.bodyBold, fontSize: 16, color: Colors.textInverted, marginLeft: 8 },
 });
