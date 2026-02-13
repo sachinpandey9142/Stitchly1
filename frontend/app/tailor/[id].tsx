@@ -110,6 +110,7 @@ const styles = StyleSheet.create({
   ratingCount: { fontFamily: Fonts.ui, fontSize: 14, color: Colors.textMuted, marginLeft: 4 },
   metaRow: { flexDirection: 'row', alignItems: 'center', marginTop: 8 },
   metaText: { fontFamily: Fonts.ui, fontSize: 14, color: Colors.textMuted, marginLeft: 6 },
+  metaTextBold: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.primary, marginLeft: 6 },
   tagRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 14 },
   tag: { backgroundColor: Colors.primary + '15', borderRadius: Radius.full, paddingHorizontal: 12, paddingVertical: 5 },
   tagText: { fontFamily: Fonts.body, fontSize: 13, color: Colors.primary },
