@@ -73,6 +73,26 @@ export default function OrderDetail() {
             <Feather name="star" size={20} color={Colors.textInverted} /><Text style={styles.reviewBtnText}>Write Review</Text>
           </TouchableOpacity>
         )}
+
+        {user?.role === 'customer' && order.payment_method === 'online' && order.payment_status !== 'completed' && order.status !== 'rejected' && (
+          <TouchableOpacity testID="pay-now-btn" style={styles.payNowBtn} onPress={async () => {
+            try {
+              await api.post('/payment/create-order', { order_id: order.id });
+              router.push(`/checkout?orderId=${order.id}`);
+            } catch (err: any) { Alert.alert('Error', err.message); }
+          }} activeOpacity={0.7}>
+            <Feather name="credit-card" size={20} color={Colors.textInverted} />
+            <Text style={styles.payNowBtnText}>Pay Now - {'\u20B9'}{order.price}</Text>
+          </TouchableOpacity>
+        )}
+
+        {order.razorpay_payment_id && (
+          <View style={[styles.section, { marginTop: 0 }]}>
+            <Text style={styles.sectionTitle}>Payment Details</Text>
+            <View style={styles.priceRow}><Text style={styles.priceLabel}>Payment ID</Text><Text style={[styles.priceValue, { fontSize: 12 }]}>{order.razorpay_payment_id}</Text></View>
+            <View style={styles.priceRow}><Text style={styles.priceLabel}>Commission</Text><Text style={styles.priceValue}>{'\u20B9'}{order.commission_amount}</Text></View>
+          </View>
+        )}
         <View style={{ height: 40 }} />
       </ScrollView>
     </SafeAreaView>
