@@ -27,6 +27,9 @@ type RegisterData = {
   phone: string;
   password: string;
   role: string;
+  city?: string;
+  pincode?: string;
+  address?: string;
 };
 
 type AuthContextType = {
