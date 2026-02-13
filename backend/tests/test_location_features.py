@@ -4,7 +4,7 @@ import requests
 import os
 import time
 
-BASE_URL = os.environ['EXPO_PUBLIC_BACKEND_URL'].rstrip('/')
+BASE_URL = os.environ.get('EXPO_PUBLIC_BACKEND_URL', os.environ.get('EXPO_BACKEND_URL', '')).rstrip('/')
 
 class TestLocationEndpoints:
     """Test location-based endpoints"""
