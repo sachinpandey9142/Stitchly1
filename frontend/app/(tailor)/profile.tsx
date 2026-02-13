@@ -51,7 +51,8 @@ export default function TailorProfile() {
           <View style={styles.avatar}><Text style={styles.avatarText}>{user?.name?.charAt(0)}</Text></View>
           <Text style={styles.userName}>{user?.name}</Text>
           <Text style={styles.userEmail}>{user?.email}</Text>
-          <View style={styles.infoRow}><Feather name="map-pin" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>{user?.location || 'Location not set'}</Text></View>
+          <View style={styles.infoRow}><Feather name="map-pin" size={14} color={Colors.primary} /><Text style={styles.infoText}>{user?.city}{user?.pincode ? `, ${user?.pincode}` : ''} {!user?.city && 'Location not set'}</Text></View>
+          {user?.address ? <View style={styles.infoRow}><Feather name="home" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>{user?.address}</Text></View> : null}
           <View style={styles.tagRow}>{user?.specialities?.map((s: string) => (<View key={s} style={styles.tag}><Text style={styles.tagText}>{s}</Text></View>))}</View>
         </View>
 
