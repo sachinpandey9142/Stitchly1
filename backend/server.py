@@ -146,6 +146,11 @@ async def register(data: UserRegister):
     if data.role not in ["customer", "tailor", "delivery"]:
         raise HTTPException(status_code=400, detail="Invalid role")
 
+    city_val = data.city.strip() if data.city else ""
+    pincode_val = data.pincode.strip() if data.pincode else ""
+    address_val = data.address.strip() if data.address else ""
+    location_str = f"{city_val}, {pincode_val}".strip(", ") if city_val or pincode_val else ""
+
     user = {
         "id": str(uuid.uuid4()),
         "name": data.name,
@@ -153,7 +158,10 @@ async def register(data: UserRegister):
         "phone": data.phone,
         "password_hash": hash_password(data.password),
         "role": data.role,
-        "location": "",
+        "city": city_val,
+        "pincode": pincode_val,
+        "address": address_val,
+        "location": location_str,
         "rating": 0.0,
         "rating_count": 0,
         "status": "pending" if data.role == "tailor" else "active",
