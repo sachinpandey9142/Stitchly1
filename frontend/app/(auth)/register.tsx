@@ -19,13 +19,20 @@ export default function Register() {
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
   const [password, setPassword] = useState('');
+  const [city, setCity] = useState('');
+  const [pincode, setPincode] = useState('');
+  const [address, setAddress] = useState('');
   const [role, setRole] = useState('customer');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
 
   const handleRegister = async () => {
     if (!name.trim() || !email.trim() || !phone.trim() || !password) {
-      Alert.alert('Error', 'Please fill in all fields');
+      Alert.alert('Error', 'Please fill in all required fields');
+      return;
+    }
+    if (!city.trim()) {
+      Alert.alert('Error', 'City is required for location-based services');
       return;
     }
     if (password.length < 6) {
@@ -34,7 +41,11 @@ export default function Register() {
     }
     setLoading(true);
     try {
-      const user = await register({ name: name.trim(), email: email.trim().toLowerCase(), phone: phone.trim(), password, role });
+      const user = await register({
+        name: name.trim(), email: email.trim().toLowerCase(),
+        phone: phone.trim(), password, role,
+        city: city.trim(), pincode: pincode.trim(), address: address.trim(),
+      } as any);
       if (user.role === 'customer') router.replace('/(customer)');
       else if (user.role === 'tailor') router.replace('/(tailor)');
       else if (user.role === 'delivery') router.replace('/(delivery)');
@@ -74,7 +85,7 @@ export default function Register() {
           </View>
 
           <View style={styles.inputGroup}>
-            <Text style={styles.label}>Full Name</Text>
+            <Text style={styles.label}>Full Name *</Text>
             <View style={styles.inputContainer}>
               <Feather name="user" size={20} color={Colors.textMuted} />
               <TextInput testID="register-name-input" style={styles.input} placeholder="Your full name" placeholderTextColor={Colors.textMuted} value={name} onChangeText={setName} />
@@ -82,7 +93,7 @@ export default function Register() {
           </View>
 
           <View style={styles.inputGroup}>
-            <Text style={styles.label}>Email</Text>
+            <Text style={styles.label}>Email *</Text>
             <View style={styles.inputContainer}>
               <Feather name="mail" size={20} color={Colors.textMuted} />
               <TextInput testID="register-email-input" style={styles.input} placeholder="your@email.com" placeholderTextColor={Colors.textMuted} value={email} onChangeText={setEmail} keyboardType="email-address" autoCapitalize="none" />
@@ -90,15 +101,44 @@ export default function Register() {
           </View>
 
           <View style={styles.inputGroup}>
-            <Text style={styles.label}>Phone Number</Text>
+            <Text style={styles.label}>Phone Number *</Text>
             <View style={styles.inputContainer}>
               <Feather name="phone" size={20} color={Colors.textMuted} />
               <TextInput testID="register-phone-input" style={styles.input} placeholder="9876543210" placeholderTextColor={Colors.textMuted} value={phone} onChangeText={setPhone} keyboardType="phone-pad" />
             </View>
           </View>
 
+          <View style={styles.locationSection}>
+            <Text style={styles.sectionLabel}>
+              <Feather name="map-pin" size={15} color={Colors.primary} />
+              {'  '}Your Location
+            </Text>
+            <View style={styles.locationRow}>
+              <View style={[styles.inputGroup, { flex: 2, marginRight: 8 }]}>
+                <Text style={styles.label}>City *</Text>
+                <View style={styles.inputContainer}>
+                  <TextInput testID="register-city-input" style={styles.inputNoPad} placeholder="e.g. Mumbai" placeholderTextColor={Colors.textMuted} value={city} onChangeText={setCity} />
+                </View>
+              </View>
+              <View style={[styles.inputGroup, { flex: 1 }]}>
+                <Text style={styles.label}>Pincode</Text>
+                <View style={styles.inputContainer}>
+                  <TextInput testID="register-pincode-input" style={styles.inputNoPad} placeholder="400001" placeholderTextColor={Colors.textMuted} value={pincode} onChangeText={setPincode} keyboardType="numeric" maxLength={6} />
+                </View>
+              </View>
+            </View>
+
+            <View style={styles.inputGroup}>
+              <Text style={styles.label}>Full Address</Text>
+              <View style={styles.inputContainer}>
+                <Feather name="map" size={20} color={Colors.textMuted} />
+                <TextInput testID="register-address-input" style={styles.input} placeholder="Street, area, landmark" placeholderTextColor={Colors.textMuted} value={address} onChangeText={setAddress} />
+              </View>
+            </View>
+          </View>
+
           <View style={styles.inputGroup}>
-            <Text style={styles.label}>Password</Text>
+            <Text style={styles.label}>Password *</Text>
             <View style={styles.inputContainer}>
               <Feather name="lock" size={20} color={Colors.textMuted} />
               <TextInput testID="register-password-input" style={styles.input} placeholder="Min 6 characters" placeholderTextColor={Colors.textMuted} value={password} onChangeText={setPassword} secureTextEntry={!showPassword} />
@@ -138,14 +178,17 @@ const styles = StyleSheet.create({
   roleLabel: { fontFamily: Fonts.bodyBold, fontSize: 13, color: Colors.textMuted, marginTop: 8 },
   roleLabelActive: { color: Colors.primary },
   roleDesc: { fontFamily: Fonts.ui, fontSize: 11, color: Colors.textMuted, textAlign: 'center', marginTop: 4 },
+  locationSection: { backgroundColor: Colors.subtle, borderRadius: Radius.lg, padding: 16, marginBottom: 4, borderWidth: 1, borderColor: Colors.primary + '20' },
+  locationRow: { flexDirection: 'row' },
   inputGroup: { marginBottom: 18 },
   label: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.text, marginBottom: 8 },
   inputContainer: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.subtle,
+    flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.surface,
     borderRadius: Radius.md, borderWidth: 1, borderColor: Colors.border,
     paddingHorizontal: 16, height: 52,
   },
   input: { flex: 1, fontFamily: Fonts.ui, fontSize: 16, color: Colors.text, marginLeft: 12 },
+  inputNoPad: { flex: 1, fontFamily: Fonts.ui, fontSize: 16, color: Colors.text },
   button: {
     backgroundColor: Colors.primary, borderRadius: Radius.full,
     paddingVertical: 16, alignItems: 'center', marginTop: 8,
