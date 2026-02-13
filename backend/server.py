@@ -670,28 +670,258 @@ async def admin_approve_withdrawal(withdrawal_id: str, user=Depends(require_admi
     return {"message": "Withdrawal approved"}
 
 
-# ===================== PAYMENT MOCK =====================
+# ===================== RAZORPAY PAYMENT =====================
 
 @api_router.post("/payment/create-order")
 async def create_payment_order(order_id: str = Body(..., embed=True), user=Depends(require_customer)):
     order = await db.orders.find_one({"id": order_id, "customer_id": user["id"]}, {"_id": 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    return {
-        "id": f"pay_mock_{uuid.uuid4().hex[:12]}",
-        "amount": int(order["price"] * 100),
-        "currency": "INR",
-        "status": "created",
-        "order_id": order_id
-    }
+    if order.get("payment_status") == "completed":
+        raise HTTPException(status_code=400, detail="Payment already completed")
 
-@api_router.post("/payment/verify")
-async def verify_payment(order_id: str = Body(...), payment_id: str = Body(...), user=Depends(require_customer)):
+    amount_paise = int(order["price"] * 100)
+
+    try:
+        razorpay_order = razorpay_client.order.create({
+            "amount": amount_paise,
+            "currency": "INR",
+            "payment_capture": 1,
+            "notes": {
+                "stitchly_order_id": order_id,
+                "customer_id": user["id"],
+                "service_type": order.get("service_type", ""),
+            }
+        })
+    except Exception as e:
+        logger.error(f"Razorpay order creation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Payment gateway error: {str(e)}")
+
     await db.orders.update_one(
         {"id": order_id},
-        {"$set": {"payment_status": "completed", "updated_at": datetime.now(timezone.utc).isoformat()}}
+        {"$set": {
+            "razorpay_order_id": razorpay_order["id"],
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }}
     )
-    return {"verified": True, "message": "Payment verified successfully (MOCK)"}
+
+    return {
+        "razorpay_order_id": razorpay_order["id"],
+        "razorpay_key_id": RAZORPAY_KEY_ID,
+        "amount": amount_paise,
+        "currency": "INR",
+        "order_id": order_id,
+        "customer_name": user["name"],
+        "customer_email": user["email"],
+        "customer_phone": user["phone"],
+    }
+
+
+@api_router.post("/payment/verify")
+async def verify_payment(
+    order_id: str = Body(...),
+    razorpay_payment_id: str = Body(...),
+    razorpay_order_id: str = Body(...),
+    razorpay_signature: str = Body(...),
+    user=Depends(require_customer),
+):
+    order = await db.orders.find_one({"id": order_id, "customer_id": user["id"]}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # Verify signature
+    message = f"{razorpay_order_id}|{razorpay_payment_id}"
+    expected_signature = hmac.new(
+        RAZORPAY_KEY_SECRET.encode('utf-8'),
+        message.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+
+    if expected_signature != razorpay_signature:
+        await db.orders.update_one(
+            {"id": order_id},
+            {"$set": {
+                "payment_status": "failed",
+                "razorpay_payment_id": razorpay_payment_id,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+        raise HTTPException(status_code=400, detail="Payment verification failed - invalid signature")
+
+    # Payment verified - update order
+    settings = await db.settings.find_one({"key": "commission_percentage"}, {"_id": 0})
+    commission_pct = settings["value"] if settings else 10.0
+    commission_amount = round(order["price"] * commission_pct / 100, 2)
+
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {
+            "payment_status": "completed",
+            "razorpay_payment_id": razorpay_payment_id,
+            "razorpay_order_id": razorpay_order_id,
+            "razorpay_signature": razorpay_signature,
+            "commission_amount": commission_amount,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+
+    logger.info(f"Payment verified for order {order_id}: ₹{order['price']} (commission: ₹{commission_amount})")
+
+    return {
+        "verified": True,
+        "message": "Payment verified successfully",
+        "order_id": order_id,
+        "amount": order["price"],
+        "commission": commission_amount,
+        "tailor_earnings": round(order["price"] - commission_amount, 2),
+        "payment_id": razorpay_payment_id,
+    }
+
+
+@api_router.get("/payment/status/{order_id}")
+async def get_payment_status(order_id: str, user=Depends(get_current_user)):
+    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return {
+        "order_id": order_id,
+        "payment_status": order.get("payment_status", "pending"),
+        "payment_method": order.get("payment_method", "online"),
+        "razorpay_order_id": order.get("razorpay_order_id", ""),
+        "razorpay_payment_id": order.get("razorpay_payment_id", ""),
+        "amount": order.get("price", 0),
+        "commission_amount": order.get("commission_amount", 0),
+    }
+
+
+@api_router.get("/payment/checkout/{order_id}")
+async def razorpay_checkout_page(order_id: str):
+    """Serve Razorpay checkout HTML page for WebView"""
+    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    amount_paise = int(order["price"] * 100)
+    razorpay_order_id = order.get("razorpay_order_id", "")
+
+    html = f"""<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stitchly Payment</title>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #FAFAF9; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 20px; }}
+  .container {{ max-width: 400px; width: 100%; text-align: center; }}
+  .logo {{ font-family: serif; font-size: 32px; font-weight: bold; color: #0F766E; margin-bottom: 8px; }}
+  .subtitle {{ color: #78716C; font-size: 14px; margin-bottom: 32px; }}
+  .card {{ background: white; border-radius: 16px; padding: 24px; border: 1px solid #E7E5E4; box-shadow: 0 2px 8px rgba(0,0,0,0.04); margin-bottom: 24px; }}
+  .amount-label {{ color: #78716C; font-size: 14px; margin-bottom: 4px; }}
+  .amount {{ font-size: 36px; font-weight: bold; color: #0F766E; margin-bottom: 4px; }}
+  .order-info {{ color: #78716C; font-size: 13px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #E7E5E4; }}
+  .pay-btn {{ background: #0F766E; color: white; border: none; border-radius: 999px; padding: 16px 32px; font-size: 16px; font-weight: 600; cursor: pointer; width: 100%; transition: opacity 0.2s; }}
+  .pay-btn:hover {{ opacity: 0.9; }}
+  .pay-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+  .secure {{ color: #78716C; font-size: 12px; margin-top: 16px; }}
+  .secure svg {{ vertical-align: middle; margin-right: 4px; }}
+  .status {{ padding: 20px; border-radius: 12px; margin-top: 20px; display: none; }}
+  .status.success {{ display: block; background: #F0FDF4; color: #15803D; }}
+  .status.failed {{ display: block; background: #FEF2F2; color: #B91C1C; }}
+  .spinner {{ display: none; margin: 20px auto; width: 32px; height: 32px; border: 3px solid #E7E5E4; border-top-color: #0F766E; border-radius: 50%; animation: spin 0.8s linear infinite; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+</style>
+</head><body>
+<div class="container">
+  <div class="logo">Stitchly</div>
+  <div class="subtitle">Secure Payment</div>
+  <div class="card">
+    <div class="amount-label">Amount to Pay</div>
+    <div class="amount">&#8377;{order["price"]}</div>
+    <div class="order-info">
+      {order.get("service_type", "Tailoring Service")}<br>
+      Tailor: {order.get("tailor_name", "")}
+    </div>
+  </div>
+  <button class="pay-btn" id="payBtn" onclick="openRazorpay()">Pay &#8377;{order["price"]}</button>
+  <div class="spinner" id="spinner"></div>
+  <div class="status" id="statusMsg"></div>
+  <div class="secure">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+    Secured by Razorpay
+  </div>
+</div>
+<script>
+function openRazorpay() {{
+  document.getElementById('payBtn').disabled = true;
+  document.getElementById('payBtn').textContent = 'Processing...';
+  var options = {{
+    key: "{RAZORPAY_KEY_ID}",
+    amount: {amount_paise},
+    currency: "INR",
+    name: "Stitchly",
+    description: "{order.get('service_type', 'Tailoring Service')}",
+    order_id: "{razorpay_order_id}",
+    prefill: {{
+      name: "{order.get('customer_name', '')}",
+      email: "",
+      contact: "{order.get('customer_phone', '')}"
+    }},
+    theme: {{ color: "#0F766E" }},
+    handler: function(response) {{
+      document.getElementById('payBtn').style.display = 'none';
+      document.getElementById('spinner').style.display = 'block';
+      // Post message to WebView
+      var msg = JSON.stringify({{
+        type: 'PAYMENT_SUCCESS',
+        razorpay_payment_id: response.razorpay_payment_id,
+        razorpay_order_id: response.razorpay_order_id,
+        razorpay_signature: response.razorpay_signature,
+        order_id: "{order_id}"
+      }});
+      if (window.ReactNativeWebView) {{
+        window.ReactNativeWebView.postMessage(msg);
+      }} else {{
+        window.parent.postMessage(msg, '*');
+      }}
+      document.getElementById('spinner').style.display = 'none';
+      var st = document.getElementById('statusMsg');
+      st.className = 'status success';
+      st.innerHTML = '<strong>Payment Successful!</strong><br>Payment ID: ' + response.razorpay_payment_id + '<br>Returning to app...';
+    }},
+    modal: {{
+      ondismiss: function() {{
+        document.getElementById('payBtn').disabled = false;
+        document.getElementById('payBtn').textContent = 'Pay \\u20B9{order["price"]}';
+        var msg = JSON.stringify({{ type: 'PAYMENT_CANCELLED', order_id: "{order_id}" }});
+        if (window.ReactNativeWebView) {{
+          window.ReactNativeWebView.postMessage(msg);
+        }} else {{
+          window.parent.postMessage(msg, '*');
+        }}
+      }}
+    }}
+  }};
+  var rzp = new Razorpay(options);
+  rzp.on('payment.failed', function(response) {{
+    document.getElementById('payBtn').disabled = false;
+    document.getElementById('payBtn').textContent = 'Retry Payment';
+    var st = document.getElementById('statusMsg');
+    st.className = 'status failed';
+    st.innerHTML = '<strong>Payment Failed</strong><br>' + response.error.description;
+    var msg = JSON.stringify({{ type: 'PAYMENT_FAILED', order_id: "{order_id}", error: response.error.description }});
+    if (window.ReactNativeWebView) {{
+      window.ReactNativeWebView.postMessage(msg);
+    }} else {{
+      window.parent.postMessage(msg, '*');
+    }}
+  }});
+  rzp.open();
+}}
+// Auto-open on load
+setTimeout(openRazorpay, 500);
+</script>
+</body></html>"""
+    return HTMLResponse(content=html)
 
 
 # ===================== SEED DATA =====================
