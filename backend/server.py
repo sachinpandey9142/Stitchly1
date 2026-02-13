@@ -351,7 +351,7 @@ async def accept_order(order_id: str, user=Depends(require_tailor)):
         raise HTTPException(status_code=400, detail="Order cannot be accepted in current status")
 
     delivery_partner = await db.users.find_one(
-        {"role": "delivery", "status": "active", "city": {"$regex": f"^{tailor.get('city', '')}$", "$options": "i"}},
+        {"role": "delivery", "status": "active", "city": {"$regex": f"^{user.get('city', '')}$", "$options": "i"}},
         {"_id": 0}
     )
     if not delivery_partner:
