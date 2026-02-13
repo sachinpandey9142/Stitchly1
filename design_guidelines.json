@@ -1,0 +1,208 @@
+{
+  "metadata": {
+    "app_name": "Stitchly",
+    "version": "1.0.0",
+    "platform": "React Native (Expo)",
+    "design_system_version": "E1-AntiAI-v1"
+  },
+  "brand_core": {
+    "archetype": "Organic & Earthy",
+    "vibe": "Craftsmanship, Trust, Efficiency, Indian-Modern",
+    "theme_mode": "Light (Clean & Minimal)",
+    "design_principles": [
+      "Mobile-First Ergonomics (Thumb zone friendly)",
+      "Cultural Minimalism (Subtle Indian motifs, not kitsch)",
+      "Content is King (High quality fabric/work photos)",
+      "Warmth over sterility (Stone greys instead of blue greys)"
+    ]
+  },
+  "colors": {
+    "palette": {
+      "primary": {
+        "default": "#0F766E",
+        "light": "#14B8A6",
+        "dark": "#115E59",
+        "foreground": "#FFFFFF"
+      },
+      "secondary": {
+        "default": "#D97706",
+        "light": "#F59E0B",
+        "dark": "#B45309",
+        "foreground": "#FFFFFF"
+      },
+      "background": {
+        "app": "#FAFAF9",
+        "surface": "#FFFFFF",
+        "subtle": "#F5F5F4"
+      },
+      "text": {
+        "main": "#1C1917",
+        "muted": "#78716C",
+        "inverted": "#FFFFFF"
+      },
+      "border": {
+        "default": "#E7E5E4",
+        "active": "#0F766E"
+      },
+      "status": {
+        "success": "#15803D",
+        "error": "#B91C1C",
+        "warning": "#C2410C",
+        "info": "#0369A1"
+      }
+    },
+    "gradients": {
+      "primary": ["#0F766E", "#115E59"],
+      "warmth": ["#FAFAF9", "#F5F5F4"]
+    }
+  },
+  "typography": {
+    "font_families": {
+      "heading": "PlayfairDisplay_700Bold",
+      "body": "Manrope_500Medium",
+      "body_bold": "Manrope_700Bold",
+      "ui": "Manrope_400Regular"
+    },
+    "scale": {
+      "xs": 12,
+      "sm": 14,
+      "base": 16,
+      "lg": 18,
+      "xl": 20,
+      "2xl": 24,
+      "3xl": 30,
+      "4xl": 36
+    },
+    "instructions": "Use @expo-google-fonts/playfair-display and @expo-google-fonts/manrope. Load fonts in _layout.tsx or App.js before rendering."
+  },
+  "spacing": {
+    "xs": 4,
+    "sm": 8,
+    "md": 16,
+    "lg": 24,
+    "xl": 32,
+    "2xl": 48,
+    "3xl": 64,
+    "container_padding": 20
+  },
+  "shapes": {
+    "radius": {
+      "sm": 8,
+      "md": 12,
+      "lg": 16,
+      "full": 9999
+    },
+    "border_width": {
+      "hairline": 0.5,
+      "thin": 1,
+      "thick": 2
+    }
+  },
+  "component_styles": {
+    "buttons": {
+      "primary": {
+        "backgroundColor": "#0F766E",
+        "borderRadius": 9999,
+        "paddingVertical": 16,
+        "paddingHorizontal": 24,
+        "alignItems": "center",
+        "justifyContent": "center",
+        "elevation": 2,
+        "shadowColor": "#0F766E",
+        "shadowOffset": { "width": 0, "height": 4 },
+        "shadowOpacity": 0.2,
+        "shadowRadius": 8
+      },
+      "secondary": {
+        "backgroundColor": "#FFFFFF",
+        "borderWidth": 1,
+        "borderColor": "#E7E5E4",
+        "borderRadius": 9999,
+        "paddingVertical": 16,
+        "paddingHorizontal": 24,
+        "alignItems": "center",
+        "justifyContent": "center"
+      },
+      "text_primary": {
+        "color": "#FFFFFF",
+        "fontSize": 16,
+        "fontFamily": "Manrope_700Bold"
+      },
+      "text_secondary": {
+        "color": "#1C1917",
+        "fontSize": 16,
+        "fontFamily": "Manrope_700Bold"
+      }
+    },
+    "cards": {
+      "base": {
+        "backgroundColor": "#FFFFFF",
+        "borderRadius": 16,
+        "padding": 16,
+        "borderWidth": 1,
+        "borderColor": "#E7E5E4",
+        "shadowColor": "#000",
+        "shadowOffset": { "width": 0, "height": 2 },
+        "shadowOpacity": 0.05,
+        "shadowRadius": 4,
+        "elevation": 2
+      }
+    },
+    "inputs": {
+      "base": {
+        "backgroundColor": "#FAFAF9",
+        "borderRadius": 12,
+        "borderWidth": 1,
+        "borderColor": "#E7E5E4",
+        "padding": 16,
+        "fontSize": 16,
+        "fontFamily": "Manrope_400Regular",
+        "color": "#1C1917"
+      },
+      "active": {
+        "borderColor": "#0F766E",
+        "backgroundColor": "#FFFFFF"
+      }
+    }
+  },
+  "assets": {
+    "images": {
+      "hero_tailor": "https://images.unsplash.com/photo-1635191743651-398e42cf5de1?crop=entropy&cs=srgb&fm=jpg&ixlib=rb-4.1.0&q=85",
+      "hero_sewing_woman": "https://images.unsplash.com/photo-1634626857321-deb416dcdb00?crop=entropy&cs=srgb&fm=jpg&ixlib=rb-4.1.0&q=85",
+      "fabric_texture": "https://images.unsplash.com/photo-1444362408440-274ecb6fc730?crop=entropy&cs=srgb&fm=jpg&ixlib=rb-4.1.0&q=85",
+      "fabric_detail": "https://images.unsplash.com/photo-1693987646600-c911a3f571b7?crop=entropy&cs=srgb&fm=jpg&ixlib=rb-4.1.0&q=85",
+      "placeholder_avatar": "https://ui-avatars.com/api/?background=0F766E&color=fff"
+    },
+    "icons": {
+      "library": "lucide-react-native",
+      "style": "Stroke width 1.5 or 2, color #1C1917 or #0F766E"
+    }
+  },
+  "react_native_rules": {
+    "styling": [
+      "Use StyleSheet.create() for performance.",
+      "Avoid inline styles for complex objects.",
+      "Use SafeAreaView from 'react-native-safe-area-context'.",
+      "Use KeyboardAvoidingView for forms.",
+      "Images: Use 'contentFit'='cover' from 'expo-image' if available, else Image 'resizeMode'='cover'."
+    ],
+    "navigation": [
+      "Use 'expo-router' with Stack and Tabs.",
+      "Hide header shadows for a clean look: headerShadowVisible: false",
+      "Custom back button with Lucide 'ArrowLeft' icon."
+    ],
+    "components": [
+      "TouchableOpacity: always set activeOpacity={0.7}",
+      "FlatList: always set showsVerticalScrollIndicator={false}",
+      "Status Bar: Use 'expo-status-bar' style='dark' on light backgrounds."
+    ]
+  },
+  "universal_guidelines": [
+    "Do NOT use 'Inter' font.",
+    "Do NOT use gradients on text.",
+    "Do NOT use purple or default blue.",
+    "Always use a 'Loader' component for async states.",
+    "All touchables must be at least 44x44 points for hit slop."
+  ],
+  "instructions_to_main_agent": "You are building a React Native Expo app. Follow these design guidelines strictly. Use the provided colors and fonts. Implement the 'Stitchly' brand as a premium, trustworthy Indian tailoring marketplace. Mock the Razorpay payment flow visually."
+}
