@@ -71,7 +71,8 @@ Stitchly is a 3-sided marketplace mobile + web application connecting Customers,
 
 ## Status
 - ✅ MVP Complete - All 4 role dashboards functional
-- ✅ 21/21 backend API tests passed
+- ✅ Location-Based Marketplace - City/Pincode filtering, city selector, location-based delivery assignment
+- ✅ 21/21 backend API tests passed (iteration 1) + 9/9 location tests (iteration 2)
 - ✅ Frontend flows tested and working
 - 🔲 Payment: Razorpay MOCKED (needs real keys for production)
 - 🔲 Future: Push notifications, coupon system, referral system
