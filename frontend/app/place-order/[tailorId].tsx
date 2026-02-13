@@ -29,12 +29,17 @@ export default function PlaceOrder() {
       const order = await api.post('/orders', { tailor_id: tailorId, service_type: serviceType, description: description.trim(), pickup_address: pickupAddress.trim(), payment_method: paymentMethod });
       if (paymentMethod === 'online') {
         try {
-          const payment = await api.post('/payment/create-order', { order_id: order.id });
-          await api.post('/payment/verify', { order_id: order.id, payment_id: payment.id });
-          Alert.alert('Success', 'Order placed and payment completed (MOCK)', [{ text: 'OK', onPress: () => router.back() }]);
-        } catch { Alert.alert('Order Placed', 'Order placed but payment pending', [{ text: 'OK', onPress: () => router.back() }]); }
+          // Create Razorpay order first
+          const paymentData = await api.post('/payment/create-order', { order_id: order.id });
+          // Navigate to Razorpay checkout WebView
+          setLoading(false);
+          router.push(`/checkout?orderId=${order.id}`);
+          return;
+        } catch (err: any) {
+          Alert.alert('Order Placed', 'Order created but payment initiation failed. You can pay from Orders tab.', [{ text: 'OK', onPress: () => router.replace('/(customer)/orders') }]);
+        }
       } else {
-        Alert.alert('Success', 'Order placed with Cash on Delivery', [{ text: 'OK', onPress: () => router.back() }]);
+        Alert.alert('Success', 'Order placed with Cash on Delivery', [{ text: 'OK', onPress: () => router.replace('/(customer)/orders') }]);
       }
     } catch (err: any) { Alert.alert('Error', err.message); }
     finally { setLoading(false); }
