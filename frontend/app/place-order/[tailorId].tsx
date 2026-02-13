@@ -4,15 +4,17 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { api } from '../../src/utils/api';
+import { useAuth } from '../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius } from '../../src/utils/theme';
 
 export default function PlaceOrder() {
   const { tailorId, service } = useLocalSearchParams<{ tailorId: string; service?: string }>();
   const router = useRouter();
+  const { user } = useAuth();
   const [tailor, setTailor] = useState<any>(null);
   const [serviceType, setServiceType] = useState(service ? decodeURIComponent(service) : '');
   const [description, setDescription] = useState('');
-  const [pickupAddress, setPickupAddress] = useState('');
+  const [pickupAddress, setPickupAddress] = useState(user?.address || '');
   const [paymentMethod, setPaymentMethod] = useState('online');
   const [loading, setLoading] = useState(false);
 
