@@ -24,8 +24,8 @@ export default function Login() {
     setLoading(true);
     try {
       const user = await login(email.trim().toLowerCase(), password);
-      if (user.role === 'customer') router.replace('/(customer)');
-      else if (user.role === 'tailor') router.replace('/(tailor)');
+      if (user.role === 'customer') router.replace("/(customer)/(tabs)");
+      else if (user.role === 'tailor') router.replace('/(tailor)/(tabs)');
       else if (user.role === 'delivery') router.replace('/(delivery)');
       else if (user.role === 'admin') router.replace('/(admin)');
     } catch (err: any) {
