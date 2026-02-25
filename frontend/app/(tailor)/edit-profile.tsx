@@ -1,11 +1,10 @@
 import React, { useState } from "react";
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert } from "react-native";
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, Image } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
 import { useAuth } from "../../src/context/AuthContext";
 import { api } from "@/src/utils/api";
 import * as ImagePicker from 'expo-image-picker';
-import { Image } from 'react-native';
 import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
 
 export default function EditProfile() {
