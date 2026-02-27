@@ -1,12 +1,16 @@
-import React, { useState } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, Alert } from 'react-native';
+import React, { useState, useEffect } from 'react';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, Alert, Modal } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius } from '../../src/utils/theme';
 import * as Location from 'expo-location';
+<<<<<<< feat-added-location
+import LiveMap from '../live-map';
+=======
 import { useRef } from 'react';
+>>>>>>> main
 
 const ROLES = [
   { key: 'customer', label: 'Customer', icon: 'shopping-bag' as const, desc: 'Find tailors near you' },
@@ -30,11 +34,64 @@ export default function Register() {
   const [role, setRole] = useState('customer');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+<<<<<<< feat-added-location
+  const [pincodeError, setPincodeError] = useState('');
+  const [cityTouched, setCityTouched] = useState(false);
+  const [pincodeTouched, setPincodeTouched] = useState(false);
+  const [coords, setCoords] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [showMapModal, setShowMapModal] = useState(false);
+
+  const fetchCityFromPincode = async (code: string) => {
+    try {
+      const res = await fetch(`https://api.postalpincode.in/pincode/${code}`);
+      const json = await res.json();
+      if (Array.isArray(json) && json[0]?.Status === 'Success') {
+        const po = json[0].PostOffice?.[0];
+        if (po) {
+          if (!cityTouched && po.District && !city) {
+            setCity(po.District);
+          }
+          setPincodeError('');
+          return;
+        }
+      }
+      setPincodeError('Invalid pincode');
+    } catch {
+      setPincodeError('Unable to verify pincode');
+    }
+  };
+
+  useEffect(() => {
+    if (!pincodeTouched) return;
+
+    if (!pincode) {
+      setPincodeError('');
+      return;
+    }
+
+    if (!/^\d+$/.test(pincode)) {
+      setPincodeError('Pincode must be numeric');
+      return;
+    }
+
+    if (pincode.length !== 6) {
+      setPincodeError('Pincode must be 6 digits');
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      void fetchCityFromPincode(pincode);
+    }, 500);
+
+    return () => clearTimeout(timeout);
+  }, [pincode, pincodeTouched, city, cityTouched]);
+=======
   const [suggestions, setSuggestions] = useState<any[]>([]);
   const [latitude, setLatitude] = useState<number | null>(null); 
   const [longitude, setLongitude] = useState<number | null>(null);
   const [searchTimeout, setSearchTimeout] = useState<ReturnType<typeof setTimeout> | null>(null);
 
+>>>>>>> main
 
   const handleRegister = async () => {
     if (!name.trim() || !email.trim() || !phone.trim() || !password) {
@@ -239,7 +296,21 @@ setTimeout(() => {
              <View style={[styles.inputGroup, { flex: 2, marginRight: 8, position: 'relative' }]}>
                 <Text style={styles.label}>City *</Text>
                 <View style={styles.inputContainer}>
+<<<<<<< feat-added-location
+                  <TextInput
+                    testID="register-city-input"
+                    style={styles.inputNoPad}
+                    placeholder="e.g. Mumbai"
+                    placeholderTextColor={Colors.textMuted}
+                    value={city}
+                    onChangeText={(val) => {
+                      setCity(val);
+                      setCityTouched(true);
+                    }}
+                  />
+=======
                   <TextInput testID="register-city-input" style={styles.inputNoPad} placeholder="e.g. Mumbai" placeholderTextColor={Colors.textMuted} value={city} onChangeText={fetchCitySuggestions} />
+>>>>>>> main
                 </View>
                 <TouchableOpacity
   onPress={fetchCurrentLocation}
@@ -318,13 +389,42 @@ setTimeout(() => {
               <View style={[styles.inputGroup, { flex: 1 }]}>
                 <Text style={styles.label}>Pincode</Text>
                 <View style={styles.inputContainer}>
+<<<<<<< feat-added-location
+                  <TextInput
+                    testID="register-pincode-input"
+                    style={styles.inputNoPad}
+                    placeholder="400001"
+                    placeholderTextColor={Colors.textMuted}
+                    value={pincode}
+                    onChangeText={(val) => {
+                      setPincode(val);
+                      setPincodeTouched(true);
+                    }}
+                    keyboardType="numeric"
+                    maxLength={6}
+                  />
+=======
                   <TextInput testID="register-pincode-input" style={styles.inputNoPad} placeholder="400001" placeholderTextColor={Colors.textMuted} value={pincode} onChangeText={(text) => {
   setPincode(text);
   fetchFromPincode(text);
 }} keyboardType="numeric" maxLength={6} />
+>>>>>>> main
                 </View>
               </View>
             </View>
+
+            {pincodeError ? (
+              <Text style={styles.errorText}>{pincodeError}</Text>
+            ) : null}
+
+            <TouchableOpacity
+              style={styles.mapPickBtn}
+              onPress={() => setShowMapModal(true)}
+              activeOpacity={0.7}
+            >
+              <Feather name="map-pin" size={16} color={Colors.primary} />
+              <Text style={styles.mapPickText}>Pick on Map (optional)</Text>
+            </TouchableOpacity>
 
             <View style={styles.inputGroup}>
               <Text style={styles.label}>Full Address</Text>
@@ -355,6 +455,50 @@ setTimeout(() => {
           </TouchableOpacity>
         </ScrollView>
       </KeyboardAvoidingView>
+
+      <Modal visible={showMapModal} transparent animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalSheet}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Select Location</Text>
+              <TouchableOpacity onPress={() => setShowMapModal(false)}>
+                <Feather name="x" size={22} color={Colors.text} />
+              </TouchableOpacity>
+            </View>
+            <View style={styles.modalMapWrapper}>
+              <LiveMap
+                initialLocation={coords || undefined}
+                onLocationChange={async (c) => {
+                  setCoords(c);
+                  try {
+                    const results = await Location.reverseGeocodeAsync({
+                      latitude: c.latitude,
+                      longitude: c.longitude,
+                    });
+                    const first = results[0];
+                    if (!first) return;
+                    if (!cityTouched && first.city && !city) {
+                      setCity(first.city);
+                    }
+                    if (!pincodeTouched && first.postalCode && !pincode) {
+                      setPincode(first.postalCode);
+                    }
+                  } catch {
+                    // ignore
+                  }
+                }}
+              />
+            </View>
+            <TouchableOpacity
+              style={styles.modalConfirmBtn}
+              onPress={() => setShowMapModal(false)}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.modalConfirmText}>Use this location</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -398,9 +542,72 @@ const styles = StyleSheet.create({
   linkButton: { alignItems: 'center', marginTop: 20, paddingVertical: 8 },
   linkText: { fontFamily: Fonts.ui, fontSize: 15, color: Colors.textMuted },
   linkBold: { fontFamily: Fonts.bodyBold, color: Colors.primary },
+<<<<<<< feat-added-location
+  errorText: {
+    fontFamily: Fonts.ui,
+    fontSize: 12,
+    color: Colors.error,
+    marginTop: 4,
+  },
+  mapPickBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 8,
+    gap: 6,
+  },
+  mapPickText: {
+    fontFamily: Fonts.body,
+    fontSize: 13,
+    color: Colors.primary,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    justifyContent: 'flex-end',
+  },
+  modalSheet: {
+    backgroundColor: Colors.surface,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingHorizontal: Spacing.containerPadding,
+    paddingTop: 16,
+    paddingBottom: 24,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  modalTitle: {
+    fontFamily: Fonts.bodyBold,
+    fontSize: 18,
+    color: Colors.text,
+  },
+  modalMapWrapper: {
+    height: 260,
+    borderRadius: Radius.lg,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  modalConfirmBtn: {
+    marginTop: 14,
+    backgroundColor: Colors.primary,
+    borderRadius: Radius.full,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  modalConfirmText: {
+    fontFamily: Fonts.bodyBold,
+    fontSize: 15,
+    color: Colors.textInverted,
+  },
+=======
   dropdownText: {
   fontFamily: Fonts.ui,
   fontSize: 14,
   color: Colors.text,
 },
+>>>>>>> main
 });

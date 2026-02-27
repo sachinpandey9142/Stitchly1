@@ -26,3 +26,6 @@ export default function Index() {
 
   return <LoadingScreen />;
 }
+// import LiveMap from "./live-map";
+
+// export default LiveMap;

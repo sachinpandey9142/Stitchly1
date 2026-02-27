@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Alert, KeyboardAvoidingView, Platform } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Alert, KeyboardAvoidingView, Platform, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
@@ -17,13 +17,61 @@ export default function PlaceOrder() {
   const [pickupAddress, setPickupAddress] = useState(user?.address || '');
   const [paymentMethod, setPaymentMethod] = useState('online');
   const [loading, setLoading] = useState(false);
+  const [addresses, setAddresses] = useState<any[]>([]);
+  const [addressesLoading, setAddressesLoading] = useState(false);
+  const [selectedAddressId, setSelectedAddressId] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => { try { const data = await api.get(`/tailors/${tailorId}`); setTailor(data); } catch {} })();
   }, [tailorId]);
 
+  useEffect(() => {
+    (async () => {
+      setAddressesLoading(true);
+      try {
+        const list = await api.get('/addresses');
+        setAddresses(list);
+        if (list.length > 0) {
+          const def = list.find((a: any) => a.is_default) || list[0];
+          setSelectedAddressId(def.id);
+          const addressLine = [
+            def.flat_no,
+            def.area,
+            def.landmark,
+            `${def.city} - ${def.pincode}`,
+          ]
+            .filter(Boolean)
+            .join(', ');
+          setPickupAddress(addressLine);
+        }
+      } catch (e) {
+        // ignore silently here, user can still type address
+      } finally {
+        setAddressesLoading(false);
+      }
+    })();
+  }, []);
+
   const handleOrder = async () => {
-    if (!serviceType || !description.trim() || !pickupAddress.trim()) { Alert.alert('Error', 'Fill in all required fields'); return; }
+    if (!serviceType || !description.trim() || !pickupAddress.trim()) {
+      Alert.alert('Error', 'Fill in all required fields');
+      return;
+    }
+
+    if (!selectedAddressId) {
+      Alert.alert(
+        'Add address',
+        'Please add and select a delivery address before placing an order.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Add Address',
+            onPress: () => router.push('/(customer)/add-address'),
+          },
+        ]
+      );
+      return;
+    }
     setLoading(true);
     try {
       const order = await api.post('/orders', { tailor_id: tailorId, service_type: serviceType, description: description.trim(), pickup_address: pickupAddress.trim(), payment_method: paymentMethod });
@@ -74,7 +122,109 @@ export default function PlaceOrder() {
             <TextInput testID="order-desc-input" style={[styles.input, styles.textArea]} placeholder="Describe what you need (fabric type, design, etc.)" placeholderTextColor={Colors.textMuted} value={description} onChangeText={setDescription} multiline numberOfLines={4} textAlignVertical="top" />
 
             <Text style={styles.label}>Pickup Address *</Text>
-            <TextInput testID="order-address-input" style={styles.input} placeholder="Enter your address" placeholderTextColor={Colors.textMuted} value={pickupAddress} onChangeText={setPickupAddress} />
+            {addressesLoading ? (
+              <View style={styles.addressLoader}>
+                <ActivityIndicator size="small" color={Colors.primary} />
+              </View>
+            ) : addresses.length > 0 ? (
+              <>
+                <View style={styles.addressList}>
+                  {addresses.map((addr: any) => {
+                    const isSelected = addr.id === selectedAddressId;
+                    const line = [
+                      addr.flat_no,
+                      addr.area,
+                      addr.landmark,
+                      `${addr.city} - ${addr.pincode}`,
+                    ]
+                      .filter(Boolean)
+                      .join(', ');
+                    return (
+                      <TouchableOpacity
+                        key={addr.id}
+                        style={[
+                          styles.addressCard,
+                          isSelected && styles.addressCardActive,
+                        ]}
+                        onPress={() => {
+                          setSelectedAddressId(addr.id);
+                          setPickupAddress(line);
+                        }}
+                        activeOpacity={0.8}
+                      >
+                        <View style={styles.addressCardHeader}>
+                          <View style={styles.addressLabelBadge}>
+                            <Feather
+                              name={
+                                addr.label === 'Work'
+                                  ? 'briefcase'
+                                  : addr.label === 'Home'
+                                  ? 'home'
+                                  : 'map-pin'
+                              }
+                              size={14}
+                              color={
+                                isSelected ? Colors.textInverted : Colors.primary
+                              }
+                            />
+                            <Text
+                              style={[
+                                styles.addressLabelText,
+                                isSelected && styles.addressLabelTextActive,
+                              ]}
+                            >
+                              {addr.label}
+                            </Text>
+                          </View>
+                          {addr.is_default && (
+                            <Text style={styles.defaultPill}>Default</Text>
+                          )}
+                        </View>
+                        <Text
+                          style={[
+                            styles.addressLine,
+                            isSelected && styles.addressLineActive,
+                          ]}
+                          numberOfLines={2}
+                        >
+                          {line}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+                <TouchableOpacity
+                  style={styles.manageAddressesBtn}
+                  onPress={() => router.push('/(customer)/addresses')}
+                  activeOpacity={0.7}
+                >
+                  <Feather name="settings" size={14} color={Colors.primary} />
+                  <Text style={styles.manageAddressesText}>Manage addresses</Text>
+                </TouchableOpacity>
+              </>
+            ) : (
+              <>
+                <Text style={styles.noAddressText}>
+                  You don&apos;t have any saved addresses yet.
+                </Text>
+                <TouchableOpacity
+                  style={styles.addAddressInlineBtn}
+                  onPress={() => router.push('/(customer)/add-address')}
+                  activeOpacity={0.8}
+                >
+                  <Feather name="map-pin" size={16} color={Colors.textInverted} />
+                  <Text style={styles.addAddressInlineText}>Add Address</Text>
+                </TouchableOpacity>
+                <TextInput
+                  testID="order-address-input"
+                  style={[styles.input, { marginTop: 12 }]}
+                  placeholder="Enter your address"
+                  placeholderTextColor={Colors.textMuted}
+                  value={pickupAddress}
+                  onChangeText={setPickupAddress}
+                />
+              </>
+            )}
 
             <Text style={styles.label}>Payment Method</Text>
             <View style={styles.paymentRow}>
@@ -134,4 +284,99 @@ const styles = StyleSheet.create({
   submitBtn: { backgroundColor: Colors.primary, borderRadius: Radius.full, paddingVertical: 16, alignItems: 'center', marginHorizontal: Spacing.containerPadding, marginTop: 24, shadowColor: Colors.primary, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.2, shadowRadius: 8, elevation: 4 },
   submitBtnDisabled: { opacity: 0.6 },
   submitBtnText: { fontFamily: Fonts.bodyBold, fontSize: 16, color: Colors.textInverted },
+  addressLoader: {
+    backgroundColor: Colors.surface,
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  addressList: {
+    marginTop: 4,
+    gap: 8,
+  },
+  addressCard: {
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.surface,
+    padding: 10,
+  },
+  addressCardActive: {
+    borderColor: Colors.primary,
+    backgroundColor: Colors.primary + '08',
+  },
+  addressCardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+  },
+  addressLabelBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: Radius.full,
+    backgroundColor: Colors.primary + '10',
+  },
+  addressLabelText: {
+    marginLeft: 6,
+    fontFamily: Fonts.bodyBold,
+    fontSize: 12,
+    color: Colors.primary,
+  },
+  addressLabelTextActive: {
+    color: Colors.textInverted,
+  },
+  defaultPill: {
+    fontFamily: Fonts.bodyBold,
+    fontSize: 11,
+    color: Colors.secondaryDark,
+    backgroundColor: Colors.secondary + '16',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: Radius.full,
+  },
+  addressLine: {
+    fontFamily: Fonts.ui,
+    fontSize: 13,
+    color: Colors.text,
+  },
+  addressLineActive: {
+    color: Colors.text,
+  },
+  manageAddressesBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 8,
+    gap: 6,
+  },
+  manageAddressesText: {
+    fontFamily: Fonts.body,
+    fontSize: 13,
+    color: Colors.primary,
+  },
+  noAddressText: {
+    fontFamily: Fonts.ui,
+    fontSize: 13,
+    color: Colors.textMuted,
+    marginBottom: 8,
+  },
+  addAddressInlineBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    backgroundColor: Colors.primary,
+    borderRadius: Radius.full,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    gap: 6,
+  },
+  addAddressInlineText: {
+    fontFamily: Fonts.bodyBold,
+    fontSize: 13,
+    color: Colors.textInverted,
+  },
 });
