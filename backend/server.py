@@ -95,6 +95,43 @@ class SettingsUpdate(BaseModel):
     commission_percentage: float
 
 
+from typing import List, Optional, Literal
+
+class GeoPoint(BaseModel):
+    type: Literal["Point"] = "Point"
+    coordinates: List[float]  # [longitude, latitude]
+
+
+class AddressBase(BaseModel):
+    label: str
+    flat_no: str
+    area: str
+    landmark: Optional[str] = ""
+    city: str
+    pincode: str
+    location: GeoPoint
+
+
+class AddressCreate(AddressBase):
+    is_default: bool = False
+
+
+class AddressUpdate(BaseModel):
+    label: Optional[str] = None
+    flat_no: Optional[str] = None
+    area: Optional[str] = None
+    landmark: Optional[str] = None
+    city: Optional[str] = None
+    pincode: Optional[str] = None
+    location: Optional[GeoPoint] = None
+
+
+class AddressOut(AddressBase):
+    id: str
+    user_id: str
+    is_default: bool = False
+
+
 # ===================== AUTH HELPERS =====================
 
 def hash_password(password: str) -> str:
@@ -1103,6 +1140,98 @@ async def get_cities():
     return sorted(cities)
 
 
+# ===================== ADDRESS ROUTES =====================
+
+
+@api_router.post("/addresses", response_model=AddressOut)
+async def create_address(data: AddressCreate, user=Depends(get_current_user)):
+    existing_count = await db.addresses.count_documents({"user_id": user["id"]})
+
+    is_default = data.is_default
+    if existing_count == 0:
+        # First address for this user is always default
+        is_default = True
+    elif is_default:
+        # If explicitly marked default, unset previous defaults
+        await db.addresses.update_many({"user_id": user["id"]}, {"$set": {"is_default": False}})
+
+    address = {
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "label": data.label,
+        "flat_no": data.flat_no,
+        "area": data.area,
+        "landmark": data.landmark or "",
+        "city": data.city,
+        "pincode": data.pincode,
+        "location": data.location.dict(),
+        "is_default": is_default,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    await db.addresses.insert_one(address)
+    address.pop("_id", None)
+    return address
+
+
+@api_router.get("/addresses", response_model=List[AddressOut])
+async def list_addresses(user=Depends(get_current_user)):
+    cursor = db.addresses.find({"user_id": user["id"]}, {"_id": 0}).sort(
+        [("is_default", -1), ("created_at", -1)]
+    )
+    addresses = await cursor.to_list(50)
+    return addresses
+
+
+@api_router.put("/addresses/{address_id}", response_model=AddressOut)
+async def update_address(address_id: str, data: AddressUpdate, user=Depends(get_current_user)):
+    update = {k: v for k, v in data.dict(exclude_unset=True).items() if v is not None}
+
+    if not update:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    update["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    result = await db.addresses.update_one(
+        {"id": address_id, "user_id": user["id"]},
+        {"$set": update},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Address not found")
+
+    updated = await db.addresses.find_one({"id": address_id, "user_id": user["id"]}, {"_id": 0})
+    return updated
+
+
+@api_router.delete("/addresses/{address_id}")
+async def delete_address(address_id: str, user=Depends(get_current_user)):
+    result = await db.addresses.delete_one({"id": address_id, "user_id": user["id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Address not found")
+    return {"message": "Address deleted"}
+
+
+@api_router.put("/addresses/{address_id}/set-default", response_model=AddressOut)
+async def set_default_address(address_id: str, user=Depends(get_current_user)):
+    address = await db.addresses.find_one({"id": address_id, "user_id": user["id"]})
+    if not address:
+        raise HTTPException(status_code=404, detail="Address not found")
+
+    await db.addresses.update_many({"user_id": user["id"]}, {"$set": {"is_default": False}})
+    await db.addresses.update_one(
+        {"id": address_id, "user_id": user["id"]},
+        {
+            "$set": {
+                "is_default": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+    updated = await db.addresses.find_one({"id": address_id, "user_id": user["id"]}, {"_id": 0})
+    return updated
+
+
 # ===================== SETUP =====================
 
 app.include_router(api_router)
@@ -1131,6 +1260,9 @@ async def startup():
     await db.users.create_index("city")
     await db.users.create_index("pincode")
     await db.users.create_index([("role", 1), ("city", 1), ("status", 1)])
+    await db.addresses.create_index("id", unique=True)
+    await db.addresses.create_index("user_id")
+    await db.addresses.create_index([("location", "2dsphere")])
     logger.info("Stitchly API started - indexes created")
 
 @app.on_event("shutdown")
