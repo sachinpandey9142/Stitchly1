@@ -6,7 +6,11 @@ import { Feather } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius } from '../../src/utils/theme';
 import * as Location from 'expo-location';
+<<<<<<< feat-added-location
 import LiveMap from '../live-map';
+=======
+import { useRef } from 'react';
+>>>>>>> main
 
 const ROLES = [
   { key: 'customer', label: 'Customer', icon: 'shopping-bag' as const, desc: 'Find tailors near you' },
@@ -23,10 +27,14 @@ export default function Register() {
   const [password, setPassword] = useState('');
   const [city, setCity] = useState('');
   const [pincode, setPincode] = useState('');
+  const [loadingLocation, setLoadingLocation] = useState(false);
   const [address, setAddress] = useState('');
+  const scrollRef = useRef<ScrollView>(null);
+  const addressInputRef = useRef<TextInput>(null);
   const [role, setRole] = useState('customer');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+<<<<<<< feat-added-location
   const [pincodeError, setPincodeError] = useState('');
   const [cityTouched, setCityTouched] = useState(false);
   const [pincodeTouched, setPincodeTouched] = useState(false);
@@ -77,6 +85,13 @@ export default function Register() {
 
     return () => clearTimeout(timeout);
   }, [pincode, pincodeTouched, city, cityTouched]);
+=======
+  const [suggestions, setSuggestions] = useState<any[]>([]);
+  const [latitude, setLatitude] = useState<number | null>(null); 
+  const [longitude, setLongitude] = useState<number | null>(null);
+  const [searchTimeout, setSearchTimeout] = useState<ReturnType<typeof setTimeout> | null>(null);
+
+>>>>>>> main
 
   const handleRegister = async () => {
     if (!name.trim() || !email.trim() || !phone.trim() || !password) {
@@ -107,11 +122,123 @@ export default function Register() {
       setLoading(false);
     }
   };
+  // PINCODE → CITY
+const fetchFromPincode = async (pin: string) => {
+  if (pin.length !== 6) return;
 
+  try {
+    const res = await fetch(`https://api.postalpincode.in/pincode/${pin}`);
+    const data = await res.json();
+
+    if (data[0].Status === 'Success') {
+      const po = data[0].PostOffice[0];
+      setCity(po.District);
+      setSuggestions([]);
+    }
+  } catch (err) {
+    console.log('Pincode error:', err);
+  }
+};
+
+// CITY → SUGGESTIONS
+const fetchCitySuggestions = (text: string) => {
+  setCity(text);
+
+  if (searchTimeout) clearTimeout(searchTimeout);
+
+  if (text.length < 3) {
+    setSuggestions([]);
+    return;
+  }
+
+  const timeout = setTimeout(async () => {
+    try {
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/search?q=${text}&countrycodes=in&format=json&addressdetails=1&limit=5&featuretype=city`,
+        {
+          headers: {
+            "User-Agent": "Stitchly-App"
+          }
+        }
+      );
+
+      const data = await res.json();
+      const filtered = data.filter(
+  (item: any) =>
+    item.address.city ||
+    item.address.town ||
+    item.address.state
+);
+
+setSuggestions(filtered);
+    } catch (err) {
+      console.log("OSM error:", err);
+    }
+  }, 400); // 400ms delay
+
+  setSearchTimeout(timeout);
+};
+const fetchCurrentLocation = async () => {
+  try {
+    setLoadingLocation(true);
+
+    const { status } =
+      await Location.requestForegroundPermissionsAsync();
+
+    if (status !== "granted") {
+      Alert.alert("Permission denied");
+      setLoadingLocation(false);
+      return;
+    }
+
+    const loc = await Location.getCurrentPositionAsync({
+      accuracy: Location.Accuracy.Balanced,
+    });
+
+    const { latitude, longitude } = loc.coords;
+
+    setLatitude(latitude);
+    setLongitude(longitude);
+
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json&addressdetails=1`,
+      {
+        headers: { "User-Agent": "Stitchly-App" },
+      }
+    );
+
+    const data = await res.json();
+    const address = data.address || {};
+
+    setCity(
+      address.city ||
+      address.town ||
+      address.village ||
+      address.state ||
+      ""
+    );
+
+    setPincode(address.postcode || "");
+    setAddress(data.display_name || "");
+    // Scroll down smoothly
+setTimeout(() => {
+  scrollRef.current?.scrollToEnd({ animated: true });
+
+  // Focus address input
+  addressInputRef.current?.focus();
+}, 500);
+
+    setLoadingLocation(false);
+
+  } catch (err) {
+    console.log("Location error:", err);
+    setLoadingLocation(false);
+  }
+};
   return (
     <SafeAreaView style={styles.container}>
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.flex}>
-        <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+        <ScrollView ref={scrollRef} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
           <TouchableOpacity onPress={() => router.back()} style={styles.backBtn} testID="register-back-btn" activeOpacity={0.7}>
             <Feather name="arrow-left" size={24} color={Colors.text} />
           </TouchableOpacity>
@@ -166,9 +293,10 @@ export default function Register() {
               {'  '}Your Location
             </Text>
             <View style={styles.locationRow}>
-              <View style={[styles.inputGroup, { flex: 2, marginRight: 8 }]}>
+             <View style={[styles.inputGroup, { flex: 2, marginRight: 8, position: 'relative' }]}>
                 <Text style={styles.label}>City *</Text>
                 <View style={styles.inputContainer}>
+<<<<<<< feat-added-location
                   <TextInput
                     testID="register-city-input"
                     style={styles.inputNoPad}
@@ -180,11 +308,88 @@ export default function Register() {
                       setCityTouched(true);
                     }}
                   />
+=======
+                  <TextInput testID="register-city-input" style={styles.inputNoPad} placeholder="e.g. Mumbai" placeholderTextColor={Colors.textMuted} value={city} onChangeText={fetchCitySuggestions} />
+>>>>>>> main
                 </View>
+                <TouchableOpacity
+  onPress={fetchCurrentLocation}
+  disabled={loadingLocation}
+  style={{
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 8,marginLeft: 5,
+    opacity: loadingLocation ? 0.6 : 1,
+  }}
+>
+  <Feather
+    name="map-pin"
+    size={14}
+    color={Colors.primary}
+    style={{ marginRight: 6 }}
+  />
+  <Text
+    style={{
+      color: Colors.primary,
+      fontSize: 14,
+      fontFamily: Fonts.bodyBold,
+    }}
+  >
+    {loadingLocation ? "Fetching location..." : "Use Current Location"}
+  </Text>
+</TouchableOpacity>
+                {suggestions.length > 0 && (
+  <View style={{
+    position: 'absolute',
+    top: 60,
+    left: 0,
+    right: 0,
+    backgroundColor: Colors.surface,
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    elevation: 8,
+    zIndex: 999,
+    maxHeight: 180,
+  }}>
+    <ScrollView keyboardShouldPersistTaps="handled">
+      {suggestions.map((item) => (
+        <TouchableOpacity
+          key={item.place_id}
+          style={{ padding: 10 }}
+          onPress={() => {
+  const address = item.address || {};
+
+  setCity(
+    address.city ||
+    address.town ||
+    address.village ||
+    ""
+  );
+
+  setPincode(address.postcode || "");
+  setAddress(item.display_name || "");
+
+  setLatitude(parseFloat(item.lat));
+  setLongitude(parseFloat(item.lon));
+
+  setSuggestions([]);
+}}>
+  
+         
+ <Text style={styles.dropdownText}>
+  {item.address.city || item.address.town || item.address.state}
+</Text>
+        </TouchableOpacity>
+      ))}
+    </ScrollView>
+  </View>
+)}
               </View>
               <View style={[styles.inputGroup, { flex: 1 }]}>
                 <Text style={styles.label}>Pincode</Text>
                 <View style={styles.inputContainer}>
+<<<<<<< feat-added-location
                   <TextInput
                     testID="register-pincode-input"
                     style={styles.inputNoPad}
@@ -198,6 +403,12 @@ export default function Register() {
                     keyboardType="numeric"
                     maxLength={6}
                   />
+=======
+                  <TextInput testID="register-pincode-input" style={styles.inputNoPad} placeholder="400001" placeholderTextColor={Colors.textMuted} value={pincode} onChangeText={(text) => {
+  setPincode(text);
+  fetchFromPincode(text);
+}} keyboardType="numeric" maxLength={6} />
+>>>>>>> main
                 </View>
               </View>
             </View>
@@ -219,7 +430,7 @@ export default function Register() {
               <Text style={styles.label}>Full Address</Text>
               <View style={styles.inputContainer}>
                 <Feather name="map" size={20} color={Colors.textMuted} />
-                <TextInput testID="register-address-input" style={styles.input} placeholder="Street, area, landmark" placeholderTextColor={Colors.textMuted} value={address} onChangeText={setAddress} />
+                <TextInput ref={addressInputRef}testID="register-address-input" style={styles.input} placeholder="Street, area, landmark" placeholderTextColor={Colors.textMuted} value={address} onChangeText={setAddress} />
               </View>
             </View>
           </View>
@@ -331,6 +542,7 @@ const styles = StyleSheet.create({
   linkButton: { alignItems: 'center', marginTop: 20, paddingVertical: 8 },
   linkText: { fontFamily: Fonts.ui, fontSize: 15, color: Colors.textMuted },
   linkBold: { fontFamily: Fonts.bodyBold, color: Colors.primary },
+<<<<<<< feat-added-location
   errorText: {
     fontFamily: Fonts.ui,
     fontSize: 12,
@@ -391,4 +603,11 @@ const styles = StyleSheet.create({
     fontSize: 15,
     color: Colors.textInverted,
   },
+=======
+  dropdownText: {
+  fontFamily: Fonts.ui,
+  fontSize: 14,
+  color: Colors.text,
+},
+>>>>>>> main
 });
