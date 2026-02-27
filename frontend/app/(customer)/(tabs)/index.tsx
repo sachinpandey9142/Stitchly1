@@ -130,6 +130,19 @@ export default function CustomerHome() {
                 {selectedCity === c && <Feather name="check" size={18} color={Colors.primary} />}
               </TouchableOpacity>
             ))}
+            <View style={{ height: .1, backgroundColor: Colors.subtle, marginTop: 5 }} />
+            <TouchableOpacity
+            style={styles.manageAddressOption}
+            onPress={() => {
+              setShowCityPicker(false);
+              router.push("/(customer)/addresses");
+            }}
+            activeOpacity={0.7}
+          >
+            <Feather name="map" size={18} color={Colors.primary} />
+            <Text style={styles.manageAddressText}>Manage Addresses</Text>
+            <Feather name="chevron-right" size={18} color={Colors.textMuted} />
+          </TouchableOpacity>
           </View>
         </View>
       </Modal>
@@ -270,4 +283,19 @@ const styles = StyleSheet.create({
   emptySubText: { fontFamily: Fonts.ui, fontSize: 14, color: Colors.textMuted, marginTop: 4 },
   showAllBtn: { marginTop: 16, backgroundColor: Colors.primary, borderRadius: Radius.full, paddingHorizontal: 24, paddingVertical: 12 },
   showAllText: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.textInverted },
+  manageAddressOption: {
+  flexDirection: "row",
+  alignItems: "center",
+  justifyContent: "space-between",
+  paddingVertical: 18,
+  marginTop: 12,
+},
+
+manageAddressText: {
+  flex: 1,
+  marginLeft: 12,
+  fontFamily: Fonts.bodyBold,
+  fontSize: 16,
+  color: Colors.primary,
+},
 });
