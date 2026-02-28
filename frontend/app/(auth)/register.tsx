@@ -50,7 +50,8 @@ export default function Register() {
   const [mapModalVisible, setMapModalVisible] = useState(false);
   const markerScale = useRef(new Animated.Value(0)).current;
   const DELIVERY_RADIUS = 3000; // meters (3km example)
-  
+  const [liveAddress, setLiveAddress] = useState("");
+  const [isMoving, setIsMoving] = useState(false);
 
   useEffect(() => {
   const loadRecent = async () => {
@@ -501,7 +502,7 @@ const fetchAddressSuggestions = async (text: string) => {
           </TouchableOpacity>
         </ScrollView>
       </KeyboardAvoidingView>
-      <Modal
+     <Modal
   visible={mapModalVisible}
   animationType="slide"
   onRequestClose={() => setMapModalVisible(false)}
@@ -518,11 +519,15 @@ const fetchAddressSuggestions = async (text: string) => {
             latitudeDelta: 0.01,
             longitudeDelta: 0.01,
           }}
-          onRegionChangeComplete={(region) => {
+          onRegionChange={() => {
+            setIsMoving(true);
+          }}
+          onRegionChangeComplete={async (region) => {
             setLatitude(region.latitude);
             setLongitude(region.longitude);
+            setIsMoving(false);
 
-            // Smooth marker bounce
+            // Marker bounce
             Animated.sequence([
               Animated.timing(markerAnim, {
                 toValue: 1,
@@ -535,17 +540,72 @@ const fetchAddressSuggestions = async (text: string) => {
                 useNativeDriver: true,
               }),
             ]).start();
+
+            // 🔥 LIVE ADDRESS UPDATE
+            try {
+              const res = await fetch(
+                `https://nominatim.openstreetmap.org/reverse?lat=${region.latitude}&lon=${region.longitude}&format=json&addressdetails=1`,
+                { headers: { "User-Agent": "Stitchly-App" } }
+              );
+              const data = await res.json();
+              setLiveAddress(data.display_name || "");
+            } catch {}
           }}
         >
           <Circle
             center={{ latitude, longitude }}
             radius={DELIVERY_RADIUS}
             strokeColor="rgba(0,150,255,0.8)"
-            fillColor="rgba(0,150,255,0.2)"
+            fillColor="rgba(0,150,255,0.15)"
           />
         </MapView>
 
-        {/* Fixed Center Marker (Swiggy Style) */}
+        {/* Address Preview Card */}
+        <View
+          style={{
+            position: "absolute",
+            top: 60,
+            left: 20,
+            right: 20,
+            backgroundColor: "#fff",
+            padding: 14,
+            borderRadius: 12,
+            elevation: 5,
+          }}
+        >
+          <Text style={{ fontWeight: "600", marginBottom: 4 }}>
+            Selected Location
+          </Text>
+          <Text numberOfLines={2} style={{ fontSize: 13 }}>
+            {liveAddress || "Move map to adjust location"}
+          </Text>
+        </View>
+
+        {/* Marker Shadow */}
+        <Animated.View
+  pointerEvents="none"
+  style={{
+    position: "absolute",
+    top: "50%",
+    left: "50%",
+    marginLeft: -8,
+    marginTop: 2, // 👈 closer to marker
+    width: 15,
+    height: 5,
+    borderRadius: 16,
+    backgroundColor: "rgba(0,0,0,0.15)",
+shadowColor: "#000",
+shadowOpacity: 0.3,
+shadowRadius: 6,
+    transform: [
+      {
+        scale: isMoving ? 0.8 : 1, // shadow shrinks when marker lifts
+      },
+    ],
+  }}
+/>
+
+        {/* Fixed Center Marker */}
         <Animated.View
           pointerEvents="none"
           style={{
@@ -556,9 +616,12 @@ const fetchAddressSuggestions = async (text: string) => {
             marginTop: -36,
             transform: [
               {
-                translateY: markerAnim.interpolate({
+                translateY: isMoving ? -15 : 0,
+              },
+              {
+                scale: markerAnim.interpolate({
                   inputRange: [0, 1],
-                  outputRange: [0, -10],
+                  outputRange: [1, 1.1],
                 }),
               },
             ],
@@ -569,31 +632,9 @@ const fetchAddressSuggestions = async (text: string) => {
 
         {/* Confirm Button */}
         <TouchableOpacity
-          onPress={async () => {
-            try {
-              const res = await fetch(
-                `https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json&addressdetails=1`,
-                { headers: { "User-Agent": "Stitchly-App" } }
-              );
-
-              const data = await res.json();
-              const addr = data.address || {};
-
-              setCity(
-                addr.city ||
-                addr.town ||
-                addr.village ||
-                addr.state ||
-                ""
-              );
-
-              setPincode(addr.postcode || "");
-              setAddress(data.display_name || "");
-
-              setMapModalVisible(false);
-            } catch (err) {
-              console.log("Reverse error:", err);
-            }
+          onPress={() => {
+            setAddress(liveAddress);
+            setMapModalVisible(false);
           }}
           style={{
             position: "absolute",
@@ -602,7 +643,7 @@ const fetchAddressSuggestions = async (text: string) => {
             right: 20,
             backgroundColor: Colors.primary,
             padding: 16,
-            borderRadius: Radius.full,
+            borderRadius: 40,
             alignItems: "center",
             elevation: 6,
           }}
@@ -613,7 +654,6 @@ const fetchAddressSuggestions = async (text: string) => {
         </TouchableOpacity>
       </>
     )}
-
   </View>
 </Modal>
     </SafeAreaView>
