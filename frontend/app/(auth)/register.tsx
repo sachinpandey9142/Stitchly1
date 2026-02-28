@@ -46,22 +46,40 @@ export default function Register() {
   const dropdownOpacity = useRef(new Animated.Value(0)).current;
   const mapOpacity = useRef(new Animated.Value(0)).current;
   const markerAnim = useRef(new Animated.Value(0)).current;
-  const [recentLocations, setRecentLocations] = useState<any[]>([]);
   const [mapModalVisible, setMapModalVisible] = useState(false);
   const markerScale = useRef(new Animated.Value(0)).current;
   const DELIVERY_RADIUS = 3000; // meters (3km example)
   
 
-  useEffect(() => {
-  const loadRecent = async () => {
-    const stored = await AsyncStorage.getItem("recent_locations");
-    if (stored) {
-      setRecentLocations(JSON.parse(stored));
-    }
-  };
+  const [recentLocations, setRecentLocations] = useState<any[]>([]);
+  const [activeField, setActiveField] = useState<'city' | 'address' | null>(null);
 
-  loadRecent();
-}, []);
+  useEffect(() => {
+    const loadRecent = async () => {
+      try {
+        const stored = await AsyncStorage.getItem('recent_locations');
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          if (Array.isArray(parsed)) {
+            setRecentLocations(parsed);
+          }
+        }
+      } catch {
+        // ignore load errors
+      }
+    };
+
+    loadRecent();
+  }, []);
+
+  const upsertRecentLocation = async (loc: { address: string; lat: string; lon: string }) => {
+    setRecentLocations((prev) => {
+      const filtered = prev.filter((r) => r.address !== loc.address);
+      const updated = [loc, ...filtered].slice(0, 5);
+      AsyncStorage.setItem('recent_locations', JSON.stringify(updated)).catch(() => {});
+      return updated;
+    });
+  };
 useEffect(() => {
   if (latitude && longitude) {
     markerScale.setValue(0);
@@ -159,7 +177,7 @@ setSuggestions(filtered);
   setSearchTimeout(timeout);
 };
 useEffect(() => {
-  if (suggestions.length > 0) {
+  if (suggestions.length > 0 || recentLocations.length > 0) {
     Animated.timing(dropdownOpacity, {
       toValue: 1,
       duration: 200,
@@ -168,7 +186,7 @@ useEffect(() => {
   } else {
     dropdownOpacity.setValue(0);
   }
-}, [suggestions]);
+}, [suggestions, recentLocations]);
 
 const fetchCurrentLocation = async () => {
   try {
@@ -363,35 +381,23 @@ const fetchAddressSuggestions = async (text: string) => {
     {loadingLocation ? "Fetching location..." : "Use Current Location"}
   </Text>
 </TouchableOpacity>
-{recentLocations.length > 0 && (
-  <View style={{ marginTop: 10 }}>
-    <Text style={{ fontSize: 13, color: Colors.textMuted }}>
-      Recent Locations
-    </Text>
 
-    {recentLocations.map((loc, index) => (
-      <TouchableOpacity
-        key={index}
-        onPress={() => {
-          setAddress(loc.address);
-          setLatitude(parseFloat(loc.lat));
-          setLongitude(parseFloat(loc.lon));
-        }}
-        style={{ paddingVertical: 8 }}
-      >
-        <Text>{loc.address}</Text>
-      </TouchableOpacity>
-    ))}
-  </View>
-)}
             <View style={styles.locationRow}>
              <View style={[styles.inputGroup, { flex: 2, marginRight: 8, position: 'relative' }]}>
                 <Text style={styles.label}>City *</Text>
                 <View style={styles.inputContainer}>
-                  <TextInput testID="register-city-input" style={styles.inputNoPad} placeholder="e.g. Mumbai" placeholderTextColor={Colors.textMuted} value={city} onChangeText={fetchCitySuggestions} />
+                  <TextInput
+                    testID="register-city-input"
+                    style={styles.inputNoPad}
+                    placeholder="e.g. Mumbai"
+                    placeholderTextColor={Colors.textMuted}
+                    value={city}
+                    onChangeText={fetchCitySuggestions}
+                    onFocus={() => setActiveField('city')}
+                  />
                 </View>
                
-                {suggestions.length > 0 && (
+                {activeField === 'city' && suggestions.length > 0 && (
   <Animated.View
     style={{
       position: "absolute",
@@ -413,40 +419,24 @@ const fetchAddressSuggestions = async (text: string) => {
         <TouchableOpacity
   key={item.place_id}
   style={{ padding: 10 }}
-  onPress={async () => {
-    const address = item.address || {};
+                                              onPress={async () => {
+                                              const address = item.address || {};
 
-    setCity(
-      address.city ||
-      address.town ||
-      address.village ||
-      ""
-    );
+                                              setCity(
+                                                address.city ||
+                                                address.town ||
+                                                address.village ||
+                                                ""
+                                              );
 
-    setPincode(address.postcode || "");
-    setAddress(item.display_name || "");
+                                              setPincode(address.postcode || "");
+                                              setAddress(item.display_name || "");
 
-    setLatitude(parseFloat(item.lat));
-    setLongitude(parseFloat(item.lon));
+                                              setLatitude(parseFloat(item.lat));
+                                              setLongitude(parseFloat(item.lon));
 
-    const newLocation = {
-      address: item.display_name,
-      lat: item.lat,
-      lon: item.lon,
-    };
-
-    const updated = [newLocation, ...recentLocations]
-      .slice(0, 5);
-
-    setRecentLocations(updated);
-
-    await AsyncStorage.setItem(
-      "recent_locations",
-      JSON.stringify(updated)
-    );
-
-    setSuggestions([]);
-  }}>
+                                              setSuggestions([]);
+                                            }}>
 
  
   
@@ -473,9 +463,73 @@ const fetchAddressSuggestions = async (text: string) => {
 
             <View style={styles.inputGroup}>
               <Text style={styles.label}>Full Address</Text>
-              <View style={styles.inputContainer}>
-                <Feather name="map" size={20} color={Colors.textMuted} />
-                <TextInput ref={addressInputRef}testID="register-address-input" style={styles.input} placeholder="Street, area, landmark" placeholderTextColor={Colors.textMuted} value={address} onChangeText={fetchAddressSuggestions} />
+              <View style={{ position: 'relative' }}>
+                <View style={styles.inputContainer}>
+                  <Feather name="map" size={20} color={Colors.textMuted} />
+                  <TextInput
+                    ref={addressInputRef}
+                    testID="register-address-input"
+                    style={styles.input}
+                    placeholder="Street, area, landmark"
+                    placeholderTextColor={Colors.textMuted}
+                    value={address}
+                    onChangeText={fetchAddressSuggestions}
+                    onFocus={() => setActiveField('address')}
+                  />
+                </View>
+
+                {activeField === 'address' && (recentLocations.length > 0 || suggestions.length > 0) && (
+                  <Animated.View style={[styles.addressDropdown, { opacity: dropdownOpacity }]}>
+                    <ScrollView
+                      keyboardShouldPersistTaps="handled"
+                      style={{ maxHeight: 220 }}
+                    >
+                      {recentLocations.length > 0 && (
+                        <>
+                          <Text style={styles.dropdownSectionTitle}>Recent Locations</Text>
+                          {recentLocations.map((loc, idx) => (
+                            <TouchableOpacity
+                              key={`${loc.address}-${idx}`}
+                              style={styles.dropdownItem}
+                              onPress={() => {
+                                setAddress(loc.address);
+                                setLatitude(parseFloat(loc.lat));
+                                setLongitude(parseFloat(loc.lon));
+                                setSuggestions([]);
+                              }}
+                            >
+                              <Text style={styles.dropdownText} numberOfLines={2}>
+                                {loc.address}
+                              </Text>
+                            </TouchableOpacity>
+                          ))}
+                        </>
+                      )}
+
+                      {suggestions.map((item) => (
+                        <TouchableOpacity
+                          key={item.place_id ?? item.display_name}
+                          style={styles.dropdownItem}
+                          onPress={() => {
+                            setAddress(item.display_name || '');
+                            setLatitude(parseFloat(item.lat));
+                            setLongitude(parseFloat(item.lon));
+                            void upsertRecentLocation({
+                              address: item.display_name,
+                              lat: item.lat,
+                              lon: item.lon,
+                            });
+                            setSuggestions([]);
+                          }}
+                        >
+                          <Text style={styles.dropdownText} numberOfLines={2}>
+                            {item.display_name}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </ScrollView>
+                  </Animated.View>
+                )}
               </View>
             </View>
             
@@ -592,7 +646,7 @@ const fetchAddressSuggestions = async (text: string) => {
 
               setMapModalVisible(false);
             } catch (err) {
-              console.log("Reverse error:", err);
+            console.log("Reverse error:", err);
             }
           }}
           style={{
@@ -664,4 +718,34 @@ const styles = StyleSheet.create({
   fontSize: 14,
   color: Colors.text,
 },
+  addressDropdown: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 60,
+    backgroundColor: Colors.surface,
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
+    elevation: 6,
+    zIndex: 50,
+  },
+  dropdownSectionTitle: {
+    fontFamily: Fonts.bodyBold,
+    fontSize: 12,
+    color: Colors.textMuted,
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 4,
+  },
+  dropdownItem: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.subtle,
+  },
 });
