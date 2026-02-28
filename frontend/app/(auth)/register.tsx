@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, Alert } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, Alert,} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
@@ -7,6 +7,14 @@ import { useAuth } from '../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius } from '../../src/utils/theme';
 import * as Location from 'expo-location';
 import { useRef } from 'react';
+import { ActivityIndicator } from 'react-native';
+import * as Haptics from 'expo-haptics';
+import { Animated } from 'react-native';
+import { useEffect } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Modal } from "react-native";
+import MapView, { Marker, Circle } from "react-native-maps";
+
 
 const ROLES = [
   { key: 'customer', label: 'Customer', icon: 'shopping-bag' as const, desc: 'Find tailors near you' },
@@ -34,8 +42,37 @@ export default function Register() {
   const [latitude, setLatitude] = useState<number | null>(null); 
   const [longitude, setLongitude] = useState<number | null>(null);
   const [searchTimeout, setSearchTimeout] = useState<ReturnType<typeof setTimeout> | null>(null);
+  const [locationSuccess, setLocationSuccess] = useState(false);
+  const dropdownOpacity = useRef(new Animated.Value(0)).current;
+  const mapOpacity = useRef(new Animated.Value(0)).current;
+  const markerAnim = useRef(new Animated.Value(0)).current;
+  const [recentLocations, setRecentLocations] = useState<any[]>([]);
+  const [mapModalVisible, setMapModalVisible] = useState(false);
+  const markerScale = useRef(new Animated.Value(0)).current;
+  const DELIVERY_RADIUS = 3000; // meters (3km example)
+  
 
+  useEffect(() => {
+  const loadRecent = async () => {
+    const stored = await AsyncStorage.getItem("recent_locations");
+    if (stored) {
+      setRecentLocations(JSON.parse(stored));
+    }
+  };
 
+  loadRecent();
+}, []);
+useEffect(() => {
+  if (latitude && longitude) {
+    markerScale.setValue(0);
+    Animated.spring(markerScale, {
+      toValue: 1,
+      friction: 5,
+      useNativeDriver: true,
+    }).start();
+  }
+}, [latitude, longitude]);
+  
   const handleRegister = async () => {
     if (!name.trim() || !email.trim() || !phone.trim() || !password) {
       Alert.alert('Error', 'Please fill in all required fields');
@@ -121,6 +158,18 @@ setSuggestions(filtered);
 
   setSearchTimeout(timeout);
 };
+useEffect(() => {
+  if (suggestions.length > 0) {
+    Animated.timing(dropdownOpacity, {
+      toValue: 1,
+      duration: 200,
+      useNativeDriver: true,
+    }).start();
+  } else {
+    dropdownOpacity.setValue(0);
+  }
+}, [suggestions]);
+
 const fetchCurrentLocation = async () => {
   try {
     setLoadingLocation(true);
@@ -163,6 +212,19 @@ const fetchCurrentLocation = async () => {
 
     setPincode(address.postcode || "");
     setAddress(data.display_name || "");
+
+    setMapModalVisible(true);
+
+    // 🔥 Success feedback
+setLocationSuccess(true);
+Haptics.notificationAsync(
+  Haptics.NotificationFeedbackType.Success
+);
+
+// Hide tick after 2 sec
+setTimeout(() => {
+  setLocationSuccess(false);
+}, 2000);
     // Scroll down smoothly
 setTimeout(() => {
   scrollRef.current?.scrollToEnd({ animated: true });
@@ -178,6 +240,30 @@ setTimeout(() => {
     setLoadingLocation(false);
   }
 };
+const fetchAddressSuggestions = async (text: string) => {
+  setAddress(text);
+
+  if (text.length < 4) {
+    setSuggestions([]);
+    return;
+  }
+
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/search?q=${text}&countrycodes=in&format=json&addressdetails=1&limit=5`,
+      {
+        headers: { "User-Agent": "Stitchly-App" }
+      }
+    );
+
+    const data = await res.json();
+    setSuggestions(data);
+  } catch (err) {
+    console.log("Address search error:", err);
+  }
+};
+
+
   return (
     <SafeAreaView style={styles.container}>
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.flex}>
@@ -235,28 +321,38 @@ setTimeout(() => {
               <Feather name="map-pin" size={15} color={Colors.primary} />
               {'  '}Your Location
             </Text>
-            <View style={styles.locationRow}>
-             <View style={[styles.inputGroup, { flex: 2, marginRight: 8, position: 'relative' }]}>
-                <Text style={styles.label}>City *</Text>
-                <View style={styles.inputContainer}>
-                  <TextInput testID="register-city-input" style={styles.inputNoPad} placeholder="e.g. Mumbai" placeholderTextColor={Colors.textMuted} value={city} onChangeText={fetchCitySuggestions} />
-                </View>
-                <TouchableOpacity
+             <TouchableOpacity
   onPress={fetchCurrentLocation}
   disabled={loadingLocation}
   style={{
     flexDirection: "row",
     alignItems: "center",
-    marginTop: 8,marginLeft: 5,
-    opacity: loadingLocation ? 0.6 : 1,
+    marginTop: 8,
+    opacity: loadingLocation ? 0.7 : 1,
   }}
 >
+  {loadingLocation ? (
+  <ActivityIndicator
+    size="small"
+    color={Colors.primary}
+    style={{ marginRight: 6 }}
+  />
+) : locationSuccess ? (
+  <Feather
+    name="check-circle"
+    size={16}
+    color="green"
+    style={{ marginRight: 6 }}
+  />
+) : (
   <Feather
     name="map-pin"
     size={14}
     color={Colors.primary}
     style={{ marginRight: 6 }}
   />
+)}
+
   <Text
     style={{
       color: Colors.primary,
@@ -267,43 +363,92 @@ setTimeout(() => {
     {loadingLocation ? "Fetching location..." : "Use Current Location"}
   </Text>
 </TouchableOpacity>
+{recentLocations.length > 0 && (
+  <View style={{ marginTop: 10 }}>
+    <Text style={{ fontSize: 13, color: Colors.textMuted }}>
+      Recent Locations
+    </Text>
+
+    {recentLocations.map((loc, index) => (
+      <TouchableOpacity
+        key={index}
+        onPress={() => {
+          setAddress(loc.address);
+          setLatitude(parseFloat(loc.lat));
+          setLongitude(parseFloat(loc.lon));
+        }}
+        style={{ paddingVertical: 8 }}
+      >
+        <Text>{loc.address}</Text>
+      </TouchableOpacity>
+    ))}
+  </View>
+)}
+            <View style={styles.locationRow}>
+             <View style={[styles.inputGroup, { flex: 2, marginRight: 8, position: 'relative' }]}>
+                <Text style={styles.label}>City *</Text>
+                <View style={styles.inputContainer}>
+                  <TextInput testID="register-city-input" style={styles.inputNoPad} placeholder="e.g. Mumbai" placeholderTextColor={Colors.textMuted} value={city} onChangeText={fetchCitySuggestions} />
+                </View>
+               
                 {suggestions.length > 0 && (
-  <View style={{
-    position: 'absolute',
-    top: 60,
-    left: 0,
-    right: 0,
-    backgroundColor: Colors.surface,
-    borderRadius: Radius.md,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    elevation: 8,
-    zIndex: 999,
-    maxHeight: 180,
-  }}>
+  <Animated.View
+    style={{
+      position: "absolute",
+      top: 60,
+      left: 0,
+      right: 0,
+      backgroundColor: Colors.surface,
+      borderRadius: Radius.md,
+      borderWidth: 1,
+      borderColor: Colors.border,
+      elevation: 8,
+      zIndex: 999,
+      maxHeight: 180,
+      opacity: dropdownOpacity,   // 👈 ADD THIS
+    }}
+  >
     <ScrollView keyboardShouldPersistTaps="handled">
       {suggestions.map((item) => (
         <TouchableOpacity
-          key={item.place_id}
-          style={{ padding: 10 }}
-          onPress={() => {
-  const address = item.address || {};
+  key={item.place_id}
+  style={{ padding: 10 }}
+  onPress={async () => {
+    const address = item.address || {};
 
-  setCity(
-    address.city ||
-    address.town ||
-    address.village ||
-    ""
-  );
+    setCity(
+      address.city ||
+      address.town ||
+      address.village ||
+      ""
+    );
 
-  setPincode(address.postcode || "");
-  setAddress(item.display_name || "");
+    setPincode(address.postcode || "");
+    setAddress(item.display_name || "");
 
-  setLatitude(parseFloat(item.lat));
-  setLongitude(parseFloat(item.lon));
+    setLatitude(parseFloat(item.lat));
+    setLongitude(parseFloat(item.lon));
 
-  setSuggestions([]);
-}}>
+    const newLocation = {
+      address: item.display_name,
+      lat: item.lat,
+      lon: item.lon,
+    };
+
+    const updated = [newLocation, ...recentLocations]
+      .slice(0, 5);
+
+    setRecentLocations(updated);
+
+    await AsyncStorage.setItem(
+      "recent_locations",
+      JSON.stringify(updated)
+    );
+
+    setSuggestions([]);
+  }}>
+
+ 
   
          
  <Text style={styles.dropdownText}>
@@ -312,7 +457,7 @@ setTimeout(() => {
         </TouchableOpacity>
       ))}
     </ScrollView>
-  </View>
+  </Animated.View>
 )}
               </View>
               <View style={[styles.inputGroup, { flex: 1 }]}>
@@ -330,9 +475,10 @@ setTimeout(() => {
               <Text style={styles.label}>Full Address</Text>
               <View style={styles.inputContainer}>
                 <Feather name="map" size={20} color={Colors.textMuted} />
-                <TextInput ref={addressInputRef}testID="register-address-input" style={styles.input} placeholder="Street, area, landmark" placeholderTextColor={Colors.textMuted} value={address} onChangeText={setAddress} />
+                <TextInput ref={addressInputRef}testID="register-address-input" style={styles.input} placeholder="Street, area, landmark" placeholderTextColor={Colors.textMuted} value={address} onChangeText={fetchAddressSuggestions} />
               </View>
             </View>
+            
           </View>
 
           <View style={styles.inputGroup}>
@@ -355,6 +501,121 @@ setTimeout(() => {
           </TouchableOpacity>
         </ScrollView>
       </KeyboardAvoidingView>
+      <Modal
+  visible={mapModalVisible}
+  animationType="slide"
+  onRequestClose={() => setMapModalVisible(false)}
+>
+  <View style={{ flex: 1 }}>
+
+    {latitude !== null && longitude !== null && (
+      <>
+        <MapView
+          style={{ flex: 1 }}
+          initialRegion={{
+            latitude: latitude!,
+            longitude: longitude!,
+            latitudeDelta: 0.01,
+            longitudeDelta: 0.01,
+          }}
+          onRegionChangeComplete={(region) => {
+            setLatitude(region.latitude);
+            setLongitude(region.longitude);
+
+            // Smooth marker bounce
+            Animated.sequence([
+              Animated.timing(markerAnim, {
+                toValue: 1,
+                duration: 120,
+                useNativeDriver: true,
+              }),
+              Animated.timing(markerAnim, {
+                toValue: 0,
+                duration: 120,
+                useNativeDriver: true,
+              }),
+            ]).start();
+          }}
+        >
+          <Circle
+            center={{ latitude, longitude }}
+            radius={DELIVERY_RADIUS}
+            strokeColor="rgba(0,150,255,0.8)"
+            fillColor="rgba(0,150,255,0.2)"
+          />
+        </MapView>
+
+        {/* Fixed Center Marker (Swiggy Style) */}
+        <Animated.View
+          pointerEvents="none"
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            marginLeft: -18,
+            marginTop: -36,
+            transform: [
+              {
+                translateY: markerAnim.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [0, -10],
+                }),
+              },
+            ],
+          }}
+        >
+          <Feather name="map-pin" size={36} color={Colors.primary} />
+        </Animated.View>
+
+        {/* Confirm Button */}
+        <TouchableOpacity
+          onPress={async () => {
+            try {
+              const res = await fetch(
+                `https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json&addressdetails=1`,
+                { headers: { "User-Agent": "Stitchly-App" } }
+              );
+
+              const data = await res.json();
+              const addr = data.address || {};
+
+              setCity(
+                addr.city ||
+                addr.town ||
+                addr.village ||
+                addr.state ||
+                ""
+              );
+
+              setPincode(addr.postcode || "");
+              setAddress(data.display_name || "");
+
+              setMapModalVisible(false);
+            } catch (err) {
+              console.log("Reverse error:", err);
+            }
+          }}
+          style={{
+            position: "absolute",
+            bottom: 40,
+            left: 20,
+            right: 20,
+            backgroundColor: Colors.primary,
+            padding: 16,
+            borderRadius: Radius.full,
+            alignItems: "center",
+            elevation: 6,
+          }}
+        >
+          <Text style={{ color: "#fff", fontWeight: "600" }}>
+            Confirm Location
+          </Text>
+        </TouchableOpacity>
+      </>
+    )}
+
+  </View>
+</Modal>
     </SafeAreaView>
   );
 }
