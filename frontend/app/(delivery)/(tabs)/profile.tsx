@@ -2,7 +2,7 @@ import React from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, ScrollView, Alert } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
-import { Feather } from '@expo/vector-icons';
+import { Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useAuth } from '../../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius } from '../../../src/utils/theme';
 import { Image } from "react-native";
@@ -45,6 +45,13 @@ export default function DeliveryProfile() {
           <View style={styles.infoRow}><Feather name="home" size={18} color={Colors.textMuted} /><Text style={styles.infoLabel}>Address</Text><Text style={styles.infoValue}>{user?.address || 'Not set'}</Text></View>
           <View style={styles.infoRow}><Feather name="phone" size={18} color={Colors.textMuted} /><Text style={styles.infoLabel}>Phone</Text><Text style={styles.infoValue}>{user?.phone}</Text></View>
           <View style={styles.infoRow}><Feather name="star" size={18} color={Colors.secondary} /><Text style={styles.infoLabel}>Rating</Text><Text style={styles.infoValue}>{user?.rating?.toFixed(1)} ({user?.rating_count})</Text></View>
+          
+  <View style={styles.infoRow}>
+  <MaterialCommunityIcons name="gender-male-female"size={20}color={Colors.textMuted}/>
+  <Text style={styles.infoLabel}>Gender</Text>
+  <Text style={styles.infoValue}>{user?.gender || 'Not set'}</Text>
+  </View>
+  
         </View>
         <TouchableOpacity
   style={{

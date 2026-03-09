@@ -19,6 +19,10 @@ export type User = {
   experience: string;
   working_hours: Record<string, string>;
   profile_photo: string;
+  height?: string;
+  weight?: string;
+  gender?: 'male' | 'female';
+  bodyType?: 'slim' | 'fit' | 'bulk';
 };
 
 type RegisterData = {
@@ -27,9 +31,15 @@ type RegisterData = {
   phone: string;
   password: string;
   role: string;
-  city?: string;
-  pincode?: string;
-  address?: string;
+  city: string;
+  pincode: string;
+  address: string;
+
+  // 👇 ADD THESE
+  height?: string;
+  weight?: string;
+  gender?: 'male' | 'female';
+  bodyType?: 'slim' | 'fit' | 'bulk';
 };
 
 type AuthContextType = {
@@ -74,13 +84,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return data.user;
   };
 
-  const register = async (registerData: RegisterData) => {
-    const data = await api.post('/auth/register', registerData);
-    await AsyncStorage.setItem('auth_token', data.token);
-    setUser(data.user);
-    return data.user;
+ const register = async (registerData: RegisterData) => {
+  const data = await api.post('/auth/register', registerData);
+
+  const enrichedUser: User = {
+    ...data.user,
+    height: registerData.height,
+    weight: registerData.weight,
+    gender: registerData.gender,
+    bodyType: registerData.bodyType,
   };
 
+  await AsyncStorage.setItem('auth_token', data.token);
+
+  setUser(enrichedUser);
+
+  return enrichedUser;
+};
+
+ 
   const logout = async () => {
     await AsyncStorage.removeItem('auth_token');
     setUser(null);

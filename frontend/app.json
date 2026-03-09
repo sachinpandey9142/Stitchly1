@@ -12,12 +12,14 @@
       "supportsTablet": true
     },
     "android": {
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/images/adaptive-icon.png",
-        "backgroundColor": "#000"
-      },
-      "edgeToEdgeEnabled": true
-    },
+  "package": "com.stitchly.app",
+  "permissions": ["CAMERA"],
+  "adaptiveIcon": {
+    "foregroundImage": "./assets/images/adaptive-icon.png",
+    "backgroundColor": "#000"
+  },
+  "edgeToEdgeEnabled": true
+},
     "web": {
       "bundler": "metro",
       "output": "static",
@@ -28,15 +30,16 @@
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/splash-icon.png",
+          "image": "./assets/images/splash-image.png",
           "imageWidth": 200,
           "resizeMode": "contain",
           "backgroundColor": "#000"
         }
-      ]
+      ],
+      "react-native-vision-camera"
     ],
-    "experiments": {
-      "typedRoutes": true
+    "extra": {
+      "router": {}
     }
   }
 }

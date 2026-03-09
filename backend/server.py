@@ -18,6 +18,18 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import razorpay
+import cv2
+import mediapipe as mp
+import numpy as np
+from fastapi import UploadFile, File, Form
+import shutil
+
+
+from ai.pose_detector import detect_landmarks
+from ai.measurement_calculator import calculate_measurements
+
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(static_image_mode=True)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -53,6 +65,10 @@ class UserRegister(BaseModel):
     city: str = ""
     pincode: str = ""
     address: str = ""
+    height: str | None = None
+    weight: str | None = None
+    gender: str | None = None
+    bodyType: str | None = None
 
 class UserLogin(BaseModel):
     email: str
@@ -158,7 +174,7 @@ async def register(data: UserRegister):
     pincode_val = data.pincode.strip() if data.pincode else ""
     address_val = data.address.strip() if data.address else ""
     location_str = f"{city_val}, {pincode_val}".strip(", ") if city_val or pincode_val else ""
-
+    
     user = {
         "id": str(uuid.uuid4()),
         "name": data.name,
@@ -170,6 +186,10 @@ async def register(data: UserRegister):
         "pincode": pincode_val,
         "address": address_val,
         "location": location_str,
+        "gender": data.gender,
+        "height": data.height if data.role == "customer" else None,
+        "weight": data.weight if data.role == "customer" else None,
+        "bodyType": data.bodyType if data.role == "customer" else None,
         "rating": 0.0,
         "rating_count": 0,
         "status": "pending" if data.role == "tailor" else "active",
@@ -177,6 +197,7 @@ async def register(data: UserRegister):
         "experience": "",
         "working_hours": {},
         "profile_photo": "",
+        
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     await db.users.insert_one(user)
@@ -1136,3 +1157,109 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
+
+
+# ===================== AI MEASUREMENT ENDPOINT =====================
+@app.post("/ai/check-position")
+async def check_position(
+    image: UploadFile = File(...),
+    height_cm: float = Form(...)
+):
+
+    os.makedirs("temp", exist_ok=True)
+
+    file_path = f"temp/{image.filename}"
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(image.file, buffer)
+
+    landmarks = detect_landmarks(file_path)
+
+    if not landmarks:
+        return {"error": "No body detected"}
+
+    measurements = calculate_measurements(
+    landmarks,
+    landmarks,
+    landmarks,
+    height_cm
+    )
+
+    formatted_landmarks = []
+
+    for x, y, z in landmarks:
+        formatted_landmarks.append({
+            "x": x,
+            "y": y,
+            "z": z
+        })
+    print("Measurements:", measurements)
+    return {
+        "success": True,
+        "measurements": measurements,
+        "landmarks": formatted_landmarks
+    }
+
+# ===================== AI MEASUREMENT ENDPOINT =====================
+
+
+@app.post("/ai/scan-body")
+async def scan_body(
+    front_image: UploadFile = File(...),
+    side_image: UploadFile = File(...),
+    back_image: UploadFile = File(...),
+    height_cm: float = Form(...)
+):
+
+    os.makedirs("temp", exist_ok=True)
+
+    # -------- Save images --------
+
+    front_path = f"temp/front_{front_image.filename}"
+    side_path = f"temp/side_{side_image.filename}"
+    back_path = f"temp/back_{back_image.filename}"
+
+    with open(front_path, "wb") as buffer:
+        shutil.copyfileobj(front_image.file, buffer)
+
+    with open(side_path, "wb") as buffer:
+        shutil.copyfileobj(side_image.file, buffer)
+
+    with open(back_path, "wb") as buffer:
+        shutil.copyfileobj(back_image.file, buffer)
+
+    # -------- Detect landmarks --------
+
+    front_landmarks = detect_landmarks(front_path)
+    side_landmarks = detect_landmarks(side_path)
+    back_landmarks = detect_landmarks(back_path)
+
+    if not front_landmarks or not side_landmarks or not back_landmarks:
+        return {"error": "Body detection failed"}
+
+    # -------- Calculate measurements --------
+
+    measurements = calculate_measurements(
+        front_landmarks,
+        side_landmarks,
+        back_landmarks,
+        height_cm
+    )
+
+    # -------- Format landmarks for frontend --------
+
+    formatted_landmarks = []
+
+    for x, y, z in front_landmarks:
+        formatted_landmarks.append({
+            "x": x,
+            "y": y,
+            "z": z
+        })
+
+    return {
+        "success": True,
+        "measurements": measurements,
+        "landmarks": formatted_landmarks
+    }

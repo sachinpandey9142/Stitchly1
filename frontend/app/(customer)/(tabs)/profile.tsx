@@ -6,6 +6,7 @@ import { Feather } from '@expo/vector-icons';
 import { useAuth } from '../../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius } from '../../../src/utils/theme';
 import { Image } from "react-native";
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 
 export default function CustomerProfile() {
   const router = useRouter();
@@ -65,6 +66,29 @@ export default function CustomerProfile() {
             <Text style={styles.infoLabel}>Phone</Text>
             <Text style={styles.infoValue}>{user?.phone || 'Not set'}</Text>
           </View>
+          <View style={{ marginTop: 20 }}>
+          <Text style={styles.sectionTitle}>Body Details</Text>
+       
+  <View style={styles.infoRow}>
+  <MaterialCommunityIcons name="ruler"size={20}color={Colors.textMuted}/>
+  <Text style={styles.infoLabel}>Height</Text>
+   <Text style={styles.infoValue}>{user?.height || 'Not set'} cm</Text> 
+   </View>
+  <View style={styles.infoRow}>
+  <MaterialCommunityIcons name="weight-kilogram"size={20}color={Colors.textMuted}/>
+  <Text style={styles.infoLabel}>Weight</Text>
+  <Text style={styles.infoValue}>{user?.weight || 'Not set'} kg</Text>
+  </View>
+  <View style={styles.infoRow}>
+  <MaterialCommunityIcons name="gender-male-female"size={20}color={Colors.textMuted}/>
+  <Text style={styles.infoLabel}>Gender</Text>
+  <Text style={styles.infoValue}>{user?.gender || 'Not set'}</Text>
+  </View>
+  <View style={styles.infoRow}>
+  <MaterialCommunityIcons name="human-male"size={20}color={Colors.textMuted}/>
+  <Text style={styles.infoLabel}>Body Type</Text>
+  <Text style={styles.infoValue}>{user?.bodyType || 'Not set'}</Text></View>
+</View>
         </View>
         <TouchableOpacity
   style={styles.editBtn}

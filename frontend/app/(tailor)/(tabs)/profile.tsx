@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
-import { Feather } from '@expo/vector-icons';
+import { Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useAuth } from '../../../src/context/AuthContext';
 import { api } from '../../../src/utils/api';
 import { Colors, Fonts, Spacing, Radius } from '../../../src/utils/theme';
@@ -65,6 +65,11 @@ export default function TailorProfile() {
           <Text style={styles.userEmail}>{user?.email}</Text>
           <View style={styles.infoRow}><Feather name="map-pin" size={14} color={Colors.primary} /><Text style={styles.infoText}>{user?.city}{user?.pincode ? `, ${user?.pincode}` : ''} {!user?.city && 'Location not set'}</Text></View>
           {user?.address ? <View style={styles.infoRow}><Feather name="home" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>{user?.address}</Text></View> : null}
+          <View style={styles.infoRow}>
+  <MaterialCommunityIcons name="gender-male-female"size={20}color={Colors.textMuted}/>
+  <Text style={styles.infoLabel}>Gender</Text>
+  <Text style={styles.infoValue}>{user?.gender || 'Not set'}</Text>
+  </View>
           <View style={styles.tagRow}>{user?.specialities?.map((s: string) => (<View key={s} style={styles.tag}><Text style={styles.tagText}>{s}</Text></View>))}</View>
         </View>
 
@@ -147,4 +152,6 @@ const styles = StyleSheet.create({
   emptyText: { fontFamily: Fonts.ui, fontSize: 14, color: Colors.textMuted, textAlign: 'center', paddingVertical: 16 },
   logoutBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 16, backgroundColor: Colors.surface, borderRadius: Radius.lg, borderWidth: 1, borderColor: Colors.error + '30' },
   logoutText: { fontFamily: Fonts.bodyBold, fontSize: 16, color: Colors.error, marginLeft: 10 },
+  infoLabel: { fontFamily: Fonts.body, fontSize: 15, color: Colors.textMuted, marginLeft: 12, flex: 1 },
+  infoValue: { fontFamily: Fonts.bodyBold, fontSize: 15, color: Colors.text },
 });

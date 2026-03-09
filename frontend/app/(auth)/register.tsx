@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, Alert,} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
+import { Pressable} from "react-native";
 import { Feather } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius } from '../../src/utils/theme';
@@ -14,7 +15,14 @@ import { useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Modal } from "react-native";
 import MapView, { Marker, Circle } from "react-native-maps";
+import { Image } from 'react-native';
+import MaleSlim from '../../assets/body/male_slim.png';
+import MaleFit from '../../assets/body/male_fit.png';
+import MaleBulk from '../../assets/body/male_bulk.png';
 
+import FemaleSlim from '../../assets/body/female_slim.png';
+import FemaleFit from '../../assets/body/female_fit.png';
+import FemaleBulk from '../../assets/body/female_bulk.png';
 
 const ROLES = [
   { key: 'customer', label: 'Customer', icon: 'shopping-bag' as const, desc: 'Find tailors near you' },
@@ -46,12 +54,19 @@ export default function Register() {
   const dropdownOpacity = useRef(new Animated.Value(0)).current;
   const mapOpacity = useRef(new Animated.Value(0)).current;
   const markerAnim = useRef(new Animated.Value(0)).current;
+  const liftAnim = useRef(new Animated.Value(0)).current;
+  const glowAnim = useRef(new Animated.Value(0)).current;
   const [recentLocations, setRecentLocations] = useState<any[]>([]);
   const [mapModalVisible, setMapModalVisible] = useState(false);
   const markerScale = useRef(new Animated.Value(0)).current;
   const DELIVERY_RADIUS = 3000; // meters (3km example)
   const [liveAddress, setLiveAddress] = useState("");
   const [isMoving, setIsMoving] = useState(false);
+  const [height, setHeight] = useState('');
+  const [weight, setWeight] = useState('');
+  const [bodyType, setBodyType] = useState<'slim' | 'fit' | 'bulk' | ''>('');
+  const [gender, setGender] = useState<'male' | 'female'>('male');
+  const BODY_TYPES: ('slim' | 'fit' | 'bulk')[] = ['slim', 'fit', 'bulk'];
 
   useEffect(() => {
   const loadRecent = async () => {
@@ -63,6 +78,9 @@ export default function Register() {
 
   loadRecent();
 }, []);
+useEffect(() => {
+  setBodyType('');
+}, [gender]);
 useEffect(() => {
   if (latitude && longitude) {
     markerScale.setValue(0);
@@ -90,10 +108,23 @@ useEffect(() => {
     setLoading(true);
     try {
       const user = await register({
-        name: name.trim(), email: email.trim().toLowerCase(),
-        phone: phone.trim(), password, role,
-        city: city.trim(), pincode: pincode.trim(), address: address.trim(),
-      } as any);
+  name: name.trim(),
+  email: email.trim().toLowerCase(),
+  phone: phone.trim(),
+  password,
+  role,
+  city: city.trim(),
+  pincode: pincode.trim(),
+  address: address.trim(),
+  gender,
+  ...(role === "customer" && {
+  height,
+  weight,
+  
+  bodyType,
+  })
+} as any);
+
       if (user.role === 'customer') router.replace('/(customer)');
       else if (user.role === 'tailor') router.replace('/(tailor)');
       else if (user.role === 'delivery') router.replace('/(delivery)');
@@ -261,6 +292,21 @@ const fetchAddressSuggestions = async (text: string) => {
     setSuggestions(data);
   } catch (err) {
     console.log("Address search error:", err);
+  }
+};
+const getBodyImage = (type: 'slim' | 'fit' | 'bulk') => {
+  if (gender === 'male') {
+    return {
+      slim: MaleSlim,
+      fit: MaleFit,
+      bulk: MaleBulk,
+    }[type];
+  } else {
+    return {
+      slim: FemaleSlim,
+      fit: FemaleFit,
+      bulk: FemaleBulk,
+    }[type];
   }
 };
 
@@ -481,7 +527,118 @@ const fetchAddressSuggestions = async (text: string) => {
             </View>
             
           </View>
+          <Pressable
+  onPress={() => router.push("/scan-body")}
+  style={{
+    padding: 15,
+    backgroundColor: "black",
+    marginTop: 20,
+    borderRadius: 10,
+  }}
+>
+  <Text style={{ color: "white", textAlign: "center" }}>
+    AI Body Scan
+  </Text>
+</Pressable>
 
+          <View style={{ marginBottom: 14 }}>
+  <Text style={styles.label}>Gender</Text>
+
+  <View style={styles.genderRow}>
+    {['male', 'female'].map((g) => (
+      <TouchableOpacity
+        key={g}
+        onPress={() => setGender(g as any)}
+        style={[
+          styles.genderCard,
+          gender === g && styles.genderCardActive,
+        ]}
+      >
+        <Text
+          style={[
+            styles.genderText,
+            gender === g && { color: Colors.primary },
+          ]}
+        >
+          {g === 'male' ? 'Male' : 'Female'}
+        </Text>
+      </TouchableOpacity>
+    ))}
+  </View>
+</View>
+
+          {role === 'customer' && (
+          <View style={styles.bodySection}>
+  <Text style={styles.sectionLabel}>
+    <Feather name="user" size={15} color={Colors.primary} />
+    {'  '}Body Details
+  </Text>
+ 
+  {/* Height & Weight Row */}
+  <View style={{ flexDirection: 'row', gap: 10 }}>
+    <View style={[styles.inputGroup, { flex: 1 }]}>
+      <Text style={styles.label}>Height (cm)</Text>
+      <View style={styles.inputContainer}>
+        <TextInput
+          style={styles.inputNoPad}
+          placeholder="e.g. 170"
+          placeholderTextColor={Colors.textMuted}
+          value={height}
+          onChangeText={setHeight}
+          keyboardType="numeric"
+        />
+      </View>
+    </View>
+  
+    <View style={[styles.inputGroup, { flex: 1 }]}>
+      <Text style={styles.label}>Weight (kg)</Text>
+      <View style={styles.inputContainer}>
+        <TextInput
+          style={styles.inputNoPad}
+          placeholder="e.g. 65"
+          placeholderTextColor={Colors.textMuted}
+          value={weight}
+          onChangeText={setWeight}
+          keyboardType="numeric"
+        />
+      </View>
+    </View>
+  </View>
+  
+
+
+  {/* Body Type Selection */}
+  {/* Body Type Selection */}
+<View style={styles.bodyTypeRow}>
+  {['slim', 'fit', 'bulk'].map((type) => (
+    <TouchableOpacity
+      key={type}
+      onPress={() => setBodyType(type as any)}
+      style={[
+        styles.bodyTypeCard,
+        bodyType === type && styles.bodyTypeCardActive,
+      ]}
+      activeOpacity={0.8}
+    >
+      <Image
+        source={getBodyImage(type as any)}
+        style={{ width: 50, height: 90 }}
+        resizeMode="contain"
+      />
+
+      <Text
+        style={[
+          styles.bodyTypeText,
+          bodyType === type && { color: Colors.primary },
+        ]}
+      >
+        {type.charAt(0).toUpperCase() + type.slice(1)}
+      </Text>
+    </TouchableOpacity>
+  ))}
+</View>
+</View>
+)}
           <View style={styles.inputGroup}>
             <Text style={styles.label}>Password *</Text>
             <View style={styles.inputContainer}>
@@ -508,40 +665,55 @@ const fetchAddressSuggestions = async (text: string) => {
   onRequestClose={() => setMapModalVisible(false)}
 >
   <View style={{ flex: 1 }}>
-
     {latitude !== null && longitude !== null && (
       <>
         <MapView
           style={{ flex: 1 }}
           initialRegion={{
-            latitude: latitude!,
-            longitude: longitude!,
+            latitude,
+            longitude,
             latitudeDelta: 0.01,
             longitudeDelta: 0.01,
           }}
           onRegionChange={() => {
             setIsMoving(true);
+
+            Animated.timing(liftAnim, {
+              toValue: 1,
+              duration: 150,
+              useNativeDriver: true,
+            }).start();
+
+            Animated.loop(
+              Animated.sequence([
+                Animated.timing(glowAnim, {
+                  toValue: 1,
+                  duration: 600,
+                  useNativeDriver: true,
+                }),
+                Animated.timing(glowAnim, {
+                  toValue: 0,
+                  duration: 600,
+                  useNativeDriver: true,
+                }),
+              ])
+            ).start();
           }}
           onRegionChangeComplete={async (region) => {
             setLatitude(region.latitude);
             setLongitude(region.longitude);
             setIsMoving(false);
 
-            // Marker bounce
-            Animated.sequence([
-              Animated.timing(markerAnim, {
-                toValue: 1,
-                duration: 120,
-                useNativeDriver: true,
-              }),
-              Animated.timing(markerAnim, {
-                toValue: 0,
-                duration: 120,
-                useNativeDriver: true,
-              }),
-            ]).start();
+            Animated.spring(liftAnim, {
+              toValue: 0,
+              friction: 4,
+              useNativeDriver: true,
+            }).start();
 
-            // 🔥 LIVE ADDRESS UPDATE
+            glowAnim.stopAnimation();
+
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+
             try {
               const res = await fetch(
                 `https://nominatim.openstreetmap.org/reverse?lat=${region.latitude}&lon=${region.longitude}&format=json&addressdetails=1`,
@@ -560,7 +732,7 @@ const fetchAddressSuggestions = async (text: string) => {
           />
         </MapView>
 
-        {/* Address Preview Card */}
+        {/* Address Card */}
         <View
           style={{
             position: "absolute",
@@ -581,31 +753,51 @@ const fetchAddressSuggestions = async (text: string) => {
           </Text>
         </View>
 
-        {/* Marker Shadow */}
+        {/* Glow */}
         <Animated.View
-  pointerEvents="none"
-  style={{
-    position: "absolute",
-    top: "50%",
-    left: "50%",
-    marginLeft: -8,
-    marginTop: 2, // 👈 closer to marker
-    width: 15,
-    height: 5,
-    borderRadius: 16,
-    backgroundColor: "rgba(0,0,0,0.15)",
-shadowColor: "#000",
-shadowOpacity: 0.3,
-shadowRadius: 6,
-    transform: [
-      {
-        scale: isMoving ? 0.8 : 1, // shadow shrinks when marker lifts
-      },
-    ],
-  }}
-/>
+          pointerEvents="none"
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            marginLeft: -25,
+            marginTop: 0,
+            width: 50,
+            height: 50,
+            borderRadius: 25,
+            backgroundColor: Colors.primary,
+            opacity: glowAnim.interpolate({
+              inputRange: [0, 1],
+              outputRange: [0.05, 0.15],
+            }),
+          }}
+        />
 
-        {/* Fixed Center Marker */}
+        {/* Shadow */}
+        <Animated.View
+          pointerEvents="none"
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            marginLeft: -8,
+            marginTop: 2,
+            width: 15,
+            height: 5,
+            borderRadius: 20,
+            backgroundColor: "rgba(0,0,0,0.28)",
+            transform: [
+              {
+                scale: liftAnim.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [1, 0.7],
+                }),
+              },
+            ],
+          }}
+        />
+
+        {/* Fixed Marker */}
         <Animated.View
           pointerEvents="none"
           style={{
@@ -616,12 +808,9 @@ shadowRadius: 6,
             marginTop: -36,
             transform: [
               {
-                translateY: isMoving ? -15 : 0,
-              },
-              {
-                scale: markerAnim.interpolate({
+                translateY: liftAnim.interpolate({
                   inputRange: [0, 1],
-                  outputRange: [1, 1.1],
+                  outputRange: [0, -18],
                 }),
               },
             ],
@@ -703,5 +892,74 @@ const styles = StyleSheet.create({
   fontFamily: Fonts.ui,
   fontSize: 14,
   color: Colors.text,
+  
+},
+bodySection: {
+  backgroundColor: Colors.subtle,
+  borderRadius: Radius.lg,
+  padding: 16,
+  marginTop: 20,
+  borderWidth: 1,
+  borderColor: Colors.primary + '20',
+},
+
+bodyTypeRow: {
+  flexDirection: 'row',
+  justifyContent: 'space-between',
+  marginTop: 8,
+},
+
+bodyTypeCard: {
+  flex: 1,
+  marginHorizontal: 4,
+  paddingVertical: 14,
+  borderRadius: Radius.md,
+  borderWidth: 1.5,
+  borderColor: Colors.border,
+  alignItems: 'center',
+  backgroundColor: Colors.surface,
+},
+
+bodyTypeCardActive: {
+  borderColor: Colors.primary,
+  backgroundColor: '#F0FDFA',
+},
+
+bodyTypeText: {
+  fontFamily: Fonts.bodyBold,
+  fontSize: 13,
+  marginTop: 6,
+  color: Colors.textMuted,
+},
+genderRow: {
+  flexDirection: 'row',
+  gap: 10,
+},
+
+genderCard: {
+  flex: 1,
+  paddingVertical: 10,
+  borderRadius: Radius.md,
+  borderWidth: 1.5,
+  borderColor: Colors.border,
+  backgroundColor: Colors.surface,
+  alignItems: 'center',
+},
+
+genderCardActive: {
+  borderColor: Colors.primary,
+  backgroundColor: '#F0FDFA',
+},
+
+genderText: {
+  fontFamily: Fonts.bodyBold,
+  fontSize: 14,
+  color: Colors.textMuted,
+},
+
+bodyImage: {
+  width: 40,
+  height: 60,
+  marginBottom: 6,
 },
 });
