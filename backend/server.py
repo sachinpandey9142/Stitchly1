@@ -23,10 +23,13 @@ import mediapipe as mp
 import numpy as np
 from fastapi import UploadFile, File, Form
 import shutil
-
+from body_reconstruction import add_frame, average_landmarks
 
 from ai.pose_detector import detect_landmarks
 from ai.measurement_calculator import calculate_measurements
+
+frame_buffer = []
+MAX_FRAMES = 10
 
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=True)
@@ -1174,31 +1177,140 @@ async def check_position(
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(image.file, buffer)
 
+ # ---------------------------------------
+# LANDMARK DETECTION
+# ---------------------------------------
+
     landmarks = detect_landmarks(file_path)
 
     if not landmarks:
         return {"error": "No body detected"}
 
+
+    # ---------------------------------------
+    # ADD FRAME TO BUFFER
+    # ---------------------------------------
+
+    frame_buffer.append(landmarks)
+
+    # keep only last MAX_FRAMES frames
+    if len(frame_buffer) > MAX_FRAMES:
+        frame_buffer.pop(0)
+
+
+    # ---------------------------------------
+    # WAIT UNTIL ENOUGH FRAMES
+    # ---------------------------------------
+
+    if len(frame_buffer) < 5:
+        return {
+            "instruction": "Hold Still...",
+            "measurements": None,
+            "landmarks": []
+        }
+
+
+    # ---------------------------------------
+    # LANDMARK AVERAGING
+    # ---------------------------------------
+
+    avg_landmarks = []
+
+    num_landmarks = len(frame_buffer[0])
+
+    for i in range(num_landmarks):
+
+        x_vals = []
+        y_vals = []
+        z_vals = []
+
+        for frame in frame_buffer:
+            x_vals.append(frame[i][0])
+            y_vals.append(frame[i][1])
+            z_vals.append(frame[i][2])
+
+        avg_landmarks.append((
+            sum(x_vals) / len(x_vals),
+            sum(y_vals) / len(y_vals),
+            sum(z_vals) / len(z_vals)
+        ))
+
+
+    # ---------------------------------------
+    # CALCULATE MEASUREMENTS USING SMOOTHED DATA
+    # ---------------------------------------
+
     measurements = calculate_measurements(
-    landmarks,
-    landmarks,
-    landmarks,
-    height_cm
+        avg_landmarks,
+        avg_landmarks,
+        avg_landmarks,
+        height_cm
     )
+
+    # -----------------------------
+    # BODY POSITION ANALYSIS
+    # -----------------------------
+
+    instruction = "Perfect Position"
+
+    left_shoulder = landmarks[11]
+    right_shoulder = landmarks[12]
+
+    left_hip = landmarks[23]
+    right_hip = landmarks[24]
+
+    # BODY CENTER (horizontal alignment)
+    body_center = (left_shoulder[0] + right_shoulder[0]) / 2
+
+    if body_center < 0.4:
+        instruction = "Move Right"
+
+    elif body_center > 0.6:
+        instruction = "Move Left"
+
+    else:
+
+        # DISTANCE CHECK
+        shoulder_width = measurements["shoulder_width_cm"]
+
+        if shoulder_width < 35:
+            instruction = "Move Closer"
+
+        elif shoulder_width > 60:
+            instruction = "Move Back"
+
+        else:
+
+            # BODY TILT CHECK
+            shoulder_diff = abs(left_shoulder[1] - right_shoulder[1])
+
+            if shoulder_diff > 0.05:
+                instruction = "Stand Straight"
+
+            else:
+                instruction = "Perfect Position"
+
+    # -----------------------------
+    # FORMAT LANDMARKS
+    # -----------------------------
 
     formatted_landmarks = []
 
-    for x, y, z in landmarks:
+    for x, y, z in avg_landmarks:
         formatted_landmarks.append({
             "x": x,
             "y": y,
             "z": z
         })
+
     print("Measurements:", measurements)
+    print("Instruction:", instruction)
+
     return {
         "success": True,
         "measurements": measurements,
-        "landmarks": formatted_landmarks
+        "landmarks": formatted_landmarks,
+        "instruction": instruction
     }
 
 # ===================== AI MEASUREMENT ENDPOINT =====================

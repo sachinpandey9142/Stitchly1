@@ -78,3 +78,39 @@ agenthub/agents/youtube/db
 
 # Mobile development
 android-sdk/ 
+
+# =========================
+# Stitchly Backend AI
+# =========================
+
+# AI virtual environment
+ai_env/
+
+# Python environments
+env/
+ENV/
+
+# Environment variables
+.env
+.env.*
+
+# Temporary files
+temp/
+tmp/
+
+# React Native / Expo
+.expo/
+
+# AI models (large files)
+*.pt
+*.pth
+*.onnx
+models/
+
+# Python caches
+__pycache__/
+*.pyo
+
+# OS junk
+Thumbs.db
+desktop.ini

@@ -11,7 +11,7 @@ def distance(p1, p2):
 def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, height_cm):
 
     # ------------------------------
-    # BODY HEIGHT SCALE
+    # HEIGHT SCALE (FRONT VIEW)
     # ------------------------------
     head = front_landmarks[0]
     ankle = front_landmarks[27]
@@ -25,36 +25,70 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
 
 
     # ------------------------------
-    # FRONT WIDTHS
+    # FRONT SHOULDER WIDTH
     # ------------------------------
-    left_shoulder = front_landmarks[11]
-    right_shoulder = front_landmarks[12]
+    front_left_shoulder = front_landmarks[11]
+    front_right_shoulder = front_landmarks[12]
 
-    left_hip = front_landmarks[23]
-    right_hip = front_landmarks[24]
-
-    shoulder_width_px = distance(left_shoulder, right_shoulder)
-    hip_width_px = distance(left_hip, right_hip)
-
-    shoulder_width = shoulder_width_px * scale
-    hip_width = hip_width_px * scale
+    front_shoulder_px = distance(front_left_shoulder, front_right_shoulder)
+    front_shoulder = front_shoulder_px * scale
 
 
     # ------------------------------
-    # SIDE DEPTH (TORSO DEPTH)
+    # BACK SHOULDER WIDTH
+    # ------------------------------
+    back_left_shoulder = back_landmarks[11]
+    back_right_shoulder = back_landmarks[12]
+
+    back_shoulder_px = distance(back_left_shoulder, back_right_shoulder)
+    back_shoulder = back_shoulder_px * scale
+
+
+    # MULTI VIEW SHOULDER FUSION
+    shoulder_width = (front_shoulder + back_shoulder) / 2
+
+
+    # ------------------------------
+    # FRONT HIP WIDTH
+    # ------------------------------
+    front_left_hip = front_landmarks[23]
+    front_right_hip = front_landmarks[24]
+
+    front_hip_px = distance(front_left_hip, front_right_hip)
+    front_hip = front_hip_px * scale
+
+
+    # ------------------------------
+    # BACK HIP WIDTH
+    # ------------------------------
+    back_left_hip = back_landmarks[23]
+    back_right_hip = back_landmarks[24]
+
+    back_hip_px = distance(back_left_hip, back_right_hip)
+    back_hip = back_hip_px * scale
+
+
+    # MULTI VIEW HIP FUSION
+    hip_width = (front_hip + back_hip) / 2
+
+
+    # ------------------------------
+    # SIDE DEPTH (TORSO THICKNESS)
     # ------------------------------
     side_shoulder = side_landmarks[11]
     side_hip = side_landmarks[23]
 
-    torso_depth_px = abs(side_shoulder[0] - side_hip[0])
-    torso_depth = torso_depth_px * scale
+    depth_px = abs(side_shoulder[0] - side_hip[0])
+    torso_depth = depth_px * scale
 
 
     # ------------------------------
-    # CHEST / WAIST USING ELLIPSE MODEL
+    # BODY CIRCUMFERENCE MODEL
     # ------------------------------
-    chest_circumference = math.pi * (shoulder_width + torso_depth) / 2
-    waist_circumference = math.pi * (hip_width + torso_depth) / 2
+
+    # improved body model
+    chest_circumference = (shoulder_width * 1.6) + (torso_depth * 1.2)
+    waist_circumference = (hip_width * 1.5) + (torso_depth * 1.1)
 
 
     # ------------------------------
@@ -80,11 +114,11 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
 
 
     # ------------------------------
-    # SAFETY CLAMPS
+    # SAFETY LIMITS
     # ------------------------------
-    shoulder_width = max(30, min(shoulder_width, 70))
-    hip_width = max(30, min(hip_width, 70))
-    torso_depth = max(10, min(torso_depth, 40))
+    shoulder_width = max(30, min(shoulder_width, 65))
+    hip_width = max(30, min(hip_width, 60))
+    torso_depth = max(10, min(torso_depth, 35))
 
 
     # ------------------------------

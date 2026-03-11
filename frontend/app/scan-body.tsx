@@ -74,6 +74,10 @@ export default function ScanBody() {
   const [landmarks, setLandmarks] = useState<any[]>([]);
   const [measurements, setMeasurements] = useState<any>(null);
 
+  const [stableFrames, setStableFrames] = useState(0)
+  const [lastShoulder, setLastShoulder] = useState(0)
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const [shoulderHistory, setShoulderHistory] = useState<number[]>([]);
   const [positionMessage,setPositionMessage] = useState(
     "Align your body inside the outline"
   );
@@ -109,84 +113,173 @@ export default function ScanBody() {
   /* Position Checking Loop        */
   /* ============================= */
 
-  useEffect(() => {
+    useEffect(() => {
 
-    if (!startScan) return;
+    if (!startScan || step === "processing" || step === "done") return;
 
     const interval = setInterval(() => {
-
-      checkBodyPosition();
-
-    }, 1500);
+    checkBodyPosition();
+    }, 800);
 
     return () => clearInterval(interval);
 
-  }, [startScan]);
+    }, [startScan, step]);
 
   /* ============================= */
   /* Check Body Position           */
   /* ============================= */
 
-  const checkBodyPosition = async () => {
+const checkBodyPosition = async () => {
 
-    if (!camera.current) return;
+  if (!camera.current) return;
 
-    try {
+  if (countdown !== null || step === "processing") return;
 
-      const photo = await camera.current.takePhoto({
-        qualityPrioritization:"speed"
-      });
+  try {
 
-      const imagePath = "file://" + photo.path;
+    const photo = await camera.current.takePhoto({
+      qualityPrioritization: "speed"
+    });
 
-      const formData = new FormData();
+    const imagePath = "file://" + photo.path;
 
-      formData.append("image",{
-        uri:imagePath,
-        name:"frame.jpg",
-        type:"image/jpeg"
-      } as any);
+    const formData = new FormData();
 
-      formData.append("height_cm",heightCm);
+    formData.append("image", {
+      uri: imagePath,
+      name: "frame.jpg",
+      type: "image/jpeg"
+    } as any);
 
-      const response = await fetch(
-        "http://10.171.61.15:8000/ai/check-position",
-        {
-          method:"POST",
-          body:formData
-        }
-      );
+    formData.append("height_cm", heightCm);
 
-      const data = await response.json();
-
-      setLandmarks(data.landmarks || []);
-
-      if (!data.measurements) {
-        setPositionMessage("Move into frame");
-        return;
+    const response = await fetch(
+      "http://10.171.61.15:8000/ai/check-position",
+      {
+        method: "POST",
+        body: formData
       }
+    );
 
-      const shoulder = data.measurements.shoulder_width_cm;
+    const data = await response.json();
 
-      if (shoulder < 30) {
-        setPositionMessage("Move Closer");
-      }
-      else if (shoulder > 60) {
-        setPositionMessage("Move Back");
-      }
-      else {
-        setPositionMessage("Perfect Position");
+    setLandmarks(data.landmarks || []);
 
-        setTimeout(() => {
-          takePicture();
-        },1200);
-      }
+if (!data.landmarks || data.landmarks.length < 28) {
+  setPositionMessage("Move into frame");
+  setStableFrames(0);
+  return;
+}
 
-    } catch(err) {
-      console.log("Position check error:",err);
+const head = data.landmarks[0];
+const ankle = data.landmarks[27];
+
+if (!head || !ankle) {
+  setPositionMessage("Move into frame");
+  setStableFrames(0);
+  return;
+}
+
+const bodyHeight = Math.abs(head.y - ankle.y);
+
+if (bodyHeight < 0.45) {
+  setPositionMessage("Step back - full body required");
+  setStableFrames(0);
+  return;
+}
+
+    const shoulderRaw = data.measurements.shoulder_width_cm;
+
+    // ----- FRAME AVERAGING -----
+
+    const updatedHistory = [...shoulderHistory, shoulderRaw].slice(-5);
+
+    setShoulderHistory(updatedHistory);
+
+    const shoulder =
+      updatedHistory.reduce((a, b) => a + b, 0) / updatedHistory.length;
+
+    // ----- DISTANCE CHECK -----
+
+    if (shoulder < 30) {
+
+      setPositionMessage("Move Closer");
+      setStableFrames(0);
+      return;
+
     }
 
-  };
+    if (shoulder > 60) {
+
+      setPositionMessage("Move Back");
+      setStableFrames(0);
+      return;
+
+    }
+
+    // ----- CENTERING INSTRUCTION FROM BACKEND -----
+
+    if (data.instruction) {
+
+      setPositionMessage(data.instruction);
+      setStableFrames(0);
+      return;
+
+    }
+
+    // ----- PERFECT POSITION -----
+
+    setPositionMessage("Perfect Position");
+
+    let newStableFrames = stableFrames;
+
+  newStableFrames = stableFrames + 1;
+
+    setStableFrames(newStableFrames);
+    setLastShoulder(shoulder);
+
+    // ----- CAPTURE WHEN STABLE -----
+
+   if (newStableFrames >= 2 && countdown === null) {
+
+      setPositionMessage("Pose Locked");
+      setCountdown(3);
+
+      const timer = setInterval(() => {
+
+        setCountdown(prev => {
+
+          if (prev === null) return null;
+
+          if (prev === 1) {
+
+            clearInterval(timer);
+
+            setCountdown(null);
+
+            takePicture();
+
+            setStableFrames(0);
+
+            return null;
+
+          }
+
+          return prev - 1;
+
+        });
+
+      }, 1000);
+
+    }
+
+  } catch (err) {
+
+    console.log("Position check error:", err);
+
+  }
+
+};
 
   /* ============================= */
   /* Capture Images                */
@@ -195,6 +288,8 @@ export default function ScanBody() {
   const takePicture = async () => {
 
     if (!camera.current) return;
+
+    if (step === "processing") return;
 
     try {
 
@@ -356,6 +451,26 @@ export default function ScanBody() {
           photo={true}
         />
 
+        {countdown !== null && (
+  <View
+    style={{
+      position: "absolute",
+      top: "45%",
+      width: "100%",
+      alignItems: "center"
+    }}
+  >
+    <Text
+      style={{
+        fontSize: 80,
+        color: "white",
+        fontWeight: "bold"
+      }}
+    >
+      {countdown}
+    </Text>
+  </View>
+)}
         <Svg
           style={{
             position:"absolute",
@@ -395,49 +510,118 @@ export default function ScanBody() {
             />
           ))}
 
+         {landmarks.length > 0 && (
+<>
+<Line
+x1={`${landmarks[11].x*100}%`}
+y1={`${landmarks[11].y*100}%`}
+x2={`${landmarks[12].x*100}%`}
+y2={`${landmarks[12].y*100}%`}
+stroke="white"
+strokeWidth="4"
+/>
+
+<Line
+x1={`${landmarks[11].x*100}%`}
+y1={`${landmarks[11].y*100}%`}
+x2={`${landmarks[23].x*100}%`}
+y2={`${landmarks[23].y*100}%`}
+stroke="white"
+strokeWidth="4"
+/>
+
+<Line
+x1={`${landmarks[12].x*100}%`}
+y1={`${landmarks[12].y*100}%`}
+x2={`${landmarks[24].x*100}%`}
+y2={`${landmarks[24].y*100}%`}
+stroke="white"
+strokeWidth="4"
+/>
+
+<Line
+x1={`${landmarks[23].x*100}%`}
+y1={`${landmarks[23].y*100}%`}
+x2={`${landmarks[25].x*100}%`}
+y2={`${landmarks[25].y*100}%`}
+stroke="white"
+strokeWidth="4"
+/>
+
+<Line
+x1={`${landmarks[24].x*100}%`}
+y1={`${landmarks[24].y*100}%`}
+x2={`${landmarks[26].x*100}%`}
+y2={`${landmarks[26].y*100}%`}
+stroke="white"
+strokeWidth="4"
+/>
+</>
+)}
+
         </Svg>
 
-        <BodyOutline/>
+       
+<View style={styles.overlay}>
 
-        <View style={styles.overlay}>
+  {/* STEP TITLE */}
+  <Text style={styles.stepTitle}>
+    {step === "front" && "Front Scan"}
+    {step === "side" && "Turn Side"}
+    {step === "back" && "Turn Back"}
+  </Text>
 
-          {step === "processing" && (
-            <>
-              <ActivityIndicator size="large" color="white"/>
-              <Text style={styles.instructions}>
-                Analyzing body measurements...
-              </Text>
-            </>
-          )}
+  {/* STEP INSTRUCTION */}
+  <Text style={styles.instructions}>
+    {step === "front" && "Stand straight facing the camera"}
+    {step === "side" && "Turn sideways and keep arms away"}
+    {step === "back" && "Turn your back to the camera"}
+  </Text>
 
-          {step === "done" && measurements && (
-            <View style={styles.resultBox}>
+  {/* POSITION MESSAGE */}
+  <Text style={styles.positionText}>
+    {positionMessage}
+  </Text>
 
-              <Text style={styles.resultTitle}>
-                Measurements
-              </Text>
+  {/* PROCESSING STATE */}
+  {step === "processing" && (
+    <>
+      <ActivityIndicator size="large" color="white" />
+      <Text style={styles.instructions}>
+        Analyzing body measurements...
+      </Text>
+    </>
+  )}
 
-              <Text style={styles.resultText}>
-                Shoulder: {measurements.shoulder_width_cm} cm
-              </Text>
+  {/* RESULT SCREEN */}
+  {step === "done" && measurements && (
+    <View style={styles.resultBox}>
 
-              <Text style={styles.resultText}>
-                Hip: {measurements.hip_width_cm} cm
-              </Text>
+      <Text style={styles.resultTitle}>
+        Measurements
+      </Text>
 
-              <Pressable
-                style={styles.doneButton}
-                onPress={()=>router.back()}
-              >
-                <Text style={{color:"white"}}>
-                  Use Measurements
-                </Text>
-              </Pressable>
+      <Text style={styles.resultText}>
+        Shoulder: {measurements.shoulder_width_cm} cm
+      </Text>
 
-            </View>
-          )}
+      <Text style={styles.resultText}>
+        Hip: {measurements.hip_width_cm} cm
+      </Text>
 
-        </View>
+      <Pressable
+        style={styles.doneButton}
+        onPress={() => router.back()}
+      >
+        <Text style={{color:"white"}}>
+          Use Measurements
+        </Text>
+      </Pressable>
+
+    </View>
+  )}
+
+</View>
 
       </>
 
@@ -529,7 +713,22 @@ backgroundColor:"#0F766E",
 paddingVertical:14,
 paddingHorizontal:40,
 borderRadius:12
-}
+},
+stepTitle:{
+color:"white",
+fontSize:28,
+fontWeight:"bold",
+marginBottom:10
+},
+
+positionText:{
+color:"#00FFAA",
+fontSize:20,
+marginTop:8,
+fontWeight:"600",
+textAlign:"center"
+},
+
 
 });
 
