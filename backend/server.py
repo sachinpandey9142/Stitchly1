@@ -2,9 +2,12 @@
 
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Body, Query, Request
 from dotenv import load_dotenv
+from pymongo import ReturnDocument
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import HTMLResponse
+from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
+import asyncio
 import os
 import logging
 import uuid
@@ -12,8 +15,8 @@ import hmac
 import hashlib
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional
-from datetime import datetime, timezone
+from typing import List, Optional, Literal
+from datetime import datetime, timezone, timedelta
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -44,6 +47,11 @@ logger = logging.getLogger(__name__)
 
 # ===================== PYDANTIC MODELS =====================
 
+class Location(BaseModel):
+    type: Literal["Point"] = "Point"
+    coordinates: list[float]  # [longitude, latitude]
+
+
 class UserRegister(BaseModel):
     name: str
     email: str
@@ -73,15 +81,27 @@ class ServiceCreate(BaseModel):
     service_name: str
     price: float
     category: str
+    # New Field: Optional list of delivery dictionaries
+    delivery_options: Optional[List[dict]] = None
+class DeliveryOption(BaseModel):
+    label: str
+    days_required: int
 
 class OrderCreate(BaseModel):
     tailor_id: str
     service_type: str
     description: str
     reference_image: Optional[str] = None
+
     pickup_address: str
+    pickup_location: Location   # 🔥 REQUIRED for geo queries
+
     delivery_address: Optional[str] = None
-    payment_method: str = "online"
+    delivery_location: Optional[Location] = None
+
+    payment_method: Literal["online", "cod"] = "online"
+
+    delivery_option: DeliveryOption  # 🔥 Proper validation
 
 class ReviewCreate(BaseModel):
     order_id: str
@@ -177,6 +197,8 @@ async def register(data: UserRegister):
         "experience": "",
         "working_hours": {},
         "profile_photo": "",
+        "is_available": False if data.role == "delivery" else None,
+        "geo_location": None,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     await db.users.insert_one(user)
@@ -267,19 +289,54 @@ async def list_tailors(
         tailors = [t for t in tailors if t.get("min_price", 0) <= max_price]
     return tailors
 
-@api_router.get("/tailors/{tailor_id}")
-async def get_tailor(tailor_id: str):
-    tailor = await db.users.find_one({"id": tailor_id, "role": "tailor"}, {"_id": 0, "password_hash": 0})
-    if not tailor:
-        raise HTTPException(status_code=404, detail="Tailor not found")
-    services = await db.tailor_services.find({"tailor_id": tailor_id}, {"_id": 0}).to_list(100)
-    reviews = await db.reviews.find({"tailor_id": tailor_id}, {"_id": 0}).sort("created_at", -1).to_list(50)
-    for review in reviews:
-        customer = await db.users.find_one({"id": review["customer_id"]}, {"_id": 0, "name": 1})
-        review["customer_name"] = customer["name"] if customer else "Unknown"
-    tailor["services"] = services
-    tailor["reviews"] = reviews
-    return tailor
+# @api_router.get("/tailors/{tailor_id}")
+# async def get_tailor(tailor_id: str):
+#     tailor = await db.users.find_one({"id": tailor_id, "role": "tailor"}, {"_id": 0, "password_hash": 0})
+#     if not tailor:
+#         raise HTTPException(status_code=404, detail="Tailor not found")
+#     services = await db.tailor_services.find({"tailor_id": tailor_id}, {"_id": 0}).to_list(100)
+#     reviews = await db.reviews.find({"tailor_id": tailor_id}, {"_id": 0}).sort("created_at", -1).to_list(50)
+#     for review in reviews:
+#         customer = await db.users.find_one({"id": review["customer_id"]}, {"_id": 0, "name": 1})
+#         review["customer_name"] = customer["name"] if customer else "Unknown"
+#     tailor["services"] = services
+#     tailor["reviews"] = reviews
+#     return tailor
+# @api_router.post("/tailor/services")
+# async def add_service(data: ServiceCreate, user=Depends(require_tailor)):
+#     # Default if not provided
+#     delivery_opts = data.delivery_options or [{"label": "Standard (5 Days)", "days_required": 5}]
+    
+#     service = {
+#         "id": str(uuid.uuid4()),
+#         "tailor_id": user["id"],
+#         "service_name": data.service_name,
+#         "price": data.price,
+#         "category": data.category,
+#         "delivery_options": delivery_opts # Store in DB
+#     }
+#     await db.tailor_services.insert_one(service)
+#     service.pop("_id", None)
+#     return service
+
+# @api_router.put("/tailor/services/{service_id}")
+# async def update_service(service_id: str, data: ServiceCreate, user=Depends(require_tailor)):
+#     update_vals = {
+#         "service_name": data.service_name, 
+#         "price": data.price, 
+#         "category": data.category
+#     }
+#     if data.delivery_options is not None:
+#         update_vals["delivery_options"] = data.delivery_options
+
+#     result = await db.tailor_services.update_one(
+#         {"id": service_id, "tailor_id": user["id"]},
+#         {"$set": update_vals}
+#     )
+#     if result.modified_count == 0:
+#         raise HTTPException(status_code=404, detail="Service not found")
+#     updated = await db.tailor_services.find_one({"id": service_id}, {"_id": 0})
+#     return updated
 
 
 # ===================== ORDER ROUTES =====================
@@ -293,7 +350,19 @@ async def create_order(data: OrderCreate, user=Depends(require_customer)):
     service = await db.tailor_services.find_one(
         {"tailor_id": data.tailor_id, "service_name": data.service_type}, {"_id": 0}
     )
-    price = service["price"] if service else 500
+    
+    # Validation Logic
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found")
+    
+    # Check if the chosen delivery option exists in the service's allowed options
+    valid_options = service.get("delivery_options", [])
+    if data.delivery_option.dict() not in valid_options:
+        raise HTTPException(status_code=400, detail="Invalid delivery option for this service")
+
+    price = service["price"]
+    days_required = data.delivery_option.dict().get("days_required", 5)
+    est_date = datetime.now(timezone.utc) + timedelta(days=days_required)
 
     settings = await db.settings.find_one({"key": "commission_percentage"}, {"_id": 0})
     commission_pct = settings["value"] if settings else 10.0
@@ -309,6 +378,7 @@ async def create_order(data: OrderCreate, user=Depends(require_customer)):
         "tailor_name": tailor["name"],
         "tailor_phone": tailor["phone"],
         "tailor_city": tailor.get("city", ""),
+        "tailor_location": tailor.get("geo_location"),
         "delivery_partner_id": "",
         "delivery_partner_name": "",
         "service_type": data.service_type,
@@ -321,6 +391,9 @@ async def create_order(data: OrderCreate, user=Depends(require_customer)):
         "status": "placed",
         "payment_status": "pending" if data.payment_method == "online" else "cod",
         "payment_method": data.payment_method,
+        "delivery_option": data.delivery_option.dict(),
+        "estimated_delivery_date": est_date.isoformat(), # New field
+        "pickup_location": data.pickup_location.dict(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
@@ -352,30 +425,49 @@ async def get_order(order_id: str, user=Depends(get_current_user)):
 
 @api_router.put("/orders/{order_id}/accept")
 async def accept_order(order_id: str, user=Depends(require_tailor)):
-    order = await db.orders.find_one({"id": order_id, "tailor_id": user["id"]}, {"_id": 0})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-    if order["status"] != "placed":
-        raise HTTPException(status_code=400, detail="Order cannot be accepted in current status")
 
-    delivery_partner = await db.users.find_one(
-        {"role": "delivery", "status": "active", "city": {"$regex": f"^{user.get('city', '')}$", "$options": "i"}},
+    order = await db.orders.find_one(
+        {"id": order_id, "tailor_id": user["id"]},
         {"_id": 0}
     )
-    if not delivery_partner:
-        delivery_partner = await db.users.find_one({"role": "delivery", "status": "active"}, {"_id": 0})
-    dp_id = delivery_partner["id"] if delivery_partner else ""
-    dp_name = delivery_partner["name"] if delivery_partner else ""
 
-    await db.orders.update_one(
-        {"id": order_id},
-        {"$set": {
-            "status": "accepted",
-            "delivery_partner_id": dp_id,
-            "delivery_partner_name": dp_name,
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }}
-    )
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order["status"] != "placed":
+        raise HTTPException(status_code=400, detail="Order cannot be accepted")
+
+    update_data = {
+        "status": "pickup_pending",
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    # 🔥 AUTO ASSIGN DELIVERY FOR PICKUP
+    if order.get("pickup_location"):
+
+        nearby_partner = await db.users.find_one_and_update(
+            {
+                "role": "delivery",
+                "status": "active",
+                "is_available": True,
+                "geo_location": {
+                    "$near": {
+                        "$geometry": order["pickup_location"],
+                        "$maxDistance": 5000
+                    }
+                }
+            },
+            {"$set": {"is_available": False}},
+            return_document=ReturnDocument.AFTER
+        )
+
+        if nearby_partner:
+            update_data["delivery_partner_id"] = nearby_partner["id"]
+            update_data["delivery_partner_name"] = nearby_partner["name"]
+            update_data["status"] = "pickup_assigned"
+
+    await db.orders.update_one({"id": order_id}, {"$set": update_data})
+
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
     return updated
 
@@ -392,26 +484,124 @@ async def reject_order(order_id: str, user=Depends(require_tailor)):
     return updated
 
 @api_router.put("/orders/{order_id}/status")
-async def update_order_status(order_id: str, status: str = Body(..., embed=True), user=Depends(get_current_user)):
-    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+async def update_order_status(
+    order_id: str,
+    status: str = Body(..., embed=True),
+    user=Depends(get_current_user)
+):
+
+    order = await db.orders.find_one({"id": order_id})
+
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
     valid_statuses = [
-        "placed", "accepted", "pickup_assigned", "picked_up",
-        "delivered_to_tailor", "in_stitching", "completed", "ready",
-        "collected_from_tailor", "out_for_delivery", "delivered", "rejected"
+    "placed",
+    "pickup_pending",
+    "pickup_assigned",
+    "picked_up",
+    "delivered_to_tailor",
+    "in_stitching",
+    "completed",
+    "ready",
+    "collected_from_tailor",
+    "delivery_assigned",
+    "out_for_delivery",
+    "delivered",
+    "rejected"
     ]
-    if status not in valid_statuses:
-        raise HTTPException(status_code=400, detail=f"Invalid status")
 
-    update_data = {"status": status, "updated_at": datetime.now(timezone.utc).isoformat()}
+    if status not in valid_statuses:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    update_data = {
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    # 🔥 AUTO ASSIGN DELIVERY WHEN COMPLETED
+    if status == "ready":
+
+        if order.get("delivery_partner_id"):
+            raise HTTPException(status_code=400, detail="Delivery already assigned")
+
+        if not order.get("pickup_location"):
+            raise HTTPException(status_code=400, detail="Pickup location missing")
+
+        nearby_partner = await db.users.find_one_and_update(
+            {
+                "role": "delivery",
+                "status": "active",
+                "is_available": True,
+                "geo_location": {
+                    "$near": {
+                        "$geometry": order["pickup_location"],
+                        "$maxDistance": 5000
+                    }
+                }
+            },
+            {"$set": {"is_available": False}},
+            return_document=ReturnDocument.AFTER
+        )
+
+        if nearby_partner:
+            update_data["delivery_partner_id"] = nearby_partner["id"]
+            update_data["delivery_partner_name"] = nearby_partner["name"]
+            update_data["status"] = "delivery_assigned"
+
     if status == "delivered":
         update_data["payment_status"] = "completed"
+
     await db.orders.update_one({"id": order_id}, {"$set": update_data})
+
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
     return updated
 
+# @app.put("/orders/{order_id}/complete")
+# async def complete_order(order_id: str):
+
+#     order = await db.orders.find_one({"id": order_id})
+
+#     if not order:
+#         raise HTTPException(status_code=404, detail="Order not found")
+
+#     if not order.get("pickup_location"):
+#         raise HTTPException(status_code=400, detail="Pickup location missing")
+
+#     # 🔥 Atomic partner assignment
+#     nearby_partner = await db.users.find_one_and_update(
+#         {
+#             "role": "delivery",
+#             "status": "active",
+#             "is_available": True,
+#             "geo_location": {
+#                 "$near": {
+#                     "$geometry": order["pickup_location"],
+#                     "$maxDistance": 5000
+#                 }
+#             }
+#         },
+#         {"$set": {"is_available": False}},
+#         return_document=True
+#     )
+
+#     if not nearby_partner:
+#         return {"message": "No delivery partner available nearby"}
+
+#     await db.orders.update_one(
+#         {"id": order_id},
+#         {"$set": {
+#             "delivery_partner_id": nearby_partner["id"],
+#             "delivery_partner_name": nearby_partner["name"],
+#             "status": "out_for_delivery",
+#             "updated_at": datetime.now(timezone.utc).isoformat()
+#         }}
+#     )
+
+#     return {
+#         "message": "Delivery partner assigned",
+#         "delivery_partner": nearby_partner["name"]
+#     }   
 
 # ===================== REVIEW ROUTES =====================
 
@@ -453,41 +643,41 @@ async def get_tailor_reviews(tailor_id: str):
 
 # ===================== TAILOR SERVICE ROUTES =====================
 
-@api_router.get("/tailor/services")
-async def get_my_services(user=Depends(require_tailor)):
-    services = await db.tailor_services.find({"tailor_id": user["id"]}, {"_id": 0}).to_list(100)
-    return services
+# @api_router.get("/tailor/services")
+# async def get_my_services(user=Depends(require_tailor)):
+#     services = await db.tailor_services.find({"tailor_id": user["id"]}, {"_id": 0}).to_list(100)
+#     return services
 
-@api_router.post("/tailor/services")
-async def add_service(data: ServiceCreate, user=Depends(require_tailor)):
-    service = {
-        "id": str(uuid.uuid4()),
-        "tailor_id": user["id"],
-        "service_name": data.service_name,
-        "price": data.price,
-        "category": data.category
-    }
-    await db.tailor_services.insert_one(service)
-    service.pop("_id", None)
-    return service
+# @api_router.post("/tailor/services")
+# async def add_service(data: ServiceCreate, user=Depends(require_tailor)):
+#     service = {
+#         "id": str(uuid.uuid4()),
+#         "tailor_id": user["id"],
+#         "service_name": data.service_name,
+#         "price": data.price,
+#         "category": data.category
+#     }
+#     await db.tailor_services.insert_one(service)
+#     service.pop("_id", None)
+#     return service
 
-@api_router.put("/tailor/services/{service_id}")
-async def update_service(service_id: str, data: ServiceCreate, user=Depends(require_tailor)):
-    result = await db.tailor_services.update_one(
-        {"id": service_id, "tailor_id": user["id"]},
-        {"$set": {"service_name": data.service_name, "price": data.price, "category": data.category}}
-    )
-    if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Service not found")
-    updated = await db.tailor_services.find_one({"id": service_id}, {"_id": 0})
-    return updated
+# @api_router.put("/tailor/services/{service_id}")
+# async def update_service(service_id: str, data: ServiceCreate, user=Depends(require_tailor)):
+#     result = await db.tailor_services.update_one(
+#         {"id": service_id, "tailor_id": user["id"]},
+#         {"$set": {"service_name": data.service_name, "price": data.price, "category": data.category}}
+#     )
+#     if result.modified_count == 0:
+#         raise HTTPException(status_code=404, detail="Service not found")
+#     updated = await db.tailor_services.find_one({"id": service_id}, {"_id": 0})
+#     return updated
 
-@api_router.delete("/tailor/services/{service_id}")
-async def delete_service(service_id: str, user=Depends(require_tailor)):
-    result = await db.tailor_services.delete_one({"id": service_id, "tailor_id": user["id"]})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Service not found")
-    return {"message": "Service deleted"}
+# @api_router.delete("/tailor/services/{service_id}")
+# async def delete_service(service_id: str, user=Depends(require_tailor)):
+#     result = await db.tailor_services.delete_one({"id": service_id, "tailor_id": user["id"]})
+#     if result.deleted_count == 0:
+#         raise HTTPException(status_code=404, detail="Service not found")
+#     return {"message": "Service deleted"}
 
 @api_router.put("/tailor/working-hours")
 async def update_working_hours(data: WorkingHoursUpdate, user=Depends(require_tailor)):
@@ -534,29 +724,227 @@ async def request_withdrawal(amount: float = Body(..., embed=True), user=Depends
     withdrawal.pop("_id", None)
     return withdrawal
 
+# ===================== TAILOR SERVICE ROUTES =====================
 
+@api_router.get("/tailor/services")
+async def get_my_services(user=Depends(require_tailor)):
+    services = await db.tailor_services.find(
+        {"tailor_id": user["id"]},
+        {"_id": 0}
+    ).to_list(100)
+    return services
+
+@api_router.get("/tailors/{tailor_id}")
+async def get_tailor(tailor_id: str):
+    tailor = await db.users.find_one(
+        {"id": tailor_id, "role": "tailor"},
+        {"_id": 0, "password_hash": 0}
+    )
+    if not tailor:
+        raise HTTPException(status_code=404, detail="Tailor not found")
+
+    services = await db.tailor_services.find(
+        {"tailor_id": tailor_id},
+        {"_id": 0}
+    ).to_list(100)
+
+    reviews = await db.reviews.find(
+        {"tailor_id": tailor_id},
+        {"_id": 0}
+    ).sort("created_at", -1).to_list(50)
+
+    tailor["services"] = services
+    tailor["reviews"] = reviews
+
+    return tailor
+
+
+@api_router.post("/tailor/services")
+async def add_service(data: ServiceCreate, user=Depends(require_tailor)):
+    delivery_opts = data.delivery_options or [
+        {"label": "Standard (5 Days)", "days_required": 5}
+    ]
+
+    service = {
+        "id": str(uuid.uuid4()),
+        "tailor_id": user["id"],
+        "service_name": data.service_name,
+        "price": data.price,
+        "category": data.category,
+        "delivery_options": delivery_opts
+    }
+
+    await db.tailor_services.insert_one(service)
+    service.pop("_id", None)
+    return service
+
+
+@api_router.put("/tailor/services/{service_id}")
+async def update_service(service_id: str, data: ServiceCreate, user=Depends(require_tailor)):
+    update_vals = {
+        "service_name": data.service_name,
+        "price": data.price,
+        "category": data.category
+    }
+
+    if data.delivery_options is not None:
+        update_vals["delivery_options"] = data.delivery_options
+
+    result = await db.tailor_services.update_one(
+        {"id": service_id, "tailor_id": user["id"]},
+        {"$set": update_vals}
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    updated = await db.tailor_services.find_one({"id": service_id}, {"_id": 0})
+    return updated
+
+
+@api_router.delete("/tailor/services/{service_id}")
+async def delete_service(service_id: str, user=Depends(require_tailor)):
+    result = await db.tailor_services.delete_one(
+        {"id": service_id, "tailor_id": user["id"]}
+    )
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    return {"message": "Service deleted"}
 # ===================== DELIVERY ROUTES =====================
+@api_router.put("/delivery/{order_id}/accept")
+async def accept_delivery(order_id: str, user=Depends(require_delivery)):
+
+    order = await db.orders.find_one({
+        "id": order_id,
+        "delivery_partner_id": user["id"],
+        "status": "delivery_assigned"
+    })
+
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not available for acceptance")
+
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {
+            "status": "delivery_accepted",
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+
+    return {"message": "Delivery accepted successfully"}
+
+@api_router.put("/delivery/{order_id}/reject")
+async def reject_delivery(order_id: str, user=Depends(require_delivery)):
+
+    order = await db.orders.find_one({
+        "id": order_id,
+        "delivery_partner_id": user["id"],
+        "status": "pickup_assigned"
+    })
+
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not available for rejection")
+
+    # make driver available again
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"is_available": True}}
+    )
+
+    # reset order to dispatcher queue
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {
+            "status": "pickup_pending",
+            "delivery_partner_id": "",
+            "delivery_partner_name": "",
+            "pickup_assigned_at": None,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+
+    return {"message": "Delivery rejected"}
 
 @api_router.get("/delivery/assignments")
 async def get_delivery_assignments(user=Depends(require_delivery)):
     orders = await db.orders.find(
-        {"delivery_partner_id": user["id"], "status": {"$nin": ["delivered", "rejected", "placed"]}},
-        {"_id": 0}
-    ).sort("created_at", -1).to_list(100)
+    {
+        "delivery_partner_id": user["id"],
+        "status": {
+            "$in": [
+                "pickup_assigned",
+                "picked_up",
+                "delivery_assigned",
+                "delivery_accepted",
+                "out_for_delivery"
+            ]
+        }
+    },
+    {"_id": 0}
+).sort("created_at", -1).to_list(100)
     return orders
 
 @api_router.put("/delivery/{order_id}/update")
-async def update_delivery_status(order_id: str, status: str = Body(..., embed=True), user=Depends(require_delivery)):
-    valid = ["picked_up", "delivered_to_tailor", "collected_from_tailor", "out_for_delivery", "delivered"]
+async def update_delivery_status(
+    order_id: str,
+    status: str = Body(..., embed=True),
+    user=Depends(require_delivery)
+):
+    valid = [
+        "picked_up",
+        "delivered_to_tailor",
+        "collected_from_tailor",
+        "out_for_delivery",
+        "delivered"
+    ]
+
     if status not in valid:
-        raise HTTPException(status_code=400, detail=f"Invalid delivery status")
-    order = await db.orders.find_one({"id": order_id, "delivery_partner_id": user["id"]}, {"_id": 0})
+        raise HTTPException(status_code=400, detail="Invalid delivery status")
+
+    order = await db.orders.find_one(
+        {"id": order_id, "delivery_partner_id": user["id"]},
+        {"_id": 0}
+    )
+
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    update_data = {"status": status, "updated_at": datetime.now(timezone.utc).isoformat()}
+
+    update_data = {
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    # ✅ If final delivery completed
     if status == "delivered":
         update_data["payment_status"] = "completed"
-    await db.orders.update_one({"id": order_id}, {"$set": update_data})
+
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": update_data}
+    )
+
+    # 🔥 If pickup completed → move to stitching
+    if status == "delivered_to_tailor":
+
+    # Make driver available again
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$set": {"is_available": True}}
+        )
+
+    # 🔥 CLEAR pickup driver AND move to stitching
+        await db.orders.update_one(
+            {"id": order_id},
+            {"$set": {
+                "status": "in_stitching",
+                "delivery_partner_id": "",
+                "delivery_partner_name": "",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
     return updated
 
@@ -572,6 +960,37 @@ async def get_delivery_earnings(user=Depends(require_delivery)):
         "delivery_fee": delivery_fee,
         "recent_deliveries": orders[:10]
     }
+
+@api_router.put("/delivery/location")
+async def update_delivery_location(
+    latitude: float = Body(...),
+    longitude: float = Body(...),
+    user=Depends(require_delivery)
+):
+    await db.users.update_one(
+        {"id": user["id"]},
+        {
+            "$set": {
+                "geo_location": {
+                    "type": "Point",
+                    "coordinates": [longitude, latitude]
+                }
+            }
+        }
+    )
+
+    return {"message": "Location updated"}
+@api_router.put("/delivery/availability")
+async def toggle_availability(
+    is_available: bool = Body(..., embed=True),
+    user=Depends(require_delivery)
+):
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"is_available": is_available}}
+    )
+
+    return {"message": "Availability updated", "is_available": is_available}
 
 
 # ===================== ADMIN ROUTES =====================
@@ -1002,7 +1421,12 @@ async def seed_data():
         "rating": 4.2,
         "rating_count": 45, "status": "active", "specialities": [],
         "experience": "", "working_hours": {}, "profile_photo": "",
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "geo_location": {               # 🔥 ADD THIS
+        "type": "Point",
+        "coordinates": [72.8777, 19.0760]
+    },
+    "is_available": True,           # 🔥 ADD THIS
     }
 
     delivery2 = {
@@ -1012,22 +1436,46 @@ async def seed_data():
         "address": "Karol Bagh, Delhi", "location": "Delhi, 110001",
         "rating": 4.0, "rating_count": 22, "status": "active", "specialities": [],
         "experience": "", "working_hours": {}, "profile_photo": "",
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "geo_location": {               # 🔥 ADD THIS
+        "type": "Point",
+        "coordinates": [72.8777, 19.0760]
+        },
+        "is_available": True,           # 🔥 ADD THIS
     }
 
     all_users = [admin] + tailors + customers + [delivery, delivery2]
     await db.users.insert_many(all_users)
 
     service_data = [
-        {"tailor_id": tailors[0]["id"], "service_name": "Blouse Stitching", "price": 800, "category": "Blouse"},
-        {"tailor_id": tailors[0]["id"], "service_name": "Lehenga", "price": 5000, "category": "Lehenga"},
-        {"tailor_id": tailors[0]["id"], "service_name": "Saree Blouse Premium", "price": 1500, "category": "Blouse"},
-        {"tailor_id": tailors[1]["id"], "service_name": "Men's Suit", "price": 8000, "category": "Men's Suit"},
-        {"tailor_id": tailors[1]["id"], "service_name": "Kurta Pajama", "price": 2500, "category": "Kurta"},
-        {"tailor_id": tailors[1]["id"], "service_name": "Sherwani", "price": 15000, "category": "Sherwani"},
-        {"tailor_id": tailors[2]["id"], "service_name": "Alteration", "price": 300, "category": "Alteration"},
-        {"tailor_id": tailors[2]["id"], "service_name": "Blouse Stitching", "price": 600, "category": "Blouse"},
-        {"tailor_id": tailors[2]["id"], "service_name": "Dress Stitching", "price": 2000, "category": "Dress"},
+    {
+        "tailor_id": tailors[0]["id"],
+        "service_name": "Blouse Stitching",
+        "price": 800,
+        "category": "Blouse",
+        "delivery_options": [
+            {"label": "Standard (5 Days)", "days_required": 5},
+            {"label": "Express (2 Days)", "days_required": 2}
+        ]
+    },
+    {
+        "tailor_id": tailors[0]["id"],
+        "service_name": "Lehenga",
+        "price": 5000,
+        "category": "Lehenga",
+        "delivery_options": [
+            {"label": "Standard (7 Days)", "days_required": 7}
+        ]
+    },
+    {
+        "tailor_id": tailors[1]["id"],
+        "service_name": "Men's Suit",
+        "price": 8000,
+        "category": "Men's Suit",
+        "delivery_options": [
+            {"label": "Premium (10 Days)", "days_required": 10}
+        ]
+    }
     ]
     services = [{"id": str(uuid.uuid4()), **sd} for sd in service_data]
     await db.tailor_services.insert_many(services)
@@ -1114,9 +1562,107 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+async def auto_assign_pickups():
+    while True:
+        try:
+            # find orders waiting for pickup
+            pending_orders = db.orders.find(
+                {"status": "pickup_pending"},
+                {"_id": 0}
+            )
+
+            async for order in pending_orders:
+
+                if not order.get("pickup_location"):
+                    continue
+
+                # find nearest delivery partner
+                partner = await db.users.find_one_and_update(
+                    {
+                        "role": "delivery",
+                        "status": "active",
+                        "is_available": True,
+                        "geo_location": {
+                            "$near": {
+                                "$geometry": order["pickup_location"],
+                                "$maxDistance": 5000
+                            }
+                        }
+                    },
+                    {"$set": {"is_available": False}},
+                    return_document=ReturnDocument.AFTER
+                )
+
+                if partner:
+                    await db.orders.update_one(
+                        {"id": order["id"]},
+                        {"$set": {
+                            "delivery_partner_id": partner["id"],
+                            "delivery_partner_name": partner["name"],
+                            "status": "pickup_assigned",
+                            "pickup_assigned_at": datetime.now(timezone.utc).isoformat(),
+                            "updated_at": datetime.now(timezone.utc).isoformat()
+                        }}
+                    )
+
+                    logger.info(f"Driver {partner['name']} assigned to order {order['id']}")
+
+        except Exception as e:
+            logger.error(f"Dispatcher error: {e}")
+
+        await asyncio.sleep(10)  # run every 10 seconds
+async def check_driver_timeouts():
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+
+            assigned_orders = db.orders.find(
+                {"status": "pickup_assigned"},
+                {"_id": 0}
+            )
+
+            async for order in assigned_orders:
+
+                assigned_time = order.get("pickup_assigned_at")
+                if not assigned_time:
+                    continue
+
+                assigned_dt = datetime.fromisoformat(assigned_time)
+
+                # 60 second timeout
+                if (now - assigned_dt).total_seconds() > 60:
+
+                    driver_id = order.get("delivery_partner_id")
+
+                    # make driver available again
+                    if driver_id:
+                        await db.users.update_one(
+                            {"id": driver_id},
+                            {"$set": {"is_available": True}}
+                        )
+
+                    # reset order
+                    await db.orders.update_one(
+                        {"id": order["id"]},
+                        {"$set": {
+                            "status": "pickup_pending",
+                            "delivery_partner_id": "",
+                            "delivery_partner_name": "",
+                            "pickup_assigned_at": None,
+                            "updated_at": now.isoformat()
+                        }}
+                    )
+
+                    logger.info(f"Driver timeout → reassigned order {order['id']}")
+
+        except Exception as e:
+            logger.error(f"Timeout checker error: {e}")
+
+        await asyncio.sleep(15)
 
 @app.on_event("startup")
 async def startup():
+    
     await db.users.create_index("id", unique=True)
     await db.users.create_index("email", unique=True)
     await db.tailor_services.create_index("id", unique=True)
@@ -1130,7 +1676,11 @@ async def startup():
     await db.withdrawals.create_index("id", unique=True)
     await db.users.create_index("city")
     await db.users.create_index("pincode")
+    await db.orders.create_index("estimated_delivery_date")
     await db.users.create_index([("role", 1), ("city", 1), ("status", 1)])
+    await db.users.create_index([("geo_location", "2dsphere")])
+    asyncio.create_task(auto_assign_pickups())
+    asyncio.create_task(check_driver_timeouts())
     logger.info("Stitchly API started - indexes created")
 
 @app.on_event("shutdown")

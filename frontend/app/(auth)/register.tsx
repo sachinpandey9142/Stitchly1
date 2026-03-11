@@ -419,24 +419,24 @@ const fetchAddressSuggestions = async (text: string) => {
         <TouchableOpacity
   key={item.place_id}
   style={{ padding: 10 }}
-                                              onPress={async () => {
-                                              const address = item.address || {};
+    onPress={async () => {
+    const address = item.address || {};
 
-                                              setCity(
-                                                address.city ||
-                                                address.town ||
-                                                address.village ||
-                                                ""
-                                              );
+    setCity(
+      address.city ||
+      address.town ||
+      address.village ||
+      ""
+    );
 
-                                              setPincode(address.postcode || "");
-                                              setAddress(item.display_name || "");
+    setPincode(address.postcode || "");
+    setAddress(item.display_name || "");
 
-                                              setLatitude(parseFloat(item.lat));
-                                              setLongitude(parseFloat(item.lon));
+    setLatitude(parseFloat(item.lat));
+    setLongitude(parseFloat(item.lon));
 
-                                              setSuggestions([]);
-                                            }}>
+    setSuggestions([]);
+  }}>
 
  
   

@@ -5,7 +5,7 @@ import { Feather } from '@expo/vector-icons';
 import { api } from '../../../src/utils/api';
 import { Colors, Fonts, Spacing, Radius, STATUS_COLORS, STATUS_LABELS } from '../../../src/utils/theme';
 
-const TAILOR_STATUSES = ['in_stitching', 'completed', 'ready'];
+const TAILOR_STATUSES = ['accepted', 'in_stitching', 'ready'];;
 
 export default function TailorOrders() {
   const [orders, setOrders] = useState<any[]>([]);
@@ -69,11 +69,11 @@ export default function TailorOrders() {
           </TouchableOpacity>
         </View>
       )}
-      {['accepted', 'in_stitching', 'completed'].includes(item.status) && item.status !== 'ready' && (
+      {['accepted', 'in_stitching'].includes(item.status) && (
         <TouchableOpacity testID={`update-status-${item.id}`} style={styles.updateBtn} onPress={() => handleStatusUpdate(item.id, item.status)} activeOpacity={0.7}>
           <Feather name="arrow-right" size={18} color={Colors.primary} />
           <Text style={styles.updateText}>
-            {item.status === 'accepted' ? 'Start Stitching' : item.status === 'in_stitching' ? 'Mark Completed' : 'Mark Ready'}
+           {item.status === 'accepted'? 'Start Stitching': 'Mark Ready'}
           </Text>
         </TouchableOpacity>
       )}
