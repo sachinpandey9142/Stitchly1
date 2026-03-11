@@ -23,7 +23,7 @@ import mediapipe as mp
 import numpy as np
 from fastapi import UploadFile, File, Form
 import shutil
-from body_reconstruction import add_frame, average_landmarks
+from ai.body3d.body_reconstruction import add_frame, average_landmarks
 
 from ai.pose_detector import detect_landmarks
 from ai.measurement_calculator import calculate_measurements
