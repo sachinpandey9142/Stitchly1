@@ -7,26 +7,108 @@ import { api } from '../../src/utils/api';
 import { useAuth } from '../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius } from '../../src/utils/theme';
 
+
 export default function PlaceOrder() {
-  const { tailorId, service } = useLocalSearchParams<{ tailorId: string; service?: string }>();
+  const { tailorId, service, address, lat, lng } =
+useLocalSearchParams<{
+  tailorId: string;
+  service?: string;
+  address?: string;
+  lat?: string;
+  lng?: string;
+}>();
   const router = useRouter();
   const { user } = useAuth();
   const [tailor, setTailor] = useState<any>(null);
   const [serviceType, setServiceType] = useState(service ? decodeURIComponent(service) : '');
   const [description, setDescription] = useState('');
-  const [pickupAddress, setPickupAddress] = useState(user?.address || '');
   const [paymentMethod, setPaymentMethod] = useState('online');
+  const [selectedDeliveryOption, setSelectedDeliveryOption] = useState<any>(null);
   const [loading, setLoading] = useState(false);
+  const [pickupAddress, setPickupAddress] = useState("");
+  const [pickupLocation, setPickupLocation] = useState<any>(null);
+
+useEffect(() => {
+  if (address && lat && lng) {
+
+    setPickupAddress(String(address));
+
+    setPickupLocation({
+      type: "Point",
+      coordinates: [Number(lng), Number(lat)]
+    });
+
+  }
+}, [address, lat, lng]);
 
   useEffect(() => {
-    (async () => { try { const data = await api.get(`/tailors/${tailorId}`); setTailor(data); } catch {} })();
+  setSelectedDeliveryOption(null);
+}, [serviceType]);
+
+
+  useEffect(() => {
+    (async () => { try {
+  const data = await api.get(`/tailors/${tailorId}`);
+  setTailor(data);
+} catch (err) {
+  Alert.alert("Error", "Failed to load tailor");
+} })();
   }, [tailorId]);
+  useEffect(() => {
+  if (user) {
+    if (!user.address) {
+      Alert.alert(
+        "Address Required",
+        "Please add your address before placing an order.",
+        [
+          {
+            text: "Add Address",
+            onPress: () => router.push("/(customer)/profile")
+          }
+        ]
+      );
+      return;
+    }
+
+    setPickupAddress(user.address);
+
+    if (user.geo_location) {
+      setPickupLocation(user.geo_location);
+    }
+  }
+}, [user]);
+
+  
 
   const handleOrder = async () => {
-    if (!serviceType || !description.trim() || !pickupAddress.trim()) { Alert.alert('Error', 'Fill in all required fields'); return; }
-    setLoading(true);
+    
+    console.log("HANDLE ORDER TRIGGERED 🔥");
+   
+  if (!serviceType || !description.trim() || !pickupAddress.trim() || !selectedDeliveryOption || !pickupLocation)  {
+  Alert.alert('Error', 'Fill all required fields and allow location access');
+  return;
+}
+  
+  if (selectedService?.delivery_options && !selectedDeliveryOption) {
+    Alert.alert('Selection Required', 'Please select delivery timing');
+    return;
+  }
+  setLoading(true);
     try {
-      const order = await api.post('/orders', { tailor_id: tailorId, service_type: serviceType, description: description.trim(), pickup_address: pickupAddress.trim(), payment_method: paymentMethod });
+      const payload = {
+  tailor_id: tailorId,
+  service_type: serviceType,
+  description: description.trim(),
+  pickup_address: pickupAddress.trim(),
+  pickup_location: pickupLocation,
+  payment_method: paymentMethod,
+  delivery_option: selectedDeliveryOption
+};
+
+console.log("ORDER PAYLOAD:", JSON.stringify(payload, null, 2));
+
+const order = await api.post('/orders', payload);
+      
       if (paymentMethod === 'online') {
         try {
           // Create Razorpay order first
@@ -41,7 +123,9 @@ export default function PlaceOrder() {
       } else {
         Alert.alert('Success', 'Order placed with Cash on Delivery', [{ text: 'OK', onPress: () => router.replace('/(customer)/orders') }]);
       }
-    } catch (err: any) { Alert.alert('Error', err.message); }
+    } catch (err: any) {
+  Alert.alert('Error', err?.message || 'Something went wrong');
+}
     finally { setLoading(false); }
   };
 
@@ -51,8 +135,20 @@ export default function PlaceOrder() {
     <SafeAreaView style={styles.container} edges={['top']}>
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1 }}>
         <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
-          <TouchableOpacity testID="back-btn" style={styles.backBtn} onPress={() => router.back()} activeOpacity={0.7}>
-            <Feather name="arrow-left" size={24} color={Colors.text} />
+                  <TouchableOpacity
+          testID="back-btn"
+          style={styles.backBtn}
+          onPress={() => {
+            if (router.canGoBack()) {
+              router.back();
+            } else {
+              router.replace("/(customer)/home");
+            }
+          }}
+          activeOpacity={0.7}
+        >
+                    
+        <Feather name="arrow-left" size={24} color={Colors.text} />
           </TouchableOpacity>
           <View style={styles.headerSection}>
             <Text style={styles.title}>Place Order</Text>
@@ -69,12 +165,54 @@ export default function PlaceOrder() {
                 </TouchableOpacity>
               ))}
             </View>
+            {selectedService?.delivery_options?.length > 0 && (
+                <>
+                  <Text style={styles.label}>Select Delivery Timing *</Text>
+                  <View style={styles.serviceGrid}>
+                    {selectedService.delivery_options.map((option: any, index: number) => (
+                      <TouchableOpacity
+                        key={index}
+                        style={[
+                          styles.serviceChip,
+                          selectedDeliveryOption?.label === option.label && styles.serviceChipActive
+                        ]}
+                        onPress={() => setSelectedDeliveryOption(option)}
+                        activeOpacity={0.7}
+                      >
+                        <Text
+                          style={[
+                            styles.serviceChipText,
+                            selectedDeliveryOption?.label === option.label && styles.serviceChipTextActive
+                          ]}
+                        >
+                          {option.label}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </>
+              )}
 
             <Text style={styles.label}>Description *</Text>
             <TextInput testID="order-desc-input" style={[styles.input, styles.textArea]} placeholder="Describe what you need (fabric type, design, etc.)" placeholderTextColor={Colors.textMuted} value={description} onChangeText={setDescription} multiline numberOfLines={4} textAlignVertical="top" />
 
             <Text style={styles.label}>Pickup Address *</Text>
-            <TextInput testID="order-address-input" style={styles.input} placeholder="Enter your address" placeholderTextColor={Colors.textMuted} value={pickupAddress} onChangeText={setPickupAddress} />
+            <TextInput
+                testID="order-address-input"
+                style={styles.input}
+                value={pickupAddress}
+                editable={false}
+              />
+            {/*  */}
+            <TouchableOpacity
+            style={styles.changeAddressBtn}
+            onPress={() => router.push("/select-address")}
+          >
+            <Feather name="map-pin" size={16} color="#fff" />
+            <Text style={styles.changeAddressText}>
+              Change Address
+            </Text>
+          </TouchableOpacity>
 
             <Text style={styles.label}>Payment Method</Text>
             <View style={styles.paymentRow}>
@@ -91,7 +229,12 @@ export default function PlaceOrder() {
             <View style={styles.summaryCard}>
               <Text style={styles.summaryTitle}>Order Summary</Text>
               <View style={styles.summaryRow}><Text style={styles.summaryLabel}>{selectedService.service_name}</Text><Text style={styles.summaryValue}>{'\u20B9'}{selectedService.price}</Text></View>
-              <View style={styles.summaryRow}><Text style={styles.summaryLabel}>Payment</Text><Text style={styles.summaryValue}>{paymentMethod === 'cod' ? 'COD' : 'Online'}</Text></View>
+              {selectedDeliveryOption && (
+              <View style={styles.summaryRow}>
+                <Text style={styles.summaryLabel}>Delivery</Text>
+                <Text style={styles.summaryValue}>{selectedDeliveryOption.label}</Text>
+              </View>
+            )}
             </View>
           )}
 
@@ -134,4 +277,21 @@ const styles = StyleSheet.create({
   submitBtn: { backgroundColor: Colors.primary, borderRadius: Radius.full, paddingVertical: 16, alignItems: 'center', marginHorizontal: Spacing.containerPadding, marginTop: 24, shadowColor: Colors.primary, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.2, shadowRadius: 8, elevation: 4 },
   submitBtnDisabled: { opacity: 0.6 },
   submitBtnText: { fontFamily: Fonts.bodyBold, fontSize: 16, color: Colors.textInverted },
+  
+  changeAddressBtn: {
+  marginTop: 8,
+  backgroundColor: Colors.primary,
+  flexDirection: "row",
+  alignItems: "center",
+  justifyContent: "center",
+  paddingVertical: 10,
+  borderRadius: Radius.md,
+  gap: 6
+},
+
+changeAddressText: {
+  color: Colors.textInverted,
+  fontFamily: Fonts.bodyBold,
+  fontSize: 14
+},
 });

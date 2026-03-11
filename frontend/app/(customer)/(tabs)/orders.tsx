@@ -11,6 +11,7 @@ export default function CustomerOrders() {
   const [orders, setOrders] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  
 
   const fetchOrders = useCallback(async () => {
     try {

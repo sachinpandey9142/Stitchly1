@@ -1,6 +1,12 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { api } from '../utils/api';
+import React, {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  ReactNode,
+} from "react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { api } from "../utils/api";
 
 export type User = {
   id: string;
@@ -19,6 +25,11 @@ export type User = {
   experience: string;
   working_hours: Record<string, string>;
   profile_photo: string;
+
+  geo_location?: {
+    type: "Point";
+    coordinates: [number, number];
+  };
 };
 
 type RegisterData = {
@@ -55,46 +66,48 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const loadUser = async () => {
     try {
-      const token = await AsyncStorage.getItem('auth_token');
+      const token = await AsyncStorage.getItem("auth_token");
       if (token) {
-        const userData = await api.get('/auth/me');
+        const userData = await api.get("/auth/me");
         setUser(userData);
       }
     } catch {
-      await AsyncStorage.removeItem('auth_token');
+      await AsyncStorage.removeItem("auth_token");
     } finally {
       setLoading(false);
     }
   };
 
   const login = async (email: string, password: string) => {
-    const data = await api.post('/auth/login', { email, password });
-    await AsyncStorage.setItem('auth_token', data.token);
+    const data = await api.post("/auth/login", { email, password });
+    await AsyncStorage.setItem("auth_token", data.token);
     setUser(data.user);
     return data.user;
   };
 
   const register = async (registerData: RegisterData) => {
-    const data = await api.post('/auth/register', registerData);
-    await AsyncStorage.setItem('auth_token', data.token);
+    const data = await api.post("/auth/register", registerData);
+    await AsyncStorage.setItem("auth_token", data.token);
     setUser(data.user);
     return data.user;
   };
 
   const logout = async () => {
-    await AsyncStorage.removeItem('auth_token');
+    await AsyncStorage.removeItem("auth_token");
     setUser(null);
   };
 
   const refreshUser = async () => {
     try {
-      const userData = await api.get('/auth/me');
+      const userData = await api.get("/auth/me");
       setUser(userData);
     } catch {}
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, register, logout, refreshUser }}>
+    <AuthContext.Provider
+      value={{ user, loading, login, register, logout, refreshUser }}
+    >
       {children}
     </AuthContext.Provider>
   );

@@ -211,12 +211,20 @@ class TestLocationBasedDeliveryAssignment:
             mumbai_tailor_id = mumbai_tailors[0]["id"]
             
             # Create order
-            order_response = api_client.post(f"{BASE_URL}/api/orders", headers=customer_headers, json={
+            order_response = api_client.post(f"{BASE_URL}/api/orders", headers=customer_headers,json={
                 "tailor_id": mumbai_tailor_id,
                 "service_type": "Blouse Stitching",
                 "description": "Test order for delivery assignment",
                 "pickup_address": "123 Marine Drive, Mumbai",
-                "payment_method": "cod"
+                "pickup_location": {
+                    "type": "Point",
+                    "coordinates": [72.8777, 19.0760]
+                },
+                "payment_method": "cod",
+                "delivery_option": {
+                    "label": "Standard (5 Days)",
+                    "days_required": 5
+                }
             })
             assert order_response.status_code == 200
             order_id = order_response.json()["id"]
