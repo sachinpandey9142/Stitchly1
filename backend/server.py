@@ -27,6 +27,9 @@ from ai.body3d.body_reconstruction import add_frame, average_landmarks
 
 from ai.pose_detector import detect_landmarks
 from ai.measurement_calculator import calculate_measurements
+from pose_detector import PoseDetector
+from measurement_calculator import calculate_measurements as calculate_tailoring_measurements
+from body_reconstruction import BodyReconstructor
 
 frame_buffer = []
 MAX_FRAMES = 10
@@ -1155,6 +1158,8 @@ async def startup():
     await db.users.create_index("city")
     await db.users.create_index("pincode")
     await db.users.create_index([("role", 1), ("city", 1), ("status", 1)])
+    await db.body_scans.create_index("id", unique=True)
+    await db.body_scans.create_index("user_id")
     logger.info("Stitchly API started - indexes created")
 
 @app.on_event("shutdown")
@@ -1321,57 +1326,97 @@ async def scan_body(
     front_image: UploadFile = File(...),
     side_image: UploadFile = File(...),
     back_image: UploadFile = File(...),
-    height_cm: float = Form(...)
+    height_cm: float = Form(...),
+    user_id: Optional[str] = Form(default=None),
 ):
+    """Production body scan pipeline: landmarks -> smoothing -> mesh -> measurements."""
 
-    os.makedirs("temp", exist_ok=True)
+    scan_id = str(uuid.uuid4())
+    temp_dir = Path("temp")
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
-    # -------- Save images --------
-
-    front_path = f"temp/front_{front_image.filename}"
-    side_path = f"temp/side_{side_image.filename}"
-    back_path = f"temp/back_{back_image.filename}"
+    front_path = temp_dir / f"{scan_id}_front.jpg"
+    side_path = temp_dir / f"{scan_id}_side.jpg"
+    back_path = temp_dir / f"{scan_id}_back.jpg"
 
     with open(front_path, "wb") as buffer:
         shutil.copyfileobj(front_image.file, buffer)
-
     with open(side_path, "wb") as buffer:
         shutil.copyfileobj(side_image.file, buffer)
-
     with open(back_path, "wb") as buffer:
         shutil.copyfileobj(back_image.file, buffer)
 
-    # -------- Detect landmarks --------
+    detector = PoseDetector(min_visibility=0.5, frame_window=5)
 
-    front_landmarks = detect_landmarks(front_path)
-    side_landmarks = detect_landmarks(side_path)
-    back_landmarks = detect_landmarks(back_path)
+    try:
+        # Step 2 + 3: pose detection and frame smoothing
+        detector.detect_from_path(front_path)
+        detector.detect_from_path(side_path)
+        detector.detect_from_path(back_path)
+        smoothed = detector.smoothed_landmarks()
 
-    if not front_landmarks or not side_landmarks or not back_landmarks:
-        return {"error": "Body detection failed"}
+        # Step 5 + 11: measurement extraction with multi-view fusion + ellipse model
+        front_landmarks = detector.detect_from_path(front_path).landmarks
+        side_landmarks = detector.detect_from_path(side_path).landmarks
+        back_landmarks = detector.detect_from_path(back_path).landmarks
 
-    # -------- Calculate measurements --------
+        measurements = calculate_tailoring_measurements(
+            front_landmarks=front_landmarks,
+            side_landmarks=side_landmarks,
+            back_landmarks=back_landmarks,
+            height_cm=height_cm,
+        )
 
-    measurements = calculate_measurements(
-        front_landmarks,
-        side_landmarks,
-        back_landmarks,
-        height_cm
-    )
+        # Step 4 + 6 + 7: reconstruct and export textured mesh
+        front_bgr = cv2.imread(str(front_path))
+        reconstructor = BodyReconstructor(output_dir="outputs")
+        reconstruction = reconstructor.reconstruct(
+            measurements=measurements,
+            height_cm=height_cm,
+            texture_bgr=front_bgr,
+            scan_id=scan_id,
+        )
 
-    # -------- Format landmarks for frontend --------
+    except Exception as exc:
+        logger.exception("Body scan failed")
+        raise HTTPException(status_code=422, detail=f"Body scan failed: {exc}")
 
-    formatted_landmarks = []
+    # Step 9: store placeholders for tailoring use
+    measurement_doc = {
+        "id": scan_id,
+        "user_id": user_id,
+        "shoulder": measurements["shoulder_width"],
+        "chest": measurements["chest_circumference"],
+        "waist": measurements["waist_circumference"],
+        "hip": measurements["hip_circumference"],
+        "arm": measurements["arm_length"],
+        "leg": measurements["leg_length"],
+        "mesh_path": reconstruction.mesh_path,
+        "texture_path": reconstruction.texture_path,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.body_scans.insert_one(measurement_doc)
 
-    for x, y, z in front_landmarks:
-        formatted_landmarks.append({
-            "x": x,
-            "y": y,
-            "z": z
-        })
+    formatted_landmarks = [
+        {"x": float(x), "y": float(y), "z": float(z)}
+        for x, y, z in smoothed
+        if not np.isnan(x)
+    ]
 
+    # Step 8: response contract expected by mobile app
     return {
-        "success": True,
-        "measurements": measurements,
-        "landmarks": formatted_landmarks
+        "measurements": {
+            "shoulder": measurements["shoulder_width"],
+            "chest": measurements["chest_circumference"],
+            "waist": measurements["waist_circumference"],
+            "hip": measurements["hip_circumference"],
+            "arm": measurements["arm_length"],
+            "leg": measurements["leg_length"],
+            "inseam": measurements["inseam"],
+            "neck": measurements["neck"],
+            "thigh": measurements["thigh"],
+        },
+        "mesh": reconstruction.mesh_path,
+        "texture": reconstruction.texture_path,
+        "landmarks": formatted_landmarks,
     }
