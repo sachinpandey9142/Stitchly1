@@ -114,3 +114,7 @@ __pycache__/
 # OS junk
 Thumbs.db
 desktop.ini
+
+# pytest cache
+.pytest_cache/
+pytest-cache-files-*

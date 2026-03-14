@@ -1,6 +1,7 @@
 """Stitchly Backend API - 3-Sided Tailoring Marketplace"""
 
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Body, Query, Request
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Body, Query, Request, BackgroundTasks
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import HTMLResponse
@@ -18,30 +19,62 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import razorpay
-import cv2
-import mediapipe as mp
 import numpy as np
 from fastapi import UploadFile, File, Form
 import shutil
-from ai.body3d.body_reconstruction import add_frame, average_landmarks
 
-from ai.pose_detector import detect_landmarks
-from ai.measurement_calculator import calculate_measurements
+ROOT_DIR = Path(__file__).parent
+
+try:
+    from auth.security import create_access_token
+    from orders.policies import VALID_ORDER_STATUSES, ensure_order_access, ensure_transition_allowed
+    from dispatch.service import assign_order_to_reserved_driver, release_delivery_partner, reserve_delivery_partner
+except ImportError:
+    from .auth.security import create_access_token
+    from .orders.policies import VALID_ORDER_STATUSES, ensure_order_access, ensure_transition_allowed
+    from .dispatch.service import assign_order_to_reserved_driver, release_delivery_partner, reserve_delivery_partner
+
+AVATAR_IMPORT_ERROR = None
+try:
+    from ai.avatar_generator import generate_avatar
+    from storage.avatar_storage import LOCAL_AVATAR_DIR
+    from worker.avatar_worker import enqueue_avatar_generation_task, worker_enabled
+except Exception as exc:
+    generate_avatar = None
+    LOCAL_AVATAR_DIR = ROOT_DIR / "avatars"
+    enqueue_avatar_generation_task = None
+    worker_enabled = lambda: False
+    AVATAR_IMPORT_ERROR = exc
+
+AI_IMPORT_ERROR = None
+try:
+    import cv2
+    from ai.body3d.body_reconstruction import add_frame, average_landmarks
+    from ai.pose_detector import detect_landmarks
+    from ai.measurement_calculator import calculate_measurements
+except Exception as exc:
+    cv2 = None
+    AI_IMPORT_ERROR = exc
 
 frame_buffer = []
 MAX_FRAMES = 10
 
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=True)
-
-ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+LOCAL_AVATAR_DIR.mkdir(parents=True, exist_ok=True)
 
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALGORITHM = "HS256"
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8081,exp://127.0.0.1:19000",
+    ).split(",")
+    if origin.strip()
+]
 
 RAZORPAY_KEY_ID = os.environ['RAZORPAY_KEY_ID']
 RAZORPAY_KEY_SECRET = os.environ['RAZORPAY_KEY_SECRET']
@@ -55,6 +88,333 @@ api_router = APIRouter(prefix="/api")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+DELIVERY_SEARCH_RADIUS_METERS = 7000
+PENDING_DELIVERY_RETRY_STATUSES = ["accepted", "ready"]
+ACTIVE_DELIVERY_ORDER_STATUSES = [
+    "pickup_assigned",
+    "delivery_assigned",
+    "delivery_accepted",
+    "picked_up",
+    "out_for_delivery",
+]
+
+
+def normalize_geo_location(geo_location: Optional[dict]) -> Optional[dict]:
+    if not geo_location:
+        return None
+    coordinates = geo_location.get("coordinates", [])
+    if geo_location.get("type") != "Point" or len(coordinates) != 2:
+        return None
+    try:
+        longitude = float(coordinates[0])
+        latitude = float(coordinates[1])
+    except (TypeError, ValueError):
+        return None
+    return {"type": "Point", "coordinates": [longitude, latitude]}
+
+
+def build_geo_location(latitude: Optional[float], longitude: Optional[float]) -> Optional[dict]:
+    if latitude is None or longitude is None:
+        return None
+    return normalize_geo_location(
+        {"type": "Point", "coordinates": [float(longitude), float(latitude)]}
+    )
+
+
+def get_geo_location(document: Optional[dict]) -> Optional[dict]:
+    if not document:
+        return None
+    return normalize_geo_location(document.get("geo_location"))
+
+
+def build_safe_user(user: dict) -> dict:
+    return {k: v for k, v in user.items() if k != "password_hash"}
+
+
+def issue_token_for_user(user: dict) -> str:
+    return create_access_token(user, JWT_SECRET, JWT_ALGORITHM)
+
+
+def ensure_ai_dependencies():
+    if AI_IMPORT_ERROR is not None:
+        raise HTTPException(status_code=503, detail=f"AI dependencies unavailable: {AI_IMPORT_ERROR}")
+
+
+async def set_delivery_partner_availability(delivery_partner_id: str, is_available: bool):
+    if not delivery_partner_id:
+        return
+    await db.users.update_one(
+        {"id": delivery_partner_id, "role": "delivery"},
+        {"$set": {"is_available": is_available}},
+    )
+
+
+async def get_active_delivery_order_for_driver(delivery_partner_id: str) -> Optional[dict]:
+    if not delivery_partner_id:
+        return None
+    return await db.orders.find_one(
+        {
+            "delivery_partner_id": delivery_partner_id,
+            "status": {"$in": ACTIVE_DELIVERY_ORDER_STATUSES},
+        },
+        {"_id": 0, "id": 1, "status": 1},
+    )
+
+
+async def get_order_for_user(order_id: str, user: dict) -> dict:
+    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    ensure_order_access(user, order)
+    return order
+
+
+async def enrich_orders_with_locations(orders: List[dict]) -> List[dict]:
+    if not orders:
+        return []
+
+    user_ids = {
+        user_id
+        for order in orders
+        for user_id in [
+            order.get("customer_id"),
+            order.get("tailor_id"),
+            order.get("delivery_partner_id"),
+        ]
+        if user_id
+    }
+    users = await db.users.find(
+        {"id": {"$in": list(user_ids)}},
+        {"_id": 0, "id": 1, "address": 1, "geo_location": 1, "phone": 1},
+    ).to_list(len(user_ids) or 1)
+    user_map = {user["id"]: user for user in users}
+
+    enriched_orders = []
+    for order in orders:
+        enriched = dict(order)
+        customer = user_map.get(order.get("customer_id"))
+        tailor = user_map.get(order.get("tailor_id"))
+        delivery_partner = user_map.get(order.get("delivery_partner_id"))
+
+        enriched["customer_address"] = order.get("customer_address") or (customer or {}).get("address", "")
+        enriched["tailor_address"] = order.get("tailor_address") or (tailor or {}).get("address", "")
+        enriched["delivery_partner_phone"] = order.get("delivery_partner_phone") or (delivery_partner or {}).get("phone", "")
+        enriched["customer_geo_location"] = order.get("customer_geo_location") or get_geo_location(customer)
+        enriched["tailor_geo_location"] = order.get("tailor_geo_location") or get_geo_location(tailor)
+        enriched["delivery_partner_geo_location"] = get_geo_location(delivery_partner)
+        enriched_orders.append(enriched)
+
+    return enriched_orders
+
+
+async def enrich_order_with_locations(order: Optional[dict]) -> Optional[dict]:
+    if not order:
+        return None
+    enriched_orders = await enrich_orders_with_locations([order])
+    return enriched_orders[0] if enriched_orders else None
+
+
+async def get_assignment_reference_geo(order: dict, phase: str) -> Optional[dict]:
+    if phase == "return":
+        tailor_geo_location = normalize_geo_location(order.get("tailor_geo_location"))
+        if tailor_geo_location:
+            return tailor_geo_location
+        tailor = await db.users.find_one({"id": order["tailor_id"]}, {"_id": 0, "geo_location": 1})
+        return get_geo_location(tailor)
+
+    pickup_geo_location = normalize_geo_location(order.get("pickup_geo_location"))
+    if pickup_geo_location:
+        return pickup_geo_location
+
+    customer_geo_location = normalize_geo_location(order.get("customer_geo_location"))
+    if customer_geo_location:
+        return customer_geo_location
+    customer = await db.users.find_one({"id": order["customer_id"]}, {"_id": 0, "geo_location": 1})
+    return get_geo_location(customer)
+
+
+async def get_assignment_failure_reason(reference_geo_location: Optional[dict]) -> str:
+    if not reference_geo_location:
+        return "missing pickup location"
+
+    base_query = {"role": "delivery", "status": "active"}
+    available_query = {**base_query, "is_available": True}
+    geo_query = {**available_query, "geo_location": {"$exists": True}}
+
+    if await db.users.count_documents(base_query) == 0:
+        return "no active delivery partners"
+    if await db.users.count_documents(available_query) == 0:
+        return "all delivery partners unavailable"
+    if await db.users.count_documents(geo_query) == 0:
+        return "available delivery partners missing geo_location"
+    return f"no drivers within {DELIVERY_SEARCH_RADIUS_METERS}m"
+
+
+async def find_candidate_delivery_partners(
+    reference_geo_location: Optional[dict],
+    exclude_ids: Optional[List[str]] = None,
+    limit: int = 10,
+):
+    if not reference_geo_location:
+        return []
+
+    query: dict = {
+        "role": "delivery",
+        "status": "active",
+        "is_available": True,
+        "geo_location": {
+            "$near": {
+                "$geometry": reference_geo_location,
+                "$maxDistance": DELIVERY_SEARCH_RADIUS_METERS,
+            }
+        },
+    }
+    if exclude_ids:
+        query["id"] = {"$nin": exclude_ids}
+
+    return await db.users.find(query, {"_id": 0}).limit(limit).to_list(limit)
+
+
+async def assign_specific_delivery_partner_to_order(order: dict, delivery_partner: dict, phase: str, status: str):
+    reserved_driver = await reserve_delivery_partner(db, delivery_partner["id"])
+    if not reserved_driver:
+        return None
+
+    updated = await assign_order_to_reserved_driver(db, order, reserved_driver, phase, status)
+    if updated:
+        logger.info(
+            "Assigned delivery partner %s to order %s for phase=%s",
+            reserved_driver["id"],
+            order.get("id"),
+            phase,
+        )
+        return await enrich_order_with_locations(updated)
+
+    await release_delivery_partner(db, reserved_driver["id"])
+    return None
+
+
+async def assign_delivery_partner_to_order(order: dict, phase: str, status: str, exclude_ids: Optional[List[str]] = None):
+    reference_geo_location = await get_assignment_reference_geo(order, phase)
+    if not reference_geo_location:
+        logger.warning(
+            "Assignment failed for order %s phase=%s: missing reference location",
+            order.get("id"),
+            phase,
+        )
+        return None
+
+    candidates = await find_candidate_delivery_partners(reference_geo_location, exclude_ids=exclude_ids)
+    if not candidates:
+        reason = await get_assignment_failure_reason(reference_geo_location)
+        logger.info(
+            "Assignment failed for order %s phase=%s: %s",
+            order.get("id"),
+            phase,
+            reason,
+        )
+        return None
+
+    for delivery_partner in candidates:
+        assigned = await assign_specific_delivery_partner_to_order(order, delivery_partner, phase, status)
+        if assigned:
+            return assigned
+
+    logger.info(
+        "Assignment failed for order %s phase=%s: all candidate drivers were taken concurrently",
+        order.get("id"),
+        phase,
+    )
+    return None
+
+
+async def find_pending_orders_near_driver(delivery_partner: dict, limit: int = 25) -> List[dict]:
+    geo_location = get_geo_location(delivery_partner)
+    if not geo_location:
+        return []
+
+    pickup_orders = await db.orders.find(
+        {
+            "status": "accepted",
+            "delivery_partner_id": "",
+            "pickup_geo_location": {
+                "$near": {
+                    "$geometry": geo_location,
+                    "$maxDistance": DELIVERY_SEARCH_RADIUS_METERS,
+                }
+            },
+        },
+        {"_id": 0},
+    ).limit(limit).to_list(limit)
+
+    ready_orders = await db.orders.find(
+        {
+            "status": "ready",
+            "delivery_partner_id": "",
+            "tailor_geo_location": {
+                "$near": {
+                    "$geometry": geo_location,
+                    "$maxDistance": DELIVERY_SEARCH_RADIUS_METERS,
+                }
+            },
+        },
+        {"_id": 0},
+    ).limit(limit).to_list(limit)
+
+    return sorted(pickup_orders + ready_orders, key=lambda order: order.get("created_at", ""))
+
+
+async def dispatch_orders_for_delivery_partner(delivery_partner_id: str) -> int:
+    delivery_partner = await db.users.find_one(
+        {
+            "id": delivery_partner_id,
+            "role": "delivery",
+            "status": "active",
+            "is_available": True,
+        },
+        {"_id": 0},
+    )
+    if not delivery_partner:
+        return 0
+    if not get_geo_location(delivery_partner):
+        logger.info("Assignment failed for driver %s: missing geo_location", delivery_partner_id)
+        return 0
+
+    nearby_orders = await find_pending_orders_near_driver(delivery_partner)
+    for order in nearby_orders:
+        phase = "return" if order["status"] == "ready" else "pickup"
+        target_status = "delivery_assigned" if phase == "return" else "pickup_assigned"
+        assigned = await assign_specific_delivery_partner_to_order(order, delivery_partner, phase, target_status)
+        if assigned:
+            logger.info(
+                "Driver-centric dispatch assigned order %s to driver %s",
+                order["id"],
+                delivery_partner_id,
+            )
+            return 1
+
+    logger.info("No nearby pending orders found for driver %s", delivery_partner_id)
+    return 0
+
+
+async def retry_pending_delivery_assignments() -> int:
+    assigned_count = 0
+    drivers = await db.users.find(
+        {
+            "role": "delivery",
+            "status": "active",
+            "is_available": True,
+            "geo_location": {"$exists": True},
+        },
+        {"_id": 0, "id": 1},
+    ).to_list(100)
+
+    for driver in drivers:
+        assigned_count += await dispatch_orders_for_delivery_partner(driver["id"])
+
+    logger.info("Retried pending delivery assignments via driver-centric dispatch: assigned=%s", assigned_count)
+    return assigned_count
 
 
 # ===================== PYDANTIC MODELS =====================
@@ -72,6 +432,8 @@ class UserRegister(BaseModel):
     weight: str | None = None
     gender: str | None = None
     bodyType: str | None = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 class UserLogin(BaseModel):
     email: str
@@ -87,6 +449,8 @@ class UserProfileUpdate(BaseModel):
     experience: Optional[str] = None
     profile_photo: Optional[str] = None
     specialities: Optional[List[str]] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 class ServiceCreate(BaseModel):
     service_name: str
@@ -113,6 +477,13 @@ class WorkingHoursUpdate(BaseModel):
 class SettingsUpdate(BaseModel):
     commission_percentage: float
 
+class DeliveryAvailabilityUpdate(BaseModel):
+    is_available: bool
+
+class DeliveryLocationUpdate(BaseModel):
+    latitude: float
+    longitude: float
+
 
 # ===================== AUTH HELPERS =====================
 
@@ -123,7 +494,12 @@ def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
 def create_token(data: dict) -> str:
-    return jwt.encode(data, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    user = {
+        "id": data["user_id"],
+        "role": data["role"],
+        "token_version": data.get("token_version", 1),
+    }
+    return issue_token_for_user(user)
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if not credentials:
@@ -138,9 +514,18 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             raise HTTPException(status_code=401, detail="User not found")
         if user.get("status") == "blocked":
             raise HTTPException(status_code=403, detail="Account blocked")
+        token_version = int(payload.get("token_version", 0))
+        if token_version != int(user.get("token_version", 1)):
+            raise HTTPException(status_code=401, detail="Token has been revoked")
         return user
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+async def get_optional_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials:
+        return None
+    return await get_current_user(credentials)
 
 async def require_admin(user=Depends(get_current_user)):
     if user["role"] != "admin":
@@ -163,6 +548,43 @@ async def require_customer(user=Depends(get_current_user)):
     return user
 
 
+async def save_user_measurements(user_id: str, measurements: dict):
+    await db.users.update_one(
+        {"id": user_id},
+        {
+            "$set": {
+                "body_measurements": measurements,
+                "avatar_mesh": None,
+                "avatar_generation_status": "none",
+                "avatar_generation_error": None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+
+
+async def generate_avatar_for_user(user_id: str, measurements: dict):
+    if generate_avatar is None:
+        raise RuntimeError(f"Avatar generator is unavailable: {AVATAR_IMPORT_ERROR}")
+    if not measurements or "error" in measurements:
+        raise ValueError("Valid measurements are required for avatar generation")
+
+    try:
+        await generate_avatar(user_id, measurements, db)
+    except Exception:
+        logger.exception("Avatar generation failed for user %s", user_id)
+        raise
+
+
+def schedule_avatar_generation(background_tasks: BackgroundTasks, user_id: str, measurements: dict):
+    if enqueue_avatar_generation_task and worker_enabled() and enqueue_avatar_generation_task(user_id, measurements):
+        logger.info("Enqueued avatar generation for user %s via worker", user_id)
+        return
+
+    background_tasks.add_task(generate_avatar_for_user, user_id, measurements)
+    logger.info("Scheduled avatar generation for user %s via FastAPI background task", user_id)
+
+
 # ===================== AUTH ROUTES =====================
 
 @api_router.post("/auth/register")
@@ -177,6 +599,7 @@ async def register(data: UserRegister):
     pincode_val = data.pincode.strip() if data.pincode else ""
     address_val = data.address.strip() if data.address else ""
     location_str = f"{city_val}, {pincode_val}".strip(", ") if city_val or pincode_val else ""
+    geo_location = build_geo_location(data.latitude, data.longitude)
     
     user = {
         "id": str(uuid.uuid4()),
@@ -189,6 +612,7 @@ async def register(data: UserRegister):
         "pincode": pincode_val,
         "address": address_val,
         "location": location_str,
+        "geo_location": geo_location,
         "gender": data.gender,
         "height": data.height if data.role == "customer" else None,
         "weight": data.weight if data.role == "customer" else None,
@@ -196,18 +620,24 @@ async def register(data: UserRegister):
         "rating": 0.0,
         "rating_count": 0,
         "status": "pending" if data.role == "tailor" else "active",
+        "is_available": data.role == "delivery",
         "specialities": [],
         "experience": "",
         "working_hours": {},
         "profile_photo": "",
+        "body_measurements": {},
+        "avatar_mesh": None,
+        "avatar_generation_status": "none",
+        "avatar_generation_error": None,
+        "token_version": 1,
         
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     await db.users.insert_one(user)
     user.pop("_id", None)
 
-    safe_user = {k: v for k, v in user.items() if k != "password_hash"}
-    token = create_token({"user_id": user["id"], "role": user["role"]})
+    safe_user = build_safe_user(user)
+    token = issue_token_for_user(user)
     return {"token": token, "user": safe_user}
 
 @api_router.post("/auth/login")
@@ -220,9 +650,10 @@ async def login(data: UserLogin):
     if user["status"] == "blocked":
         raise HTTPException(status_code=403, detail="Account blocked")
 
-    token = create_token({"user_id": user["id"], "role": user["role"]})
-    safe_user = {k: v for k, v in user.items() if k != "password_hash"}
+    token = issue_token_for_user(user)
+    safe_user = build_safe_user(user)
     return {"token": token, "user": safe_user}
+
 
 @api_router.get("/auth/me")
 async def get_me(user=Depends(get_current_user)):
@@ -231,6 +662,16 @@ async def get_me(user=Depends(get_current_user)):
 @api_router.put("/auth/profile")
 async def update_profile(data: UserProfileUpdate, user=Depends(get_current_user)):
     update = {k: v for k, v in data.dict(exclude_unset=True).items() if v is not None}
+    latitude = update.pop("latitude", None)
+    longitude = update.pop("longitude", None)
+    if latitude is not None or longitude is not None:
+        existing_geo = get_geo_location(user)
+        existing_longitude = existing_geo["coordinates"][0] if existing_geo else None
+        existing_latitude = existing_geo["coordinates"][1] if existing_geo else None
+        update["geo_location"] = build_geo_location(
+            latitude if latitude is not None else existing_latitude,
+            longitude if longitude is not None else existing_longitude,
+        )
     # Auto-compute location from city + pincode if provided
     if "city" in update or "pincode" in update:
         city = update.get("city", user.get("city", ""))
@@ -323,18 +764,29 @@ async def create_order(data: OrderCreate, user=Depends(require_customer)):
     commission_pct = settings["value"] if settings else 10.0
     commission_amount = round(price * commission_pct / 100, 2)
 
+    customer_geo_location = get_geo_location(user)
+    tailor_geo_location = get_geo_location(tailor)
+    pickup_geo_location = customer_geo_location
+
     order = {
         "id": str(uuid.uuid4()),
         "customer_id": user["id"],
         "customer_name": user["name"],
         "customer_phone": user["phone"],
         "customer_city": user.get("city", ""),
+        "customer_address": user.get("address", "") or data.pickup_address,
+        "customer_geo_location": customer_geo_location,
         "tailor_id": data.tailor_id,
         "tailor_name": tailor["name"],
         "tailor_phone": tailor["phone"],
         "tailor_city": tailor.get("city", ""),
+        "tailor_address": tailor.get("address", ""),
+        "tailor_geo_location": tailor_geo_location,
+        "pickup_geo_location": pickup_geo_location,
         "delivery_partner_id": "",
         "delivery_partner_name": "",
+        "delivery_partner_phone": "",
+        "delivery_phase": "",
         "service_type": data.service_type,
         "description": data.description,
         "reference_image": data.reference_image or "",
@@ -350,91 +802,125 @@ async def create_order(data: OrderCreate, user=Depends(require_customer)):
     }
     await db.orders.insert_one(order)
     order.pop("_id", None)
-    return order
+    return await enrich_order_with_locations(order)
 
 @api_router.get("/orders/my")
 async def get_my_orders(user=Depends(require_customer)):
     orders = await db.orders.find({"customer_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
-    return orders
+    return await enrich_orders_with_locations(orders)
 
 @api_router.get("/orders/tailor")
 async def get_tailor_orders(user=Depends(require_tailor)):
     orders = await db.orders.find({"tailor_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
-    return orders
+    return await enrich_orders_with_locations(orders)
 
 @api_router.get("/orders/delivery")
 async def get_delivery_orders(user=Depends(require_delivery)):
     orders = await db.orders.find({"delivery_partner_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
-    return orders
+    return await enrich_orders_with_locations(orders)
 
 @api_router.get("/orders/{order_id}")
 async def get_order(order_id: str, user=Depends(get_current_user)):
-    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-    return order
+    order = await get_order_for_user(order_id, user)
+    return await enrich_order_with_locations(order)
 
 @api_router.put("/orders/{order_id}/accept")
 async def accept_order(order_id: str, user=Depends(require_tailor)):
     order = await db.orders.find_one({"id": order_id, "tailor_id": user["id"]}, {"_id": 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    if order["status"] != "placed":
+    if order["status"] not in ["placed", "accepted", "pickup_assigned"]:
         raise HTTPException(status_code=400, detail="Order cannot be accepted in current status")
 
-    delivery_partner = await db.users.find_one(
-        {"role": "delivery", "status": "active", "city": {"$regex": f"^{user.get('city', '')}$", "$options": "i"}},
-        {"_id": 0}
-    )
-    if not delivery_partner:
-        delivery_partner = await db.users.find_one({"role": "delivery", "status": "active"}, {"_id": 0})
-    dp_id = delivery_partner["id"] if delivery_partner else ""
-    dp_name = delivery_partner["name"] if delivery_partner else ""
+    assigned = await assign_delivery_partner_to_order(order, "pickup", "pickup_assigned")
+    now = datetime.now(timezone.utc).isoformat()
+    if assigned:
+        await db.orders.update_one({"id": order_id}, {"$set": {"tailor_accepted_at": now}})
+        updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
+        return await enrich_order_with_locations(updated)
 
     await db.orders.update_one(
         {"id": order_id},
         {"$set": {
             "status": "accepted",
-            "delivery_partner_id": dp_id,
-            "delivery_partner_name": dp_name,
-            "updated_at": datetime.now(timezone.utc).isoformat()
+            "delivery_partner_id": "",
+            "delivery_partner_name": "",
+            "delivery_partner_phone": "",
+            "delivery_phase": "",
+            "tailor_accepted_at": now,
+            "updated_at": now,
         }}
     )
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
-    return updated
+    return await enrich_order_with_locations(updated)
 
 @api_router.put("/orders/{order_id}/reject")
 async def reject_order(order_id: str, user=Depends(require_tailor)):
     order = await db.orders.find_one({"id": order_id, "tailor_id": user["id"]}, {"_id": 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    await release_delivery_partner(db, order.get("delivery_partner_id", ""))
     await db.orders.update_one(
         {"id": order_id},
-        {"$set": {"status": "rejected", "updated_at": datetime.now(timezone.utc).isoformat()}}
+        {"$set": {
+            "status": "rejected",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }}
     )
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
-    return updated
+    return await enrich_order_with_locations(updated)
 
 @api_router.put("/orders/{order_id}/status")
 async def update_order_status(order_id: str, status: str = Body(..., embed=True), user=Depends(get_current_user)):
-    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await get_order_for_user(order_id, user)
+    ensure_transition_allowed(user, order, status)
 
-    valid_statuses = [
-        "placed", "accepted", "pickup_assigned", "picked_up",
-        "delivered_to_tailor", "in_stitching", "completed", "ready",
-        "collected_from_tailor", "out_for_delivery", "delivered", "rejected"
-    ]
-    if status not in valid_statuses:
-        raise HTTPException(status_code=400, detail=f"Invalid status")
+    if status == "accepted":
+        assigned = await assign_delivery_partner_to_order(order, "pickup", "pickup_assigned")
+        now = datetime.now(timezone.utc).isoformat()
+        if assigned:
+            await db.orders.update_one({"id": order_id}, {"$set": {"tailor_accepted_at": now}})
+            updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
+            return await enrich_order_with_locations(updated)
+
+        await db.orders.update_one(
+            {"id": order_id, "tailor_id": user["id"]},
+            {"$set": {
+                "status": "accepted",
+                "delivery_partner_id": "",
+                "delivery_partner_name": "",
+                "delivery_partner_phone": "",
+                "delivery_phase": "",
+                "tailor_accepted_at": now,
+                "updated_at": now,
+            }},
+        )
+        updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
+        return await enrich_order_with_locations(updated)
+
+    if status == "rejected":
+        await release_delivery_partner(db, order.get("delivery_partner_id", ""))
+        await db.orders.update_one(
+            {"id": order_id},
+            {"$set": {"status": "rejected", "updated_at": datetime.now(timezone.utc).isoformat()}},
+        )
+        updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
+        return await enrich_order_with_locations(updated)
+
+    if status == "ready":
+        assigned = await assign_delivery_partner_to_order(order, "return", "delivery_assigned")
+        if assigned:
+            return assigned
 
     update_data = {"status": status, "updated_at": datetime.now(timezone.utc).isoformat()}
-    if status == "delivered":
-        update_data["payment_status"] = "completed"
+    if status in ["delivered_to_tailor", "ready", "cancelled"]:
+        update_data["delivery_partner_id"] = ""
+        update_data["delivery_partner_name"] = ""
+        update_data["delivery_partner_phone"] = ""
+        update_data["delivery_phase"] = ""
     await db.orders.update_one({"id": order_id}, {"$set": update_data})
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
-    return updated
+    return await enrich_order_with_locations(updated)
 
 
 # ===================== REVIEW ROUTES =====================
@@ -561,28 +1047,165 @@ async def request_withdrawal(amount: float = Body(..., embed=True), user=Depends
 
 # ===================== DELIVERY ROUTES =====================
 
+@api_router.put("/delivery/availability")
+async def update_delivery_availability(data: DeliveryAvailabilityUpdate, user=Depends(require_delivery)):
+    if data.is_available:
+        active_order = await get_active_delivery_order_for_driver(user["id"])
+        if active_order:
+            await db.users.update_one(
+                {"id": user["id"]},
+                {"$set": {"is_available": False}},
+            )
+            logger.info(
+                "Ignoring availability enable for driver %s because order %s is still active in status=%s",
+                user["id"],
+                active_order["id"],
+                active_order["status"],
+            )
+            return await db.users.find_one({"id": user["id"]}, {"_id": 0, "password_hash": 0})
+
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"is_available": data.is_available}},
+    )
+    if data.is_available:
+        await dispatch_orders_for_delivery_partner(user["id"])
+    updated = await db.users.find_one({"id": user["id"]}, {"_id": 0, "password_hash": 0})
+    return updated
+
+
+@api_router.get("/user/avatar")
+async def get_user_avatar(user=Depends(get_current_user)):
+    current = await db.users.find_one(
+        {"id": user["id"]},
+        {"_id": 0, "avatar_mesh": 1, "avatar_generation_status": 1},
+    )
+    status = (current or {}).get("avatar_generation_status") or "none"
+    mesh_url = (current or {}).get("avatar_mesh")
+    if not mesh_url:
+        return {"avatar_ready": False, "mesh_url": None, "status": status}
+    return {"avatar_ready": True, "mesh_url": mesh_url, "status": "ready"}
+
+@api_router.put("/delivery/location")
+async def update_delivery_location(data: DeliveryLocationUpdate, user=Depends(require_delivery)):
+    geo_location = build_geo_location(data.latitude, data.longitude)
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"geo_location": geo_location}},
+    )
+    await dispatch_orders_for_delivery_partner(user["id"])
+    updated = await db.users.find_one({"id": user["id"]}, {"_id": 0, "password_hash": 0})
+    return updated
+
 @api_router.get("/delivery/assignments")
 async def get_delivery_assignments(user=Depends(require_delivery)):
     orders = await db.orders.find(
-        {"delivery_partner_id": user["id"], "status": {"$nin": ["delivered", "rejected", "placed"]}},
+        {
+            "delivery_partner_id": user["id"],
+            "status": {"$in": ["pickup_assigned", "delivery_assigned", "delivery_accepted", "picked_up", "out_for_delivery"]},
+        },
         {"_id": 0}
     ).sort("created_at", -1).to_list(100)
-    return orders
+    return await enrich_orders_with_locations(orders)
 
-@api_router.put("/delivery/{order_id}/update")
-async def update_delivery_status(order_id: str, status: str = Body(..., embed=True), user=Depends(require_delivery)):
-    valid = ["picked_up", "delivered_to_tailor", "collected_from_tailor", "out_for_delivery", "delivered"]
-    if status not in valid:
-        raise HTTPException(status_code=400, detail=f"Invalid delivery status")
+@api_router.put("/delivery/{order_id}/accept")
+async def accept_delivery_assignment(order_id: str, user=Depends(require_delivery)):
     order = await db.orders.find_one({"id": order_id, "delivery_partner_id": user["id"]}, {"_id": 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    if order["status"] not in ["pickup_assigned", "delivery_assigned"]:
+        raise HTTPException(status_code=400, detail="Order cannot be accepted in current status")
+
+    phase = order.get("delivery_phase") or ("return" if order["status"] == "delivery_assigned" else "pickup")
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {
+            "status": "delivery_accepted",
+            "delivery_phase": phase,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }}
+    )
+    updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    return await enrich_order_with_locations(updated)
+
+@api_router.put("/delivery/{order_id}/decline")
+async def decline_delivery_assignment(order_id: str, user=Depends(require_delivery)):
+    order = await db.orders.find_one({"id": order_id, "delivery_partner_id": user["id"]}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order["status"] not in ["pickup_assigned", "delivery_assigned"]:
+        raise HTTPException(status_code=400, detail="Order cannot be declined in current status")
+
+    phase = order.get("delivery_phase") or ("return" if order["status"] == "delivery_assigned" else "pickup")
+    await db.orders.update_one(
+        {"id": order_id, "delivery_partner_id": user["id"]},
+        {"$set": {
+            "delivery_partner_id": "",
+            "delivery_partner_name": "",
+            "delivery_partner_phone": "",
+            "delivery_phase": phase,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }},
+    )
+    await release_delivery_partner(db, user["id"])
+    cleared_order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    reassigned = await assign_delivery_partner_to_order(cleared_order, phase, order["status"], exclude_ids=[user["id"]])
+    if reassigned:
+        return reassigned
+
+    fallback_status = "accepted" if phase == "pickup" else "ready"
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {
+            "delivery_partner_id": "",
+            "delivery_partner_name": "",
+            "delivery_partner_phone": "",
+            "delivery_phase": "",
+            "status": fallback_status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }}
+    )
+    updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    return await enrich_order_with_locations(updated)
+
+@api_router.put("/delivery/{order_id}/update")
+async def update_delivery_status(order_id: str, status: str = Body(..., embed=True), user=Depends(require_delivery)):
+    order = await db.orders.find_one({"id": order_id, "delivery_partner_id": user["id"]}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    phase = order.get("delivery_phase") or ("return" if order["status"] in ["delivery_assigned", "out_for_delivery", "delivered"] else "pickup")
+    allowed_statuses = {
+        "pickup": {
+            "pickup_assigned": "delivery_accepted",
+            "delivery_accepted": "picked_up",
+            "picked_up": "delivered_to_tailor",
+        },
+        "return": {
+            "delivery_assigned": "delivery_accepted",
+            "delivery_accepted": "out_for_delivery",
+            "out_for_delivery": "delivered",
+        },
+    }
+    expected_next = allowed_statuses.get(phase, {}).get(order["status"])
+    if expected_next != status:
+        raise HTTPException(status_code=400, detail="Invalid delivery status")
+
     update_data = {"status": status, "updated_at": datetime.now(timezone.utc).isoformat()}
+    if status == "delivered_to_tailor":
+        update_data.update({
+            "delivery_partner_id": "",
+            "delivery_partner_name": "",
+            "delivery_partner_phone": "",
+            "delivery_phase": "",
+        })
+        await release_delivery_partner(db, user["id"])
     if status == "delivered":
-        update_data["payment_status"] = "completed"
+        update_data["delivery_phase"] = ""
+        await release_delivery_partner(db, user["id"])
     await db.orders.update_one({"id": order_id}, {"$set": update_data})
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
-    return updated
+    return await enrich_order_with_locations(updated)
 
 @api_router.get("/delivery/earnings")
 async def get_delivery_earnings(user=Depends(require_delivery)):
@@ -594,7 +1217,7 @@ async def get_delivery_earnings(user=Depends(require_delivery)):
         "total_earnings": len(orders) * delivery_fee,
         "total_deliveries": len(orders),
         "delivery_fee": delivery_fee,
-        "recent_deliveries": orders[:10]
+        "recent_deliveries": await enrich_orders_with_locations(orders[:10])
     }
 
 
@@ -614,7 +1237,13 @@ async def admin_toggle_block(user_id: str, user=Depends(require_admin)):
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     new_status = "blocked" if target["status"] != "blocked" else "active"
-    await db.users.update_one({"id": user_id}, {"$set": {"status": new_status}})
+    await db.users.update_one(
+        {"id": user_id},
+        {
+            "$set": {"status": new_status},
+            "$inc": {"token_version": 1},
+        },
+    )
     return {"message": f"User {new_status}", "status": new_status}
 
 @api_router.put("/admin/approve-tailor/{tailor_id}")
@@ -701,6 +1330,8 @@ async def create_payment_order(order_id: str = Body(..., embed=True), user=Depen
     order = await db.orders.find_one({"id": order_id, "customer_id": user["id"]}, {"_id": 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    if order.get("payment_method") != "online":
+        raise HTTPException(status_code=400, detail="Payment order is only available for online payments")
     if order.get("payment_status") == "completed":
         raise HTTPException(status_code=400, detail="Payment already completed")
 
@@ -752,6 +1383,27 @@ async def verify_payment(
     order = await db.orders.find_one({"id": order_id, "customer_id": user["id"]}, {"_id": 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    if order.get("payment_method") != "online":
+        raise HTTPException(status_code=400, detail="Payment verification is only available for online payments")
+    stored_razorpay_order_id = order.get("razorpay_order_id")
+    if not stored_razorpay_order_id:
+        raise HTTPException(status_code=400, detail="Payment order has not been created")
+    if stored_razorpay_order_id != razorpay_order_id:
+        raise HTTPException(status_code=400, detail="Razorpay order mismatch")
+    if (
+        order.get("payment_status") == "completed"
+        and order.get("razorpay_payment_id") == razorpay_payment_id
+        and order.get("razorpay_signature") == razorpay_signature
+    ):
+        return {
+            "verified": True,
+            "message": "Payment already verified",
+            "order_id": order_id,
+            "amount": order["price"],
+            "commission": order.get("commission_amount", 0),
+            "tailor_earnings": round(order["price"] - order.get("commission_amount", 0), 2),
+            "payment_id": razorpay_payment_id,
+        }
 
     # Verify signature
     message = f"{razorpay_order_id}|{razorpay_payment_id}"
@@ -761,7 +1413,7 @@ async def verify_payment(
         hashlib.sha256
     ).hexdigest()
 
-    if expected_signature != razorpay_signature:
+    if not hmac.compare_digest(expected_signature, razorpay_signature):
         await db.orders.update_one(
             {"id": order_id},
             {"$set": {
@@ -777,8 +1429,13 @@ async def verify_payment(
     commission_pct = settings["value"] if settings else 10.0
     commission_amount = round(order["price"] * commission_pct / 100, 2)
 
-    await db.orders.update_one(
-        {"id": order_id},
+    update_result = await db.orders.update_one(
+        {
+            "id": order_id,
+            "customer_id": user["id"],
+            "payment_status": {"$ne": "completed"},
+            "razorpay_order_id": razorpay_order_id,
+        },
         {"$set": {
             "payment_status": "completed",
             "razorpay_payment_id": razorpay_payment_id,
@@ -788,6 +1445,24 @@ async def verify_payment(
             "updated_at": datetime.now(timezone.utc).isoformat()
         }}
     )
+    if update_result.modified_count == 0:
+        latest = await db.orders.find_one({"id": order_id, "customer_id": user["id"]}, {"_id": 0})
+        if (
+            latest
+            and latest.get("payment_status") == "completed"
+            and latest.get("razorpay_payment_id") == razorpay_payment_id
+            and latest.get("razorpay_signature") == razorpay_signature
+        ):
+            return {
+                "verified": True,
+                "message": "Payment already verified",
+                "order_id": order_id,
+                "amount": latest["price"],
+                "commission": latest.get("commission_amount", commission_amount),
+                "tailor_earnings": round(latest["price"] - latest.get("commission_amount", commission_amount), 2),
+                "payment_id": razorpay_payment_id,
+            }
+        raise HTTPException(status_code=409, detail="Payment verification conflict")
 
     logger.info(f"Payment verified for order {order_id}: ₹{order['price']} (commission: ₹{commission_amount})")
 
@@ -804,9 +1479,7 @@ async def verify_payment(
 
 @api_router.get("/payment/status/{order_id}")
 async def get_payment_status(order_id: str, user=Depends(get_current_user)):
-    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await get_order_for_user(order_id, user)
     return {
         "order_id": order_id,
         "payment_status": order.get("payment_status", "pending"),
@@ -961,23 +1634,24 @@ async def seed_data():
         "phone": "9999999999", "password_hash": hash_password("admin123"),
         "role": "admin", "city": "Mumbai", "pincode": "400001",
         "address": "Stitchly HQ, BKC, Mumbai", "location": "Mumbai, 400001",
+        "geo_location": build_geo_location(19.0607, 72.8697),
         "rating": 0.0, "rating_count": 0,
-        "status": "active", "specialities": [], "experience": "",
-        "working_hours": {}, "profile_photo": "", "created_at": datetime.now(timezone.utc).isoformat()
+        "status": "active", "is_available": False, "specialities": [], "experience": "",
+        "working_hours": {}, "profile_photo": "", "body_measurements": {}, "avatar_mesh": None, "avatar_generation_status": "none", "avatar_generation_error": None, "token_version": 1, "created_at": datetime.now(timezone.utc).isoformat()
     }
 
     tailor_data = [
         {"name": "Ravi Kumar", "email": "ravi@stitchly.com", "phone": "9876543210",
          "city": "Mumbai", "pincode": "400001", "address": "Shop 12, Crawford Market, Mumbai",
-         "location": "Mumbai, 400001", "specialities": ["Blouse", "Lehenga", "Saree Draping"],
+         "location": "Mumbai, 400001", "latitude": 18.9476, "longitude": 72.8331, "specialities": ["Blouse", "Lehenga", "Saree Draping"],
          "experience": "15 years", "rating": 4.8, "rating_count": 124},
         {"name": "Priya Sharma", "email": "priya@stitchly.com", "phone": "9876543211",
          "city": "Delhi", "pincode": "110001", "address": "45 Chandni Chowk, Old Delhi",
-         "location": "Delhi, 110001", "specialities": ["Men's Suit", "Kurta", "Sherwani"],
+         "location": "Delhi, 110001", "latitude": 28.6505, "longitude": 77.2303, "specialities": ["Men's Suit", "Kurta", "Sherwani"],
          "experience": "10 years", "rating": 4.5, "rating_count": 89},
         {"name": "Mohammed Iqbal", "email": "iqbal@stitchly.com", "phone": "9876543212",
          "city": "Mumbai", "pincode": "400050", "address": "Bandra West, Linking Road, Mumbai",
-         "location": "Mumbai, 400050", "specialities": ["Alteration", "Blouse", "Dress"],
+         "location": "Mumbai, 400050", "latitude": 19.0596, "longitude": 72.8295, "specialities": ["Alteration", "Blouse", "Dress"],
          "experience": "8 years", "rating": 4.6, "rating_count": 56},
     ]
     tailors = []
@@ -987,23 +1661,24 @@ async def seed_data():
             "phone": td["phone"], "password_hash": hash_password("tailor123"),
             "role": "tailor", "city": td["city"], "pincode": td["pincode"],
             "address": td["address"], "location": td["location"],
+            "geo_location": build_geo_location(td["latitude"], td["longitude"]),
             "rating": td["rating"],
-            "rating_count": td["rating_count"], "status": "active",
+            "rating_count": td["rating_count"], "status": "active", "is_available": False,
             "specialities": td["specialities"], "experience": td["experience"],
             "working_hours": {"monday": "9:00-18:00", "tuesday": "9:00-18:00",
                 "wednesday": "9:00-18:00", "thursday": "9:00-18:00",
                 "friday": "9:00-18:00", "saturday": "10:00-14:00"},
-            "profile_photo": "", "created_at": datetime.now(timezone.utc).isoformat()
+            "profile_photo": "", "body_measurements": {}, "avatar_mesh": None, "avatar_generation_status": "none", "avatar_generation_error": None, "token_version": 1, "created_at": datetime.now(timezone.utc).isoformat()
         }
         tailors.append(tailor)
 
     customer_data = [
         {"name": "Anita Desai", "email": "anita@test.com", "phone": "9800000001",
          "city": "Mumbai", "pincode": "400001", "address": "123 Marine Drive, Mumbai",
-         "location": "Mumbai, 400001"},
+         "location": "Mumbai, 400001", "latitude": 18.9440, "longitude": 72.8237},
         {"name": "Rahul Verma", "email": "rahul@test.com", "phone": "9800000002",
          "city": "Delhi", "pincode": "110001", "address": "56 Connaught Place, Delhi",
-         "location": "Delhi, 110001"},
+         "location": "Delhi, 110001", "latitude": 28.6315, "longitude": 77.2167},
     ]
     customers = []
     for cd in customer_data:
@@ -1011,9 +1686,10 @@ async def seed_data():
             "id": str(uuid.uuid4()), "name": cd["name"], "email": cd["email"],
             "phone": cd["phone"], "password_hash": hash_password("customer123"),
             "role": "customer", "city": cd["city"], "pincode": cd["pincode"],
-            "address": cd["address"], "location": cd["location"], "rating": 0.0,
-            "rating_count": 0, "status": "active", "specialities": [],
-            "experience": "", "working_hours": {}, "profile_photo": "",
+            "address": cd["address"], "location": cd["location"],
+            "geo_location": build_geo_location(cd["latitude"], cd["longitude"]), "rating": 0.0,
+            "rating_count": 0, "status": "active", "is_available": False, "specialities": [],
+            "experience": "", "working_hours": {}, "profile_photo": "", "body_measurements": {}, "avatar_mesh": None, "avatar_generation_status": "none", "avatar_generation_error": None, "token_version": 1,
             "created_at": datetime.now(timezone.utc).isoformat()
         }
         customers.append(customer)
@@ -1022,10 +1698,10 @@ async def seed_data():
         "id": str(uuid.uuid4()), "name": "Suresh Driver", "email": "suresh@stitchly.com",
         "phone": "9800000003", "password_hash": hash_password("delivery123"),
         "role": "delivery", "city": "Mumbai", "pincode": "400001",
-        "address": "Andheri East, Mumbai", "location": "Mumbai, 400001",
-        "rating": 4.2,
-        "rating_count": 45, "status": "active", "specialities": [],
-        "experience": "", "working_hours": {}, "profile_photo": "",
+        "address": "Fort, Mumbai", "location": "Mumbai, 400001",
+        "geo_location": build_geo_location(18.9398, 72.8355), "rating": 4.2,
+        "rating_count": 45, "status": "active", "is_available": True, "specialities": [],
+        "experience": "", "working_hours": {}, "profile_photo": "", "body_measurements": {}, "avatar_mesh": None, "avatar_generation_status": "none", "avatar_generation_error": None, "token_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
 
@@ -1033,9 +1709,10 @@ async def seed_data():
         "id": str(uuid.uuid4()), "name": "Amit Courier", "email": "amit@stitchly.com",
         "phone": "9800000004", "password_hash": hash_password("delivery123"),
         "role": "delivery", "city": "Delhi", "pincode": "110001",
-        "address": "Karol Bagh, Delhi", "location": "Delhi, 110001",
-        "rating": 4.0, "rating_count": 22, "status": "active", "specialities": [],
-        "experience": "", "working_hours": {}, "profile_photo": "",
+        "address": "Connaught Place, Delhi", "location": "Delhi, 110001",
+        "geo_location": build_geo_location(28.6317, 77.2197),
+        "rating": 4.0, "rating_count": 22, "status": "active", "is_available": True, "specialities": [],
+        "experience": "", "working_hours": {}, "profile_photo": "", "body_measurements": {}, "avatar_mesh": None, "avatar_generation_status": "none", "avatar_generation_error": None, "token_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
 
@@ -1066,6 +1743,10 @@ async def seed_data():
             "service_type": "Blouse Stitching", "description": "Red silk blouse with gold border",
             "reference_image": "", "pickup_address": "123 Marine Drive, Mumbai",
             "delivery_address": "123 Marine Drive, Mumbai",
+            "customer_address": "123 Marine Drive, Mumbai", "tailor_address": tailors[0]["address"],
+            "pickup_geo_location": customers[0]["geo_location"],
+            "customer_geo_location": customers[0]["geo_location"], "tailor_geo_location": tailors[0]["geo_location"],
+            "delivery_partner_phone": delivery["phone"], "delivery_phase": "return",
             "price": 800, "commission_amount": 80, "status": "delivered",
             "payment_status": "completed", "payment_method": "online",
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1080,6 +1761,10 @@ async def seed_data():
             "service_type": "Lehenga", "description": "Blue designer lehenga for wedding",
             "reference_image": "", "pickup_address": "123 Marine Drive, Mumbai",
             "delivery_address": "123 Marine Drive, Mumbai",
+            "customer_address": "123 Marine Drive, Mumbai", "tailor_address": tailors[0]["address"],
+            "pickup_geo_location": customers[0]["geo_location"],
+            "customer_geo_location": customers[0]["geo_location"], "tailor_geo_location": tailors[0]["geo_location"],
+            "delivery_partner_phone": "", "delivery_phase": "",
             "price": 5000, "commission_amount": 500, "status": "placed",
             "payment_status": "pending", "payment_method": "online",
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1130,31 +1815,40 @@ async def get_cities():
 # ===================== SETUP =====================
 
 app.include_router(api_router)
+app.mount("/avatars", StaticFiles(directory=str(LOCAL_AVATAR_DIR)), name="avatars")
 
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 @app.on_event("startup")
 async def startup():
+    LOCAL_AVATAR_DIR.mkdir(parents=True, exist_ok=True)
     await db.users.create_index("id", unique=True)
     await db.users.create_index("email", unique=True)
+    await db.users.create_index("avatar_mesh")
+    await db.users.create_index("avatar_generation_status")
     await db.tailor_services.create_index("id", unique=True)
     await db.tailor_services.create_index("tailor_id")
     await db.orders.create_index("id", unique=True)
     await db.orders.create_index("customer_id")
     await db.orders.create_index("tailor_id")
     await db.orders.create_index("delivery_partner_id")
+    await db.orders.create_index([("status", 1), ("delivery_partner_id", 1), ("created_at", 1)])
+    await db.orders.create_index([("pickup_geo_location", "2dsphere")])
+    await db.orders.create_index([("tailor_geo_location", "2dsphere")])
     await db.reviews.create_index("id", unique=True)
     await db.reviews.create_index("tailor_id")
     await db.withdrawals.create_index("id", unique=True)
     await db.users.create_index("city")
     await db.users.create_index("pincode")
+    await db.users.create_index([("geo_location", "2dsphere")])
     await db.users.create_index([("role", 1), ("city", 1), ("status", 1)])
+    await db.users.create_index([("role", 1), ("status", 1), ("is_available", 1)])
     logger.info("Stitchly API started - indexes created")
 
 @app.on_event("shutdown")
@@ -1169,6 +1863,7 @@ async def check_position(
     image: UploadFile = File(...),
     height_cm: float = Form(...)
 ):
+    ensure_ai_dependencies()
 
     os.makedirs("temp", exist_ok=True)
 
@@ -1318,11 +2013,14 @@ async def check_position(
 
 @app.post("/ai/scan-body")
 async def scan_body(
+    background_tasks: BackgroundTasks,
     front_image: UploadFile = File(...),
     side_image: UploadFile = File(...),
     back_image: UploadFile = File(...),
-    height_cm: float = Form(...)
+    height_cm: float = Form(...),
+    user=Depends(get_optional_user),
 ):
+    ensure_ai_dependencies()
 
     os.makedirs("temp", exist_ok=True)
 
@@ -1359,11 +2057,17 @@ async def scan_body(
         height_cm
     )
 
+    if user and "error" not in measurements:
+        await save_user_measurements(user["id"], measurements)
+        schedule_avatar_generation(background_tasks, user["id"], measurements)
+
     # -------- Format landmarks for frontend --------
 
     formatted_landmarks = []
 
-    for x, y, z in front_landmarks:
+    for landmark in front_landmarks:
+        x, y = landmark.get("x", 0.0), landmark.get("y", 0.0)
+        z = landmark.get("z", 0.0)
         formatted_landmarks.append({
             "x": x,
             "y": y,

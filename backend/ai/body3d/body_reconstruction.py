@@ -29,9 +29,9 @@ def average_landmarks():
         zs = []
 
         for frame in FRAME_BUFFER:
-            xs.append(frame[i][0])
-            ys.append(frame[i][1])
-            zs.append(frame[i][2])
+            xs.append(frame[i]["x"])
+            ys.append(frame[i]["y"])
+            zs.append(frame[i]["z"])
 
         avg_landmarks.append((
             sum(xs) / len(xs),

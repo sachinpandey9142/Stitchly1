@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, FlatList, ActivityIndicator, RefreshControl } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
+import { useFocusEffect } from '@react-navigation/native';
 import { Feather } from '@expo/vector-icons';
 import { api } from '../../../src/utils/api';
 import { Colors, Fonts, Spacing, Radius, STATUS_COLORS, STATUS_LABELS } from '../../../src/utils/theme';
@@ -20,7 +21,13 @@ export default function CustomerOrders() {
     finally { setLoading(false); setRefreshing(false); }
   }, []);
 
-  useEffect(() => { fetchOrders(); }, [fetchOrders]);
+  useFocusEffect(
+    useCallback(() => {
+      fetchOrders();
+      const interval = setInterval(fetchOrders, 15000);
+      return () => clearInterval(interval);
+    }, [fetchOrders])
+  );
 
   const renderOrder = ({ item }: { item: any }) => (
     <TouchableOpacity testID={`order-card-${item.id}`} style={styles.card} activeOpacity={0.7} onPress={() => router.push(`/order/${item.id}`)}>

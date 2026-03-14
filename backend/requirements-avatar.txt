@@ -1,0 +1,7 @@
+boto3>=1.35
+celery[redis]>=5.4
+numpy>=1.26
+redis>=5.2
+smplx>=0.1.28
+torch>=2.2
+trimesh>=4.4

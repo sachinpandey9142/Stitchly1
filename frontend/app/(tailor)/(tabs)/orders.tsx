@@ -1,46 +1,91 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, FlatList, ActivityIndicator, Alert, RefreshControl } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useFocusEffect } from '@react-navigation/native';
 import { Feather } from '@expo/vector-icons';
 import { api } from '../../../src/utils/api';
 import { Colors, Fonts, Spacing, Radius, STATUS_COLORS, STATUS_LABELS } from '../../../src/utils/theme';
 
-const TAILOR_STATUSES = ['in_stitching', 'completed', 'ready'];
+const NEXT_TAILOR_STATUS: Record<string, string> = {
+  delivered_to_tailor: 'in_stitching',
+  in_stitching: 'completed',
+  completed: 'ready',
+  ready: 'ready',
+};
+
+const NEXT_TAILOR_LABEL: Record<string, string> = {
+  delivered_to_tailor: 'Start Stitching',
+  in_stitching: 'Mark Completed',
+  completed: 'Assign Delivery',
+  ready: 'Retry Delivery Assignment',
+};
 
 export default function TailorOrders() {
   const [orders, setOrders] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
-  const fetchOrders = async () => {
-    try { const data = await api.get('/orders/tailor'); setOrders(data); }
-    catch (err) { console.error(err); }
-    finally { setLoading(false); setRefreshing(false); }
-  };
+  const fetchOrders = useCallback(async () => {
+    try {
+      const data = await api.get('/orders/tailor');
+      setOrders(data);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, []);
 
-  useEffect(() => { fetchOrders(); }, []);
+  useFocusEffect(
+    useCallback(() => {
+      fetchOrders();
+      const interval = setInterval(fetchOrders, 15000);
+      return () => clearInterval(interval);
+    }, [fetchOrders])
+  );
 
-  const handleAccept = async (orderId: string) => {
-    try { await api.put(`/orders/${orderId}/accept`, {}); fetchOrders(); Alert.alert('Success', 'Order accepted'); }
-    catch (err: any) { Alert.alert('Error', err.message); }
-  };
+  const handleAccept = useCallback(async (orderId: string) => {
+    try {
+      const updated = await api.put(`/orders/${orderId}/accept`, {});
+      await fetchOrders();
+      Alert.alert('Success', updated.status === 'pickup_assigned' ? 'Pickup partner assigned' : 'Order accepted');
+    } catch (err: any) {
+      Alert.alert('Error', err.message || 'Unable to accept this order');
+    }
+  }, [fetchOrders]);
 
-  const handleReject = async (orderId: string) => {
+  const handleReject = useCallback((orderId: string) => {
     Alert.alert('Reject Order', 'Are you sure?', [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Reject', style: 'destructive', onPress: async () => {
-        try { await api.put(`/orders/${orderId}/reject`, {}); fetchOrders(); }
-        catch (err: any) { Alert.alert('Error', err.message); }
-      }}
+      {
+        text: 'Reject',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await api.put(`/orders/${orderId}/reject`, {});
+            await fetchOrders();
+          } catch (err: any) {
+            Alert.alert('Error', err.message || 'Unable to reject this order');
+          }
+        },
+      },
     ]);
-  };
+  }, [fetchOrders]);
 
-  const handleStatusUpdate = async (orderId: string, currentStatus: string) => {
-    const currentIdx = TAILOR_STATUSES.indexOf(currentStatus);
-    const nextStatus = TAILOR_STATUSES[currentIdx + 1] || TAILOR_STATUSES[0];
-    try { await api.put(`/orders/${orderId}/status`, { status: nextStatus }); fetchOrders(); }
-    catch (err: any) { Alert.alert('Error', err.message); }
-  };
+  const handleStatusUpdate = useCallback(async (orderId: string, currentStatus: string) => {
+    const nextStatus = NEXT_TAILOR_STATUS[currentStatus];
+    if (!nextStatus) {
+      return;
+    }
+    try {
+      const updated = await api.put(`/orders/${orderId}/status`, { status: nextStatus });
+      await fetchOrders();
+      Alert.alert('Success', STATUS_LABELS[updated.status] || 'Order updated');
+    } catch (err: any) {
+      Alert.alert('Error', err.message || 'Unable to update order status');
+    }
+  }, [fetchOrders]);
 
   const renderOrder = ({ item }: { item: any }) => (
     <View style={styles.card}>
@@ -53,7 +98,9 @@ export default function TailorOrders() {
         <View>
           <Text style={styles.price}>{'\u20B9'}{item.price}</Text>
           <View style={[styles.statusBadge, { backgroundColor: (STATUS_COLORS[item.status] || Colors.textMuted) + '18' }]}>
-            <Text style={[styles.statusText, { color: STATUS_COLORS[item.status] || Colors.textMuted }]}>{STATUS_LABELS[item.status] || item.status}</Text>
+            <Text style={[styles.statusText, { color: STATUS_COLORS[item.status] || Colors.textMuted }]}>
+              {STATUS_LABELS[item.status] || item.status}
+            </Text>
           </View>
         </View>
       </View>
@@ -69,16 +116,17 @@ export default function TailorOrders() {
           </TouchableOpacity>
         </View>
       )}
-      {['accepted', 'in_stitching', 'completed'].includes(item.status) && item.status !== 'ready' && (
+      {NEXT_TAILOR_STATUS[item.status] && (
         <TouchableOpacity testID={`update-status-${item.id}`} style={styles.updateBtn} onPress={() => handleStatusUpdate(item.id, item.status)} activeOpacity={0.7}>
           <Feather name="arrow-right" size={18} color={Colors.primary} />
-          <Text style={styles.updateText}>
-            {item.status === 'accepted' ? 'Start Stitching' : item.status === 'in_stitching' ? 'Mark Completed' : 'Mark Ready'}
-          </Text>
+          <Text style={styles.updateText}>{NEXT_TAILOR_LABEL[item.status]}</Text>
         </TouchableOpacity>
       )}
-      {item.status === 'accepted' && item.customer_phone && (
-        <Text style={styles.phoneText}>Customer: {item.customer_phone}</Text>
+      {item.status === 'accepted' && (
+        <Text style={styles.infoText}>Waiting for a nearby delivery partner to accept pickup.</Text>
+      )}
+      {item.delivery_partner_name && ['pickup_assigned', 'delivery_assigned', 'delivery_accepted'].includes(item.status) && (
+        <Text style={styles.infoText}>Delivery Partner: {item.delivery_partner_name}</Text>
       )}
     </View>
   );
@@ -87,7 +135,12 @@ export default function TailorOrders() {
     <SafeAreaView style={styles.container} edges={['top']}>
       <View style={styles.header}><Text style={styles.headerTitle}>Orders</Text></View>
       {loading ? <View style={styles.loader}><ActivityIndicator size="large" color={Colors.primary} /></View> : (
-        <FlatList data={orders} keyExtractor={(i) => i.id} renderItem={renderOrder} contentContainerStyle={styles.list} showsVerticalScrollIndicator={false}
+        <FlatList
+          data={orders}
+          keyExtractor={(item) => item.id}
+          renderItem={renderOrder}
+          contentContainerStyle={styles.list}
+          showsVerticalScrollIndicator={false}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); fetchOrders(); }} tintColor={Colors.primary} />}
           ListEmptyComponent={<View style={styles.empty}><Feather name="clipboard" size={48} color={Colors.border} /><Text style={styles.emptyText}>No orders yet</Text></View>}
         />
@@ -117,7 +170,7 @@ const styles = StyleSheet.create({
   rejectText: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.error, marginLeft: 6 },
   updateBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: Colors.primary + '10', borderRadius: Radius.full, paddingVertical: 12, marginTop: 14, borderWidth: 1, borderColor: Colors.primary + '30' },
   updateText: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.primary, marginLeft: 6 },
-  phoneText: { fontFamily: Fonts.ui, fontSize: 13, color: Colors.info, marginTop: 10 },
+  infoText: { fontFamily: Fonts.ui, fontSize: 13, color: Colors.info, marginTop: 10 },
   loader: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   empty: { alignItems: 'center', paddingTop: 80 },
   emptyText: { fontFamily: Fonts.bodyBold, fontSize: 18, color: Colors.text, marginTop: 16 },

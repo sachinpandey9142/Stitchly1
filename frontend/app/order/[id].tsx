@@ -1,13 +1,27 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, ScrollView, ActivityIndicator, Alert } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useFocusEffect } from '@react-navigation/native';
 import { Feather } from '@expo/vector-icons';
 import { api } from '../../src/utils/api';
 import { useAuth } from '../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius, STATUS_COLORS, STATUS_LABELS } from '../../src/utils/theme';
 
-const ORDER_STEPS = ['placed', 'accepted', 'picked_up', 'in_stitching', 'completed', 'ready', 'out_for_delivery', 'delivered'];
+const ORDER_STEPS = [
+  'placed',
+  'accepted',
+  'pickup_assigned',
+  'delivery_accepted',
+  'picked_up',
+  'delivered_to_tailor',
+  'in_stitching',
+  'completed',
+  'ready',
+  'delivery_assigned',
+  'out_for_delivery',
+  'delivered',
+];
 
 export default function OrderDetail() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -16,18 +30,29 @@ export default function OrderDetail() {
   const [order, setOrder] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    (async () => {
-      try { const data = await api.get(`/orders/${id}`); setOrder(data); }
-      catch (err) { console.error(err); }
-      finally { setLoading(false); }
-    })();
+  const fetchOrder = useCallback(async () => {
+    try {
+      const data = await api.get(`/orders/${id}`);
+      setOrder(data);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
   }, [id]);
+
+  useFocusEffect(
+    useCallback(() => {
+      fetchOrder();
+      const interval = setInterval(fetchOrder, 10000);
+      return () => clearInterval(interval);
+    }, [fetchOrder])
+  );
 
   if (loading) return <View style={styles.loader}><ActivityIndicator size="large" color={Colors.primary} /></View>;
   if (!order) return <View style={styles.loader}><Text style={styles.errorText}>Order not found</Text></View>;
 
-  const currentIdx = ORDER_STEPS.indexOf(order.status);
+  const currentIdx = Math.max(ORDER_STEPS.indexOf(order.status), 0);
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -47,7 +72,7 @@ export default function OrderDetail() {
           <Text style={styles.desc}>{order.description}</Text>
           <View style={styles.infoRow}><Feather name="user" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>Customer: {order.customer_name}</Text></View>
           <View style={styles.infoRow}><Feather name="scissors" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>Tailor: {order.tailor_name}</Text></View>
-          {order.delivery_partner_name ? <View style={styles.infoRow}><Feather name="truck" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>Delivery: {order.delivery_partner_name}</Text></View> : null}
+          {order.delivery_partner_name && order.status !== 'placed' ? <View style={styles.infoRow}><Feather name="truck" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>Delivery: {order.delivery_partner_name}</Text></View> : null}
           <View style={styles.infoRow}><Feather name="map-pin" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>Pickup: {order.pickup_address}</Text></View>
         </View>
 
@@ -57,7 +82,7 @@ export default function OrderDetail() {
             <View key={step} style={styles.stepRow}>
               <View style={[styles.stepDot, idx <= currentIdx ? { backgroundColor: Colors.primary } : { backgroundColor: Colors.border }]} />
               {idx < ORDER_STEPS.length - 1 && <View style={[styles.stepLine, idx < currentIdx ? { backgroundColor: Colors.primary } : { backgroundColor: Colors.border }]} />}
-              <Text style={[styles.stepText, idx <= currentIdx && styles.stepTextActive]}>{STATUS_LABELS[step]}</Text>
+              <Text style={[styles.stepText, idx <= currentIdx && styles.stepTextActive]}>{STATUS_LABELS[step] || step}</Text>
             </View>
           ))}
         </View>

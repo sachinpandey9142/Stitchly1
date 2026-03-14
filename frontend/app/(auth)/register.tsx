@@ -116,6 +116,8 @@ useEffect(() => {
   city: city.trim(),
   pincode: pincode.trim(),
   address: address.trim(),
+  latitude: latitude ?? undefined,
+  longitude: longitude ?? undefined,
   gender,
   ...(role === "customer" && {
   height,

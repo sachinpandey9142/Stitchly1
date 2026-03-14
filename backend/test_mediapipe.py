@@ -1,5 +1,4 @@
 import mediapipe as mp
-
-mp_pose = mp.solutions.pose
+from ai.pose_detector import detect_landmarks
 
 print("MediaPipe Pose Loaded Successfully")

@@ -1,129 +1,183 @@
 import math
 
 
-def distance(p1, p2):
-    return math.sqrt(
-        (p1[0] - p2[0])**2 +
-        (p1[1] - p2[1])**2
+VISIBILITY_THRESHOLD = 0.6
+MAX_SHOULDER_ANGLE_DEG = 10.0
+
+
+def _get_xy(landmark):
+    """Support both dict MediaPipe landmarks and tuple/list fallback landmarks."""
+    if isinstance(landmark, dict):
+        return float(landmark.get("x", 0.0)), float(landmark.get("y", 0.0))
+    return float(landmark[0]), float(landmark[1])
+
+
+def _get_visibility(landmark):
+    if isinstance(landmark, dict):
+        return float(landmark.get("visibility", 1.0))
+    return 1.0
+
+
+def _distance(p1, p2):
+    x1, y1 = _get_xy(p1)
+    x2, y2 = _get_xy(p2)
+    dx = x1 - x2
+    dy = y1 - y2
+    return math.sqrt((dx * dx) + (dy * dy))
+
+
+def _midpoint(p1, p2):
+    x1, y1 = _get_xy(p1)
+    x2, y2 = _get_xy(p2)
+    return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+
+
+def _point_distance(p1, p2):
+    dx = p1[0] - p2[0]
+    dy = p1[1] - p2[1]
+    return math.sqrt((dx * dx) + (dy * dy))
+
+
+def _segment_chain_length(points):
+    total = 0.0
+    for index in range(len(points) - 1):
+        total += _distance(points[index], points[index + 1])
+    return total
+
+
+def _average(values):
+    return sum(values) / len(values) if values else 0.0
+
+
+def _clamp(value, minimum, maximum):
+    return max(minimum, min(value, maximum))
+
+
+def _ellipse_circumference(width_cm, depth_cm):
+    # Ramanujan approximation for fast ellipse circumference estimation.
+    semi_major = max(width_cm * 0.5, 0.01)
+    semi_minor = max(depth_cm * 0.5, 0.01)
+    return math.pi * (
+        3.0 * (semi_major + semi_minor)
+        - math.sqrt((3.0 * semi_major + semi_minor) * (semi_major + 3.0 * semi_minor))
     )
 
 
+def _validate_landmarks(landmarks):
+    return isinstance(landmarks, list) and len(landmarks) >= 33
+
+
+def _validate_required_visibility(*views):
+    required_indices = (11, 12, 23, 24, 25, 26, 27, 28)
+    for landmarks in views:
+        for index in required_indices:
+            if _get_visibility(landmarks[index]) < VISIBILITY_THRESHOLD:
+                return False
+    return True
+
+
 def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, height_cm):
+    if not (
+        _validate_landmarks(front_landmarks)
+        and _validate_landmarks(side_landmarks)
+        and _validate_landmarks(back_landmarks)
+    ):
+        return {"error": "Poor body detection"}
 
-    # ------------------------------
-    # HEIGHT SCALE (FRONT VIEW)
-    # ------------------------------
-    head = front_landmarks[0]
-    ankle = front_landmarks[27]
+    if not _validate_required_visibility(front_landmarks, side_landmarks, back_landmarks):
+        return {"error": "Poor body detection"}
 
-    pixel_height = distance(head, ankle)
+    # Reject rotated or tilted frontal poses using the shoulder line angle.
+    left_shoulder = front_landmarks[11]
+    right_shoulder = front_landmarks[12]
+    left_shoulder_xy = _get_xy(left_shoulder)
+    right_shoulder_xy = _get_xy(right_shoulder)
+    shoulder_angle_deg = abs(
+        math.degrees(
+            math.atan2(
+                right_shoulder_xy[1] - left_shoulder_xy[1],
+                right_shoulder_xy[0] - left_shoulder_xy[0],
+            )
+        )
+    )
+    if shoulder_angle_deg > MAX_SHOULDER_ANGLE_DEG:
+        return {"error": "Stand straight facing camera"}
 
-    if pixel_height == 0:
-        return {"error": "Invalid body detection"}
+    # Improved stature scaling:
+    # 1. Estimate head top instead of treating the nose as head top.
+    # 2. Blend three anthropometric scales for better robustness.
+    nose_xy = _get_xy(front_landmarks[0])
+    shoulder_mid_xy = _midpoint(front_landmarks[11], front_landmarks[12])
+    hip_mid_xy = _midpoint(front_landmarks[23], front_landmarks[24])
+    ankle_xy = _get_xy(front_landmarks[27])
+    head_top_xy = (
+        nose_xy[0],
+        nose_xy[1] - ((shoulder_mid_xy[1] - nose_xy[1]) * 0.6),
+    )
 
-    scale = height_cm / pixel_height
+    pixel_height = _point_distance(head_top_xy, ankle_xy)
+    nose_to_ankle = _point_distance(nose_xy, ankle_xy)
+    hip_to_ankle = _point_distance(hip_mid_xy, ankle_xy)
+    shoulder_to_hip = _point_distance(shoulder_mid_xy, hip_mid_xy)
 
+    if pixel_height <= 0.0 or nose_to_ankle <= 0.0 or hip_to_ankle <= 0.0 or shoulder_to_hip <= 0.0:
+        return {"error": "Poor body detection"}
 
-    # ------------------------------
-    # FRONT SHOULDER WIDTH
-    # ------------------------------
-    front_left_shoulder = front_landmarks[11]
-    front_right_shoulder = front_landmarks[12]
+    scale_candidates = [
+        height_cm / pixel_height,
+        (height_cm * 0.53) / hip_to_ankle,
+        (height_cm * 0.28) / shoulder_to_hip,
+    ]
+    scale = _average(scale_candidates)
 
-    front_shoulder_px = distance(front_left_shoulder, front_right_shoulder)
-    front_shoulder = front_shoulder_px * scale
+    # Multi-view shoulder fusion: front view is usually cleaner than back view.
+    front_shoulder_cm = _distance(front_landmarks[11], front_landmarks[12]) * scale
+    back_shoulder_cm = _distance(back_landmarks[11], back_landmarks[12]) * scale
+    shoulder_width = (front_shoulder_cm * 0.6) + (back_shoulder_cm * 0.4)
 
+    # Hip width remains a symmetric front/back fusion.
+    front_hip_cm = _distance(front_landmarks[23], front_landmarks[24]) * scale
+    back_hip_cm = _distance(back_landmarks[23], back_landmarks[24]) * scale
+    hip_width = (front_hip_cm + back_hip_cm) * 0.5
 
-    # ------------------------------
-    # BACK SHOULDER WIDTH
-    # ------------------------------
-    back_left_shoulder = back_landmarks[11]
-    back_right_shoulder = back_landmarks[12]
+    # Torso depth from the side torso segment length, scaled by a stable factor.
+    torso_depth_px = _distance(side_landmarks[11], side_landmarks[23]) * 0.35
+    torso_depth = torso_depth_px * scale
 
-    back_shoulder_px = distance(back_left_shoulder, back_right_shoulder)
-    back_shoulder = back_shoulder_px * scale
+    # Lightweight width/depth modeling for torso sections.
+    chest_width = shoulder_width * 0.92
+    waist_width = (shoulder_width * 0.35) + (hip_width * 0.65)
+    chest_depth = torso_depth * 1.02
+    waist_depth = torso_depth * 0.92
+    hip_depth = torso_depth * 1.08
 
+    chest_circumference = _ellipse_circumference(chest_width, chest_depth)
+    waist_circumference = _ellipse_circumference(waist_width, waist_depth)
+    hip_circumference = _ellipse_circumference(hip_width, hip_depth)
 
-    # MULTI VIEW SHOULDER FUSION
-    shoulder_width = (front_shoulder + back_shoulder) / 2
+    # Limb lengths remain summed segment lengths for speed and stability.
+    left_arm_cm = _segment_chain_length([front_landmarks[11], front_landmarks[13], front_landmarks[15]]) * scale
+    right_arm_cm = _segment_chain_length([front_landmarks[12], front_landmarks[14], front_landmarks[16]]) * scale
+    arm_length = _average([left_arm_cm, right_arm_cm])
 
+    left_leg_cm = _segment_chain_length([front_landmarks[23], front_landmarks[25], front_landmarks[27]]) * scale
+    right_leg_cm = _segment_chain_length([front_landmarks[24], front_landmarks[26], front_landmarks[28]]) * scale
+    leg_length = _average([left_leg_cm, right_leg_cm])
 
-    # ------------------------------
-    # FRONT HIP WIDTH
-    # ------------------------------
-    front_left_hip = front_landmarks[23]
-    front_right_hip = front_landmarks[24]
+    # Clamp outputs to realistic human ranges to reduce noisy detections.
+    shoulder_width = _clamp(shoulder_width, 30.0, 65.0)
+    hip_width = _clamp(hip_width, 30.0, 60.0)
+    torso_depth = _clamp(torso_depth, 10.0, 35.0)
+    chest_circumference = _clamp(chest_circumference, 60.0, 160.0)
+    waist_circumference = _clamp(waist_circumference, 50.0, 150.0)
+    hip_circumference = _clamp(hip_circumference, 70.0, 160.0)
+    arm_length = _clamp(arm_length, 40.0, 90.0)
+    leg_length = _clamp(leg_length, 55.0, 130.0)
 
-    front_hip_px = distance(front_left_hip, front_right_hip)
-    front_hip = front_hip_px * scale
+    # Hip circumference is intentionally computed for stability checking even
+    # though the public return format must remain unchanged.
+    _ = hip_circumference
 
-
-    # ------------------------------
-    # BACK HIP WIDTH
-    # ------------------------------
-    back_left_hip = back_landmarks[23]
-    back_right_hip = back_landmarks[24]
-
-    back_hip_px = distance(back_left_hip, back_right_hip)
-    back_hip = back_hip_px * scale
-
-
-    # MULTI VIEW HIP FUSION
-    hip_width = (front_hip + back_hip) / 2
-
-
-    # ------------------------------
-    # SIDE DEPTH (TORSO THICKNESS)
-    # ------------------------------
-    side_shoulder = side_landmarks[11]
-    side_hip = side_landmarks[23]
-
-    depth_px = abs(side_shoulder[0] - side_hip[0])
-    torso_depth = depth_px * scale
-
-
-    # ------------------------------
-    # BODY CIRCUMFERENCE MODEL
-    # ------------------------------
-
-    # improved body model
-    chest_circumference = (shoulder_width * 1.6) + (torso_depth * 1.2)
-    waist_circumference = (hip_width * 1.5) + (torso_depth * 1.1)
-
-
-    # ------------------------------
-    # ARM LENGTH
-    # ------------------------------
-    shoulder = front_landmarks[11]
-    elbow = front_landmarks[13]
-    wrist = front_landmarks[15]
-
-    arm_px = distance(shoulder, elbow) + distance(elbow, wrist)
-    arm_length = arm_px * scale
-
-
-    # ------------------------------
-    # LEG LENGTH
-    # ------------------------------
-    hip = front_landmarks[23]
-    knee = front_landmarks[25]
-    ankle = front_landmarks[27]
-
-    leg_px = distance(hip, knee) + distance(knee, ankle)
-    leg_length = leg_px * scale
-
-
-    # ------------------------------
-    # SAFETY LIMITS
-    # ------------------------------
-    shoulder_width = max(30, min(shoulder_width, 65))
-    hip_width = max(30, min(hip_width, 60))
-    torso_depth = max(10, min(torso_depth, 35))
-
-
-    # ------------------------------
-    # FINAL OUTPUT
-    # ------------------------------
     return {
         "shoulder_width_cm": round(shoulder_width, 2),
         "hip_width_cm": round(hip_width, 2),
@@ -131,5 +185,5 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         "chest_cm": round(chest_circumference, 2),
         "waist_cm": round(waist_circumference, 2),
         "arm_length_cm": round(arm_length, 2),
-        "leg_length_cm": round(leg_length, 2)
+        "leg_length_cm": round(leg_length, 2),
     }

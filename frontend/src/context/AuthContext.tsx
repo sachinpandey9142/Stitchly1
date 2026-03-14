@@ -19,6 +19,8 @@ export type User = {
   experience: string;
   working_hours: Record<string, string>;
   profile_photo: string;
+  geo_location?: { type: 'Point'; coordinates: [number, number] } | null;
+  is_available?: boolean;
   height?: string;
   weight?: string;
   gender?: 'male' | 'female';
@@ -34,8 +36,8 @@ type RegisterData = {
   city: string;
   pincode: string;
   address: string;
-
-  // 👇 ADD THESE
+  latitude?: number;
+  longitude?: number;
   height?: string;
   weight?: string;
   gender?: 'male' | 'female';
@@ -84,25 +86,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return data.user;
   };
 
- const register = async (registerData: RegisterData) => {
-  const data = await api.post('/auth/register', registerData);
+  const register = async (registerData: RegisterData) => {
+    const data = await api.post('/auth/register', registerData);
 
-  const enrichedUser: User = {
-    ...data.user,
-    height: registerData.height,
-    weight: registerData.weight,
-    gender: registerData.gender,
-    bodyType: registerData.bodyType,
+    const enrichedUser: User = {
+      ...data.user,
+      height: registerData.height,
+      weight: registerData.weight,
+      gender: registerData.gender,
+      bodyType: registerData.bodyType,
+    };
+
+    await AsyncStorage.setItem('auth_token', data.token);
+    setUser(enrichedUser);
+
+    return enrichedUser;
   };
 
-  await AsyncStorage.setItem('auth_token', data.token);
-
-  setUser(enrichedUser);
-
-  return enrichedUser;
-};
-
- 
   const logout = async () => {
     await AsyncStorage.removeItem('auth_token');
     setUser(null);
