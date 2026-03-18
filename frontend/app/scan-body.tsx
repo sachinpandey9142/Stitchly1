@@ -16,7 +16,7 @@ import Svg, { Circle, Line } from "react-native-svg";
 const { height, width } = Dimensions.get("window");
 
 const BACKEND =
-  process.env.EXPO_PUBLIC_BACKEND_URL || "http://10.171.61.15:8000";
+  process.env.EXPO_PUBLIC_BACKEND_URL || "http://10.228.33.15:8000";
 
 /* ============================= */
 /* Skeleton connections          */

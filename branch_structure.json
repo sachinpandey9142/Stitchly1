@@ -1,0 +1,33 @@
+{
+  "default_branch": "Develop",
+  "branches": [
+    "Develop",
+    "UI-development",
+    "added_ai_cam",
+    "codex/build-ai-body-scanning-system-for-stitchly",
+    "feat-added-3D-mesh",
+    "origin",
+    "production-1",
+    "select-address"
+  ],
+  "parent": {
+    "Develop": null,
+    "UI-development": "Develop",
+    "added_ai_cam": "Develop",
+    "codex/build-ai-body-scanning-system-for-stitchly": "Develop",
+    "feat-added-3D-mesh": "Develop",
+    "origin": "Develop",
+    "production-1": "Develop",
+    "select-address": "Develop"
+  },
+  "order": [
+    "Develop",
+    "UI-development",
+    "added_ai_cam",
+    "codex/build-ai-body-scanning-system-for-stitchly",
+    "feat-added-3D-mesh",
+    "origin",
+    "production-1",
+    "select-address"
+  ]
+}
