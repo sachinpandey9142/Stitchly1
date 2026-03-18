@@ -1045,6 +1045,37 @@ async def request_withdrawal(amount: float = Body(..., embed=True), user=Depends
     return withdrawal
 
 
+# ===================== TAILOR SPECIALITIES =====================
+
+class TailorSpecialitiesUpdate(BaseModel):
+    specialities: List[str]
+
+
+@api_router.put("/tailor/specialities")
+async def update_tailor_specialities(
+    data: TailorSpecialitiesUpdate,
+    user=Depends(require_tailor)
+):
+    await db.users.update_one(
+        {"id": user["id"]},
+        {
+            "$set": {
+                "specialities": data.specialities,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+        }
+    )
+
+    updated = await db.users.find_one(
+        {"id": user["id"]},
+        {"_id": 0, "password_hash": 0}
+    )
+
+    return {
+        "message": "Specialities updated",
+        "specialities": updated.get("specialities", [])
+    }
+
 # ===================== DELIVERY ROUTES =====================
 
 @api_router.put("/delivery/availability")

@@ -6,7 +6,31 @@ import { Feather } from '@expo/vector-icons';
 import { api } from '../../../src/utils/api';
 import { useAuth } from '../../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius } from '../../../src/utils/theme';
+import { designCatalog } from "../../../src/data/designCatalog";
+import { Image } from "react-native";
 
+
+const designImages: any = {
+  lehenga: {
+    "Bridal Lehenga": require("../../../src/assets/designs/lehenga/bridal.png"),
+    "A-Line Lehenga": require("../../../src/assets/designs/lehenga/a-line.png"),
+    "Circular Lehenga": require("../../../src/assets/designs/lehenga/circular.png"),
+    "Panelled Lehenga": require("../../../src/assets/designs/lehenga/panelled.png"),
+  },
+
+  blouse: {
+    "Boat Neck Blouse": require("../../../src/assets/designs/blouse/boat-neck.png"),
+    "Backless Blouse": require("../../../src/assets/designs/blouse/backless.png"),
+    "Princess Cut Blouse": require("../../../src/assets/designs/blouse/princess-cut.png"),
+    "High Neck Blouse": require("../../../src/assets/designs/blouse/high-neck.png"),
+  },
+
+  suits: {
+    "Anarkali Suit": require("../../../src/assets/designs/suits/anarkali.png"),
+    "Straight Suit": require("../../../src/assets/designs/suits/straight.png"),
+    "Palazzo Suit": require("../../../src/assets/designs/suits/palazzo.png"),
+  }
+};
 const SPECIALITIES = ['All', 'Blouse', 'Lehenga', 'Men\'s Suit', 'Kurta', 'Alteration', 'Dress', 'Sherwani'];
 
 export default function CustomerHome() {
@@ -20,6 +44,10 @@ export default function CustomerHome() {
   const [selectedCity, setSelectedCity] = useState(user?.city || '');
   const [cities, setCities] = useState<string[]>([]);
   const [showCityPicker, setShowCityPicker] = useState(false);
+  const [selectedDesign, setSelectedDesign] = useState<string | null>(null);
+  const [activeCategory, setActiveCategory] =
+  useState<keyof typeof designCatalog.women>("lehenga");
+  const [searchDesign, setSearchDesign] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -35,7 +63,11 @@ export default function CustomerHome() {
   const fetchTailors = useCallback(async () => {
     try {
       let endpoint = '/tailors?';
-      if (selectedSpecialty !== 'All') endpoint += `specialty=${encodeURIComponent(selectedSpecialty)}&`;
+      const specialty = selectedDesign || selectedSpecialty;
+
+      if (specialty !== 'All') {
+      endpoint += `specialty=${encodeURIComponent(specialty)}&`;
+      }
       if (selectedCity) endpoint += `city=${encodeURIComponent(selectedCity)}&`;
       if (search.trim()) endpoint += `search=${encodeURIComponent(search.trim())}&`;
       const data = await api.get(endpoint);
@@ -46,7 +78,7 @@ export default function CustomerHome() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [selectedSpecialty, selectedCity, search]);
+  }, [selectedSpecialty, selectedCity, search, selectedDesign]);
 
   useEffect(() => { setLoading(true); fetchTailors(); }, [fetchTailors]);
 
@@ -134,6 +166,16 @@ export default function CustomerHome() {
         </View>
       </Modal>
 
+      {/* Design Browser */}
+
+
+
+{/* CATEGORY TABS */}
+
+
+
+
+
       <View style={styles.searchContainer}>
         <Feather name="search" size={20} color={Colors.textMuted} />
         <TextInput
@@ -151,6 +193,7 @@ export default function CustomerHome() {
           </TouchableOpacity>
         )}
       </View>
+      
 
       <FlatList
         horizontal
@@ -169,6 +212,34 @@ export default function CustomerHome() {
           </TouchableOpacity>
         )}
       />
+  <View style={styles.designCarousel}>
+
+{selectedSpecialty !== "All" && designCatalog.women[selectedSpecialty?.toLowerCase()]?.map((design) => (
+  
+  <TouchableOpacity
+    key={design}
+    style={styles.designCardNew}
+    onPress={() => setSelectedDesign(design)}
+  >
+
+    {designImages[selectedSpecialty.toLowerCase()]?.[design] ? (
+      <Image
+        source={designImages[selectedSpecialty.toLowerCase()][design]}
+        style={styles.designCardImageNew}
+      />
+    ) : (
+      <View style={styles.designCardPlaceholderNew} />
+    )}
+
+    <Text style={styles.designCardTextNew}>
+      {design}
+    </Text>
+
+  </TouchableOpacity>
+
+))}
+
+</View>
 
       {loading ? (
         <View style={styles.loader}><ActivityIndicator size="large" color={Colors.primary} /></View>
@@ -270,4 +341,182 @@ const styles = StyleSheet.create({
   emptySubText: { fontFamily: Fonts.ui, fontSize: 14, color: Colors.textMuted, marginTop: 4 },
   showAllBtn: { marginTop: 16, backgroundColor: Colors.primary, borderRadius: Radius.full, paddingHorizontal: 24, paddingVertical: 12 },
   showAllText: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.textInverted },
+  designSection:{
+  paddingHorizontal:Spacing.containerPadding,
+  marginTop:16
+},
+
+designTitle:{
+  fontFamily:Fonts.bodyBold,
+  fontSize:18,
+  marginBottom:10,
+  color:Colors.text
+},
+
+designCategory:{
+  marginBottom:12
+},
+
+designCategoryTitle:{
+  fontFamily:Fonts.ui,
+  fontSize:13,
+  color:Colors.textMuted,
+  marginBottom:6
+},
+
+designRow:{
+  flexDirection:"row",
+  flexWrap:"wrap",
+  gap:8
+},
+
+
+
+designCardActive:{
+  backgroundColor:Colors.primary,
+  borderColor:Colors.primary
+},
+
+designText:{
+  fontFamily:Fonts.body,
+  fontSize:13,
+  color:Colors.text
+},
+
+designTextActive:{
+  color:Colors.textInverted
+},
+designSearchContainer:{
+  marginHorizontal:Spacing.containerPadding,
+  marginTop:12
+},
+
+designSearchInput:{
+  borderWidth:1,
+  borderColor:Colors.border,
+  borderRadius:Radius.md,
+  padding:10
+},
+
+categoryTabs:{
+  paddingHorizontal:Spacing.containerPadding,
+  marginTop:10
+},
+
+categoryTab:{
+  paddingHorizontal:14,
+  paddingVertical:6,
+  borderRadius:Radius.full,
+  borderWidth:1,
+  borderColor:Colors.border,
+  marginRight:8
+},
+
+categoryTabActive:{
+  backgroundColor:Colors.primary,
+  borderColor:Colors.primary
+},
+
+categoryTabText:{
+  fontSize:13,
+  color:Colors.textMuted
+},
+
+categoryTabTextActive:{
+  color:Colors.textInverted
+},
+
+designList:{
+  paddingHorizontal:Spacing.containerPadding,
+  marginTop:16
+},
+
+designItem:{
+  marginBottom:20,
+  alignItems:"center"
+},
+
+imagePlaceholder:{
+  width:"100%",
+  height:120,
+  borderRadius:Radius.md,
+  borderWidth:1,
+  borderColor:Colors.border,
+  backgroundColor:"#f5f5f5"
+},
+
+designName:{
+  marginTop:6,
+  fontSize:14,
+  fontFamily:Fonts.body,
+  textAlign:"center"
+},
+designImage:{
+  width:"100%",
+  height:120
+},
+designCarousel:{
+  flexDirection:"row",
+  paddingHorizontal:Spacing.containerPadding,
+  marginTop:10
+},
+
+designCard:{
+  width:100,
+  marginRight:12,
+  alignItems:"center"
+},
+
+designCardImage:{
+  width:90,
+  height:120,
+  borderRadius:20
+},
+
+designCardPlaceholder:{
+  width:90,
+  height:120,
+  borderRadius:20,
+  backgroundColor:"#eee"
+},
+
+designCardText:{
+  marginTop:6,
+  fontSize:12,
+  fontFamily:Fonts.body,
+  color:Colors.textMuted
+},
+designCardNew:{
+  width:140,
+  marginRight:12,
+  marginTop:12,
+  borderRadius:20,
+  backgroundColor:Colors.surface,
+  padding:10,
+  alignItems:"center",
+  shadowColor:"#000",
+  shadowOpacity:0.08,
+  shadowRadius:6,
+  elevation:3
+},
+
+designCardImageNew:{
+  width:120,
+  height:150,
+  borderRadius:16
+},
+
+designCardPlaceholderNew:{
+  width:120,
+  height:150,
+  borderRadius:16,
+  backgroundColor:"#eee"
+},
+
+designCardTextNew:{
+  marginTop:8,
+  fontSize:13,
+  fontFamily:Fonts.body,
+  textAlign:"center"
+},
 });
