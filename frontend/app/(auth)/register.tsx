@@ -1,21 +1,15 @@
-import React, { useState } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, Alert,} from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, Alert, ActivityIndicator, Animated, Modal, Pressable, Image } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
-import { Pressable} from "react-native";
+import { useFocusEffect } from '@react-navigation/native';
 import { Feather } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius } from '../../src/utils/theme';
 import * as Location from 'expo-location';
-import { useRef } from 'react';
-import { ActivityIndicator } from 'react-native';
 import * as Haptics from 'expo-haptics';
-import { Animated } from 'react-native';
-import { useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Modal } from "react-native";
 import MapView, { Marker, Circle } from "react-native-maps";
-import { Image } from 'react-native';
 import MaleSlim from '../../assets/body/male_slim.png';
 import MaleFit from '../../assets/body/male_fit.png';
 import MaleBulk from '../../assets/body/male_bulk.png';
@@ -29,6 +23,8 @@ const ROLES = [
   { key: 'tailor', label: 'Tailor', icon: 'scissors' as const, desc: 'Offer your services' },
   { key: 'delivery', label: 'Delivery', icon: 'truck' as const, desc: 'Deliver orders' },
 ];
+
+const SCAN_RESULT_STORAGE_KEY = 'stitchly_latest_scan_measurements';
 
 export default function Register() {
   const router = useRouter();
@@ -66,6 +62,15 @@ export default function Register() {
   const [weight, setWeight] = useState('');
   const [bodyType, setBodyType] = useState<'slim' | 'fit' | 'bulk' | ''>('');
   const [gender, setGender] = useState<'male' | 'female'>('male');
+  const [shoulder, setShoulder] = useState('');
+  const [chest, setChest] = useState('');
+  const [waist, setWaist] = useState('');
+  const [hip, setHip] = useState('');
+  const [armLength, setArmLength] = useState('');
+  const [legLength, setLegLength] = useState('');
+  const [neck, setNeck] = useState('');
+  const [scanConfidence, setScanConfidence] = useState<number | null>(null);
+  const [legacyMeasurements, setLegacyMeasurements] = useState<Record<string, number>>({});
   const BODY_TYPES: ('slim' | 'fit' | 'bulk')[] = ['slim', 'fit', 'bulk'];
 
   useEffect(() => {
@@ -91,6 +96,84 @@ useEffect(() => {
     }).start();
   }
 }, [latitude, longitude]);
+
+useFocusEffect(
+  useCallback(() => {
+    let isMounted = true;
+
+    const hydrateScanResult = async () => {
+      try {
+        const raw = await AsyncStorage.getItem(SCAN_RESULT_STORAGE_KEY);
+        if (!raw || !isMounted) return;
+
+        const parsed = JSON.parse(raw);
+        const scanned = parsed?.measurements || {};
+
+        if (typeof parsed?.height_cm === 'number') setHeight(String(parsed.height_cm));
+        if (typeof scanned.shoulder === 'number') setShoulder(String(scanned.shoulder));
+        if (typeof scanned.chest === 'number') setChest(String(scanned.chest));
+        if (typeof scanned.waist === 'number') setWaist(String(scanned.waist));
+        if (typeof scanned.hip === 'number') setHip(String(scanned.hip));
+        if (typeof scanned.arm === 'number') setArmLength(String(scanned.arm));
+        if (typeof scanned.leg === 'number') setLegLength(String(scanned.leg));
+        if (typeof scanned.neck === 'number') setNeck(String(scanned.neck));
+
+        if (parsed?.quality && typeof parsed.quality.overall_confidence === 'number') {
+          setScanConfidence(parsed.quality.overall_confidence);
+        }
+
+        if (parsed?.legacy_measurements && typeof parsed.legacy_measurements === 'object') {
+          setLegacyMeasurements(parsed.legacy_measurements);
+        }
+
+        await AsyncStorage.removeItem(SCAN_RESULT_STORAGE_KEY);
+        Alert.alert('AI measurements imported', 'Review and edit values before creating account.');
+      } catch (error) {
+        console.log('scan hydration error', error);
+      }
+    };
+
+    hydrateScanResult();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [])
+);
+
+const toPositiveNumber = (value: string): number | undefined => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return parsed;
+};
+
+const buildBodyMeasurementsPayload = () => {
+  if (role !== 'customer') return undefined;
+
+  const shoulderCm = toPositiveNumber(shoulder);
+  const chestCm = toPositiveNumber(chest);
+  const waistCm = toPositiveNumber(waist);
+  const hipCm = toPositiveNumber(hip);
+  const armCm = toPositiveNumber(armLength);
+  const legCm = toPositiveNumber(legLength);
+  const neckCm = toPositiveNumber(neck);
+  const legacyHipWidth = Number(legacyMeasurements.hip_width_cm);
+  const hipWidthCm = Number.isFinite(legacyHipWidth) && legacyHipWidth > 0 ? legacyHipWidth : hipCm;
+
+  const payload: Record<string, number> = {};
+
+  if (shoulderCm) payload.shoulder_width_cm = Number(shoulderCm.toFixed(2));
+  if (chestCm) payload.chest_cm = Number(chestCm.toFixed(2));
+  if (waistCm) payload.waist_cm = Number(waistCm.toFixed(2));
+  if (hipWidthCm) payload.hip_width_cm = Number(hipWidthCm.toFixed(2));
+  if (hipCm) payload.hip_cm = Number(hipCm.toFixed(2));
+  if (armCm) payload.arm_length_cm = Number(armCm.toFixed(2));
+  if (legCm) payload.leg_length_cm = Number(legCm.toFixed(2));
+  if (neckCm) payload.neck_cm = Number(neckCm.toFixed(2));
+
+  if (Object.keys(payload).length === 0) return undefined;
+  return payload;
+};
   
   const handleRegister = async () => {
     if (!name.trim() || !email.trim() || !phone.trim() || !password) {
@@ -107,6 +190,7 @@ useEffect(() => {
     }
     setLoading(true);
     try {
+      const bodyMeasurements = buildBodyMeasurementsPayload();
       const user = await register({
   name: name.trim(),
   email: email.trim().toLowerCase(),
@@ -122,7 +206,7 @@ useEffect(() => {
   ...(role === "customer" && {
   height,
   weight,
-  
+  body_measurements: bodyMeasurements,
   bodyType,
   })
 } as any);
@@ -529,20 +613,6 @@ const getBodyImage = (type: 'slim' | 'fit' | 'bulk') => {
             </View>
             
           </View>
-          <Pressable
-  onPress={() => router.push("/scan-body")}
-  style={{
-    padding: 15,
-    backgroundColor: "black",
-    marginTop: 20,
-    borderRadius: 10,
-  }}
->
-  <Text style={{ color: "white", textAlign: "center" }}>
-    AI Body Scan
-  </Text>
-</Pressable>
-
           <View style={{ marginBottom: 14 }}>
   <Text style={styles.label}>Gender</Text>
 
@@ -575,6 +645,17 @@ const getBodyImage = (type: 'slim' | 'fit' | 'bulk') => {
     <Feather name="user" size={15} color={Colors.primary} />
     {'  '}Body Details
   </Text>
+
+  <Pressable style={styles.scanButton} onPress={() => router.push('/scan-body')}>
+    <Feather name="camera" size={16} color={Colors.textInverted} />
+    <Text style={styles.scanButtonText}>Start AI Body Scan</Text>
+  </Pressable>
+
+  {scanConfidence !== null && (
+    <Text style={styles.scanMeta}>
+      Last scan confidence: {(scanConfidence * 100).toFixed(0)}%
+    </Text>
+  )}
  
   {/* Height & Weight Row */}
   <View style={{ flexDirection: 'row', gap: 10 }}>
@@ -603,6 +684,57 @@ const getBodyImage = (type: 'slim' | 'fit' | 'bulk') => {
           onChangeText={setWeight}
           keyboardType="numeric"
         />
+      </View>
+    </View>
+  </View>
+
+  <View style={styles.measurementGrid}>
+    <View style={styles.measurementTile}>
+      <Text style={styles.label}>Shoulder</Text>
+      <View style={styles.inputContainer}>
+        <TextInput value={shoulder} placeholder="Shoulder" placeholderTextColor={Colors.textMuted} onChangeText={setShoulder} keyboardType="numeric" style={styles.inputNoPad} />
+      </View>
+    </View>
+
+    <View style={styles.measurementTile}>
+      <Text style={styles.label}>Chest</Text>
+      <View style={styles.inputContainer}>
+        <TextInput value={chest} placeholder="Chest" placeholderTextColor={Colors.textMuted} onChangeText={setChest} keyboardType="numeric" style={styles.inputNoPad} />
+      </View>
+    </View>
+
+    <View style={styles.measurementTile}>
+      <Text style={styles.label}>Waist</Text>
+      <View style={styles.inputContainer}>
+        <TextInput value={waist} placeholder="Waist" placeholderTextColor={Colors.textMuted} onChangeText={setWaist} keyboardType="numeric" style={styles.inputNoPad} />
+      </View>
+    </View>
+
+    <View style={styles.measurementTile}>
+      <Text style={styles.label}>Hip</Text>
+      <View style={styles.inputContainer}>
+        <TextInput value={hip} placeholder="Hip" placeholderTextColor={Colors.textMuted} onChangeText={setHip} keyboardType="numeric" style={styles.inputNoPad} />
+      </View>
+    </View>
+
+    <View style={styles.measurementTile}>
+      <Text style={styles.label}>Arm Length</Text>
+      <View style={styles.inputContainer}>
+        <TextInput value={armLength} placeholder="Arm Length" placeholderTextColor={Colors.textMuted} onChangeText={setArmLength} keyboardType="numeric" style={styles.inputNoPad} />
+      </View>
+    </View>
+
+    <View style={styles.measurementTile}>
+      <Text style={styles.label}>Leg Length</Text>
+      <View style={styles.inputContainer}>
+        <TextInput value={legLength} placeholder="Leg Length" placeholderTextColor={Colors.textMuted} onChangeText={setLegLength} keyboardType="numeric" style={styles.inputNoPad} />
+      </View>
+    </View>
+
+    <View style={[styles.measurementTile, { width: '100%' }]}>
+      <Text style={styles.label}>Neck</Text>
+      <View style={styles.inputContainer}>
+        <TextInput value={neck} placeholder="Neck" placeholderTextColor={Colors.textMuted} onChangeText={setNeck} keyboardType="numeric" style={styles.inputNoPad} />
       </View>
     </View>
   </View>
@@ -903,6 +1035,42 @@ bodySection: {
   marginTop: 20,
   borderWidth: 1,
   borderColor: Colors.primary + '20',
+},
+
+scanButton: {
+  marginBottom: 10,
+  paddingVertical: 12,
+  borderRadius: Radius.full,
+  backgroundColor: Colors.primary,
+  alignItems: 'center',
+  justifyContent: 'center',
+  flexDirection: 'row',
+  gap: 8,
+},
+
+scanButtonText: {
+  fontFamily: Fonts.bodyBold,
+  fontSize: 14,
+  color: Colors.textInverted,
+},
+
+scanMeta: {
+  marginBottom: 12,
+  fontFamily: Fonts.ui,
+  fontSize: 12,
+  color: Colors.primaryDark,
+},
+
+measurementGrid: {
+  flexDirection: 'row',
+  flexWrap: 'wrap',
+  justifyContent: 'space-between',
+  marginTop: 6,
+},
+
+measurementTile: {
+  width: '48%',
+  marginBottom: 4,
 },
 
 bodyTypeRow: {

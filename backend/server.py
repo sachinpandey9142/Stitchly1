@@ -13,7 +13,7 @@ import hmac
 import hashlib
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from jose import jwt, JWTError
 from passlib.context import CryptContext
@@ -49,15 +49,16 @@ except Exception as exc:
 AI_IMPORT_ERROR = None
 try:
     import cv2
-    from ai.body3d.body_reconstruction import add_frame, average_landmarks
-    from ai.pose_detector import detect_landmarks
+    from ai import pose_detector as pose_detector_module
     from ai.measurement_calculator import calculate_measurements
+    detect_landmarks = getattr(pose_detector_module, "detect_landmarks", None)
+    detect_pose = getattr(pose_detector_module, "detect_pose", None)
 except Exception as exc:
     cv2 = None
+    detect_landmarks = None
+    detect_pose = None
+    calculate_measurements = None
     AI_IMPORT_ERROR = exc
-
-frame_buffer = []
-MAX_FRAMES = 10
 
 load_dotenv(ROOT_DIR / '.env')
 LOCAL_AVATAR_DIR.mkdir(parents=True, exist_ok=True)
@@ -139,6 +140,301 @@ def issue_token_for_user(user: dict) -> str:
 def ensure_ai_dependencies():
     if AI_IMPORT_ERROR is not None:
         raise HTTPException(status_code=503, detail=f"AI dependencies unavailable: {AI_IMPORT_ERROR}")
+
+
+def _save_upload_to_temp(upload: UploadFile, prefix: str) -> str:
+    os.makedirs("temp", exist_ok=True)
+    extension = Path(upload.filename or "capture.jpg").suffix or ".jpg"
+    output_path = Path("temp") / f"{prefix}_{uuid.uuid4().hex}{extension}"
+    with open(output_path, "wb") as buffer:
+        shutil.copyfileobj(upload.file, buffer)
+    return str(output_path)
+
+
+def _detect_pose_view(image_path: str) -> dict:
+    if callable(detect_pose):
+        return detect_pose(image_path) or {}
+
+    if callable(detect_landmarks):
+        return {
+            "landmarks": detect_landmarks(image_path) or [],
+            "segmentation_mask": None,
+            "silhouette": [],
+            "pose_confidence": 0.0,
+            "image_width": 1000,
+            "image_height": 1000,
+        }
+
+    raise RuntimeError("Pose detector is unavailable")
+
+
+def _format_landmarks_for_response(landmarks: list) -> list:
+    formatted = []
+    for landmark in landmarks or []:
+        if isinstance(landmark, dict):
+            formatted.append(
+                {
+                    "x": float(landmark.get("x", 0.0)),
+                    "y": float(landmark.get("y", 0.0)),
+                    "z": float(landmark.get("z", 0.0)),
+                    "visibility": float(landmark.get("visibility", 0.0)),
+                }
+            )
+    return formatted
+
+
+def _format_overlay(view: dict) -> dict:
+    return {
+        "landmarks": _format_landmarks_for_response(view.get("landmarks", [])),
+        "silhouette": [
+            {
+                "x": float(point.get("x", 0.0)),
+                "y": float(point.get("y", 0.0)),
+            }
+            for point in (view.get("silhouette") or [])
+            if isinstance(point, dict)
+        ],
+        "pose_confidence": float(view.get("pose_confidence", 0.0)),
+    }
+
+
+def _build_ui_measurements(measurements: dict) -> dict:
+    return {
+        "shoulder": round(float(measurements.get("shoulder_width_cm", 0.0)), 2),
+        "chest": round(float(measurements.get("chest_cm", 0.0)), 2),
+        "waist": round(float(measurements.get("waist_cm", 0.0)), 2),
+        "hip": round(float(measurements.get("hip_circumference_cm", measurements.get("hip_width_cm", 0.0))), 2),
+        "arm": round(float(measurements.get("arm_length_cm", 0.0)), 2),
+        "leg": round(float(measurements.get("leg_length_cm", 0.0)), 2),
+        "neck": round(float(measurements.get("neck_cm", 0.0)), 2),
+    }
+
+
+def _build_avatar_measurements(measurements: dict) -> dict:
+    return {
+        "shoulder_width_cm": float(measurements.get("shoulder_width_cm", 0.0)),
+        "chest_cm": float(measurements.get("chest_cm", 0.0)),
+        "waist_cm": float(measurements.get("waist_cm", 0.0)),
+        "hip_width_cm": float(measurements.get("hip_width_cm", 0.0)),
+        "arm_length_cm": float(measurements.get("arm_length_cm", 0.0)),
+        "leg_length_cm": float(measurements.get("leg_length_cm", 0.0)),
+    }
+
+
+MEASUREMENT_NUMERIC_KEYS = (
+    "shoulder_width_cm",
+    "chest_cm",
+    "waist_cm",
+    "hip_width_cm",
+    "hip_circumference_cm",
+    "arm_length_cm",
+    "leg_length_cm",
+    "neck_cm",
+    "torso_depth_cm",
+)
+
+
+def _non_empty_uploads(*uploads: Optional[UploadFile]) -> List[UploadFile]:
+    return [upload for upload in uploads if upload is not None]
+
+
+def _detect_pose_candidates(view_name: str, uploads: List[UploadFile]) -> List[dict]:
+    candidates: List[dict] = []
+    for index, upload in enumerate(uploads):
+        image_path = _save_upload_to_temp(upload, f"{view_name}_{index + 1}")
+        candidates.append(_detect_pose_view(image_path))
+    return candidates
+
+
+def _without_outliers(values: List[float]) -> List[float]:
+    if len(values) < 3:
+        return values
+
+    q1 = float(np.percentile(values, 25))
+    q3 = float(np.percentile(values, 75))
+    iqr = q3 - q1
+    if iqr <= 0.0:
+        return values
+
+    lower = q1 - (1.5 * iqr)
+    upper = q3 + (1.5 * iqr)
+    filtered = [value for value in values if lower <= value <= upper]
+    return filtered or values
+
+
+def _aggregate_measurement_candidates(candidates: List[dict]) -> dict:
+    if not candidates:
+        return {}
+    if len(candidates) == 1:
+        return dict(candidates[0])
+
+    merged: Dict[str, Any] = {}
+
+    for key in MEASUREMENT_NUMERIC_KEYS:
+        values = [float(candidate.get(key, 0.0)) for candidate in candidates if candidate.get(key) is not None]
+        if values:
+            merged[key] = round(float(np.mean(_without_outliers(values))), 2)
+
+    measurement_keys = set()
+    for candidate in candidates:
+        measurement_keys.update((candidate.get("measurements") or {}).keys())
+    if measurement_keys:
+        merged["measurements"] = {}
+        for key in measurement_keys:
+            values = [
+                float((candidate.get("measurements") or {}).get(key))
+                for candidate in candidates
+                if (candidate.get("measurements") or {}).get(key) is not None
+            ]
+            if values:
+                merged["measurements"][key] = round(float(np.mean(_without_outliers(values))), 2)
+
+    confidence_keys = set()
+    for candidate in candidates:
+        confidence_keys.update((candidate.get("confidence") or {}).keys())
+    merged_confidence: Dict[str, float] = {}
+    for key in confidence_keys:
+        values = [
+            float((candidate.get("confidence") or {}).get(key))
+            for candidate in candidates
+            if (candidate.get("confidence") or {}).get(key) is not None
+        ]
+        if values:
+            merged_confidence[key] = round(float(np.mean(_without_outliers(values))), 3)
+
+    quality_values = [
+        float(candidate.get("quality_score", (candidate.get("confidence") or {}).get("overall", 0.0)))
+        for candidate in candidates
+    ]
+    quality_score = round(float(np.mean(_without_outliers(quality_values))), 3)
+    if "overall" not in merged_confidence:
+        merged_confidence["overall"] = quality_score
+    merged["confidence"] = merged_confidence
+    merged["quality_score"] = quality_score
+
+    warnings: List[str] = []
+    for candidate in candidates:
+        for warning in candidate.get("warnings") or []:
+            if warning and warning not in warnings:
+                warnings.append(warning)
+    merged["warnings"] = warnings
+
+    detail_keys = set()
+    for candidate in candidates:
+        detail_keys.update((candidate.get("measurement_details") or {}).keys())
+    merged_details: Dict[str, Dict[str, Any]] = {}
+    for metric in detail_keys:
+        metric_details = [
+            (candidate.get("measurement_details") or {}).get(metric)
+            for candidate in candidates
+            if (candidate.get("measurement_details") or {}).get(metric)
+        ]
+        if not metric_details:
+            continue
+
+        first = metric_details[0]
+        merged_metric: Dict[str, Any] = {}
+        for numeric_field, precision in (
+            ("value", 2),
+            ("confidence", 3),
+            ("landmark_confidence", 3),
+            ("silhouette_clarity", 3),
+            ("posture_score", 3),
+        ):
+            values = [
+                float(detail.get(numeric_field))
+                for detail in metric_details
+                if detail.get(numeric_field) is not None
+            ]
+            if values:
+                merged_metric[numeric_field] = round(float(np.mean(_without_outliers(values))), precision)
+
+        merged_metric["method"] = first.get("method", "multi-view fusion")
+        merged_details[metric] = merged_metric
+
+    if merged_details:
+        merged["measurement_details"] = merged_details
+
+    pixel_to_cm_values = [float(candidate.get("pixel_to_cm", 0.0)) for candidate in candidates if candidate.get("pixel_to_cm")]
+    if pixel_to_cm_values:
+        merged["pixel_to_cm"] = round(float(np.mean(_without_outliers(pixel_to_cm_values))), 6)
+
+    scale_keys = set()
+    for candidate in candidates:
+        scale_keys.update((candidate.get("scale_components") or {}).keys())
+    if scale_keys:
+        merged["scale_components"] = {}
+        for key in scale_keys:
+            values = [
+                float((candidate.get("scale_components") or {}).get(key))
+                for candidate in candidates
+                if (candidate.get("scale_components") or {}).get(key) is not None
+            ]
+            if values:
+                merged["scale_components"][key] = round(float(np.mean(_without_outliers(values))), 6)
+
+    best_candidate = max(
+        candidates,
+        key=lambda candidate: float(candidate.get("quality_score", (candidate.get("confidence") or {}).get("overall", 0.0))),
+    )
+    if best_candidate.get("scan_artifacts"):
+        merged["scan_artifacts"] = best_candidate.get("scan_artifacts")
+
+    return merged
+
+
+def _estimate_position_feedback(view_name: str, view: dict) -> dict:
+    landmarks = view.get("landmarks") or []
+    if len(landmarks) < 29:
+        return {
+            "instruction": "Move into frame",
+            "ready_to_capture": False,
+            "quality_score": 0.0,
+        }
+
+    left_shoulder = landmarks[11]
+    right_shoulder = landmarks[12]
+    left_ankle = landmarks[27]
+    right_ankle = landmarks[28]
+    nose = landmarks[0]
+
+    shoulder_mid_x = (float(left_shoulder.get("x", 0.0)) + float(right_shoulder.get("x", 0.0))) * 0.5
+    body_height = max(float(left_ankle.get("y", 0.0)), float(right_ankle.get("y", 0.0))) - float(nose.get("y", 0.0))
+    shoulder_tilt = abs(float(left_shoulder.get("y", 0.0)) - float(right_shoulder.get("y", 0.0)))
+    shoulder_span = abs(float(left_shoulder.get("x", 0.0)) - float(right_shoulder.get("x", 0.0)))
+    pose_confidence = float(view.get("pose_confidence", 0.0))
+
+    if body_height < 0.45:
+        return {"instruction": "Move back", "ready_to_capture": False, "quality_score": 0.15}
+
+    if shoulder_mid_x < 0.4:
+        return {"instruction": "Move right", "ready_to_capture": False, "quality_score": 0.2}
+    if shoulder_mid_x > 0.6:
+        return {"instruction": "Move left", "ready_to_capture": False, "quality_score": 0.2}
+
+    if shoulder_tilt > 0.055:
+        return {"instruction": "Stand straight", "ready_to_capture": False, "quality_score": 0.35}
+
+    if view_name == "side" and shoulder_span > 0.16:
+        return {
+            "instruction": "Turn 90° to your side",
+            "ready_to_capture": False,
+            "quality_score": 0.35,
+        }
+
+    if pose_confidence < 0.6:
+        return {
+            "instruction": "Hold steady",
+            "ready_to_capture": False,
+            "quality_score": max(0.35, pose_confidence),
+        }
+
+    quality = min(1.0, 0.5 + (pose_confidence * 0.4) + (body_height * 0.2))
+    return {
+        "instruction": "Good position",
+        "ready_to_capture": True,
+        "quality_score": round(quality, 3),
+    }
 
 
 async def set_delivery_partner_availability(delivery_partner_id: str, is_available: bool):
@@ -432,6 +728,7 @@ class UserRegister(BaseModel):
     weight: str | None = None
     gender: str | None = None
     bodyType: str | None = None
+    body_measurements: Optional[dict] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
@@ -600,6 +897,7 @@ async def register(data: UserRegister):
     address_val = data.address.strip() if data.address else ""
     location_str = f"{city_val}, {pincode_val}".strip(", ") if city_val or pincode_val else ""
     geo_location = build_geo_location(data.latitude, data.longitude)
+    customer_measurements = data.body_measurements if data.role == "customer" and isinstance(data.body_measurements, dict) else {}
     
     user = {
         "id": str(uuid.uuid4()),
@@ -625,7 +923,7 @@ async def register(data: UserRegister):
         "experience": "",
         "working_hours": {},
         "profile_photo": "",
-        "body_measurements": {},
+        "body_measurements": customer_measurements,
         "avatar_mesh": None,
         "avatar_generation_status": "none",
         "avatar_generation_error": None,
@@ -1888,225 +2186,204 @@ async def shutdown_db_client():
 
 
 
-# ===================== AI MEASUREMENT ENDPOINT =====================
+# ===================== AI MEASUREMENT ENDPOINTS =====================
+
+
 @app.post("/ai/check-position")
 async def check_position(
     image: UploadFile = File(...),
-    height_cm: float = Form(...)
+    height_cm: float = Form(...),
+    view: str = Form("front"),
 ):
     ensure_ai_dependencies()
 
-    os.makedirs("temp", exist_ok=True)
-
-    file_path = f"temp/{image.filename}"
-
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(image.file, buffer)
-
- # ---------------------------------------
-# LANDMARK DETECTION
-# ---------------------------------------
-
-    landmarks = detect_landmarks(file_path)
-
-    if not landmarks:
-        return {"error": "No body detected"}
-
-
-    # ---------------------------------------
-    # ADD FRAME TO BUFFER
-    # ---------------------------------------
-
-    frame_buffer.append(landmarks)
-
-    # keep only last MAX_FRAMES frames
-    if len(frame_buffer) > MAX_FRAMES:
-        frame_buffer.pop(0)
-
-
-    # ---------------------------------------
-    # WAIT UNTIL ENOUGH FRAMES
-    # ---------------------------------------
-
-    if len(frame_buffer) < 5:
-        return {
-            "instruction": "Hold Still...",
-            "measurements": None,
-            "landmarks": []
-        }
-
-
-    # ---------------------------------------
-    # LANDMARK AVERAGING
-    # ---------------------------------------
-
-    avg_landmarks = []
-
-    num_landmarks = len(frame_buffer[0])
-
-    for i in range(num_landmarks):
-
-        x_vals = []
-        y_vals = []
-        z_vals = []
-
-        for frame in frame_buffer:
-            x_vals.append(frame[i][0])
-            y_vals.append(frame[i][1])
-            z_vals.append(frame[i][2])
-
-        avg_landmarks.append((
-            sum(x_vals) / len(x_vals),
-            sum(y_vals) / len(y_vals),
-            sum(z_vals) / len(z_vals)
-        ))
-
-
-    # ---------------------------------------
-    # CALCULATE MEASUREMENTS USING SMOOTHED DATA
-    # ---------------------------------------
-
-    measurements = calculate_measurements(
-        avg_landmarks,
-        avg_landmarks,
-        avg_landmarks,
-        height_cm
-    )
-
-    # -----------------------------
-    # BODY POSITION ANALYSIS
-    # -----------------------------
-
-    instruction = "Perfect Position"
-
-    left_shoulder = landmarks[11]
-    right_shoulder = landmarks[12]
-
-    left_hip = landmarks[23]
-    right_hip = landmarks[24]
-
-    # BODY CENTER (horizontal alignment)
-    body_center = (left_shoulder[0] + right_shoulder[0]) / 2
-
-    if body_center < 0.4:
-        instruction = "Move Right"
-
-    elif body_center > 0.6:
-        instruction = "Move Left"
-
-    else:
-
-        # DISTANCE CHECK
-        shoulder_width = measurements["shoulder_width_cm"]
-
-        if shoulder_width < 35:
-            instruction = "Move Closer"
-
-        elif shoulder_width > 60:
-            instruction = "Move Back"
-
-        else:
-
-            # BODY TILT CHECK
-            shoulder_diff = abs(left_shoulder[1] - right_shoulder[1])
-
-            if shoulder_diff > 0.05:
-                instruction = "Stand Straight"
-
-            else:
-                instruction = "Perfect Position"
-
-    # -----------------------------
-    # FORMAT LANDMARKS
-    # -----------------------------
-
-    formatted_landmarks = []
-
-    for x, y, z in avg_landmarks:
-        formatted_landmarks.append({
-            "x": x,
-            "y": y,
-            "z": z
-        })
-
-    print("Measurements:", measurements)
-    print("Instruction:", instruction)
+    image_path = _save_upload_to_temp(image, f"position_{view}")
+    pose_view = _detect_pose_view(image_path)
+    overlay = _format_overlay(pose_view)
+    feedback = _estimate_position_feedback(view.lower(), pose_view)
 
     return {
         "success": True,
-        "measurements": measurements,
-        "landmarks": formatted_landmarks,
-        "instruction": instruction
+        "instruction": feedback["instruction"],
+        "ready_to_capture": feedback["ready_to_capture"],
+        "quality_score": feedback["quality_score"],
+        "landmarks": overlay["landmarks"],
+        "silhouette": overlay["silhouette"],
+        "pose_confidence": overlay["pose_confidence"],
+        "height_cm": height_cm,
+        "view": view.lower(),
     }
 
-# ===================== AI MEASUREMENT ENDPOINT =====================
+
+async def _run_measurement_pipeline(
+    background_tasks: BackgroundTasks,
+    front_image: UploadFile,
+    side_image: UploadFile,
+    back_image: UploadFile,
+    height_cm: float,
+    user: Optional[dict],
+    front_image_2: Optional[UploadFile] = None,
+    front_image_3: Optional[UploadFile] = None,
+    side_image_2: Optional[UploadFile] = None,
+    side_image_3: Optional[UploadFile] = None,
+    back_image_2: Optional[UploadFile] = None,
+    back_image_3: Optional[UploadFile] = None,
+):
+    front_views = _detect_pose_candidates("front", _non_empty_uploads(front_image, front_image_2, front_image_3))
+    side_views = _detect_pose_candidates("side", _non_empty_uploads(side_image, side_image_2, side_image_3))
+    back_views = _detect_pose_candidates("back", _non_empty_uploads(back_image, back_image_2, back_image_3))
+
+    if not front_views or not side_views or not back_views:
+        return {"error": "Please stand straight and ensure full body is visible"}
+
+    measurement_candidates: List[dict] = []
+    last_error: Optional[dict] = None
+    sample_count = max(len(front_views), len(side_views), len(back_views))
+
+    for index in range(sample_count):
+        front_view = front_views[min(index, len(front_views) - 1)]
+        side_view = side_views[min(index, len(side_views) - 1)]
+        back_view = back_views[min(index, len(back_views) - 1)]
+
+        if not front_view.get("landmarks") or not side_view.get("landmarks") or not back_view.get("landmarks"):
+            last_error = {"error": "Please stand straight and ensure full body is visible"}
+            continue
+
+        measurements = calculate_measurements(front_view, side_view, back_view, height_cm)
+        if "error" in measurements:
+            last_error = measurements
+            continue
+
+        measurement_candidates.append(measurements)
+
+    if not measurement_candidates:
+        return last_error or {"error": "Please stand straight and ensure full body is visible"}
+
+    measurements = _aggregate_measurement_candidates(measurement_candidates)
+
+    front_view = front_views[0]
+    side_view = side_views[0]
+    back_view = back_views[0]
+
+    measurements_for_storage = dict(measurements)
+    measurements_for_storage.pop("scan_artifacts", None)
+
+    if user:
+        await save_user_measurements(user["id"], measurements_for_storage)
+        schedule_avatar_generation(background_tasks, user["id"], measurements_for_storage)
+
+    ui_measurements = measurements.get("measurements") or _build_ui_measurements(measurements)
+    confidence = dict(measurements.get("confidence") or {})
+    quality_score = float(measurements.get("quality_score", confidence.get("overall", 0.0)))
+    if "overall" not in confidence:
+        confidence["overall"] = round(quality_score, 3)
+    warnings = list(measurements.get("warnings") or [])
+
+    return {
+        "success": True,
+        "raw_measurements": measurements,
+        "measurements": ui_measurements,
+        "confidence": confidence,
+        "quality_score": round(quality_score, 3),
+        "warnings": warnings,
+        "measurement_details": measurements.get("measurement_details", {}),
+        "legacy_measurements": {
+            **_build_avatar_measurements(measurements),
+            "neck_cm": round(float(measurements.get("neck_cm", 0.0)), 2),
+            "hip_cm": round(float(measurements.get("hip_circumference_cm", measurements.get("hip_width_cm", 0.0))), 2),
+            "torso_depth_cm": round(float(measurements.get("torso_depth_cm", 0.0)), 2),
+        },
+        "quality": {
+            "overall_confidence": round(quality_score, 3),
+            "pixel_to_cm": float(measurements.get("pixel_to_cm", 0.0)),
+        },
+        "sample_count": len(measurement_candidates),
+        "overlays": {
+            "front": _format_overlay(front_view),
+            "side": _format_overlay(side_view),
+            "back": _format_overlay(back_view),
+        },
+    }
+
+
+@app.post("/ai/measure")
+async def measure_body(
+    background_tasks: BackgroundTasks,
+    front_image: UploadFile = File(...),
+    front_image_2: Optional[UploadFile] = File(None),
+    front_image_3: Optional[UploadFile] = File(None),
+    side_image: UploadFile = File(...),
+    side_image_2: Optional[UploadFile] = File(None),
+    side_image_3: Optional[UploadFile] = File(None),
+    back_image: UploadFile = File(...),
+    back_image_2: Optional[UploadFile] = File(None),
+    back_image_3: Optional[UploadFile] = File(None),
+    height_cm: float = Form(...),
+    user=Depends(get_optional_user),
+):
+    ensure_ai_dependencies()
+
+    result = await _run_measurement_pipeline(
+        background_tasks=background_tasks,
+        front_image=front_image,
+        side_image=side_image,
+        back_image=back_image,
+        height_cm=height_cm,
+        user=user,
+        front_image_2=front_image_2,
+        front_image_3=front_image_3,
+        side_image_2=side_image_2,
+        side_image_3=side_image_3,
+        back_image_2=back_image_2,
+        back_image_3=back_image_3,
+    )
+    return result
 
 
 @app.post("/ai/scan-body")
 async def scan_body(
     background_tasks: BackgroundTasks,
     front_image: UploadFile = File(...),
+    front_image_2: Optional[UploadFile] = File(None),
+    front_image_3: Optional[UploadFile] = File(None),
     side_image: UploadFile = File(...),
+    side_image_2: Optional[UploadFile] = File(None),
+    side_image_3: Optional[UploadFile] = File(None),
     back_image: UploadFile = File(...),
+    back_image_2: Optional[UploadFile] = File(None),
+    back_image_3: Optional[UploadFile] = File(None),
     height_cm: float = Form(...),
     user=Depends(get_optional_user),
 ):
+    """Backward-compatible endpoint kept for older mobile clients."""
     ensure_ai_dependencies()
 
-    os.makedirs("temp", exist_ok=True)
-
-    # -------- Save images --------
-
-    front_path = f"temp/front_{front_image.filename}"
-    side_path = f"temp/side_{side_image.filename}"
-    back_path = f"temp/back_{back_image.filename}"
-
-    with open(front_path, "wb") as buffer:
-        shutil.copyfileobj(front_image.file, buffer)
-
-    with open(side_path, "wb") as buffer:
-        shutil.copyfileobj(side_image.file, buffer)
-
-    with open(back_path, "wb") as buffer:
-        shutil.copyfileobj(back_image.file, buffer)
-
-    # -------- Detect landmarks --------
-
-    front_landmarks = detect_landmarks(front_path)
-    side_landmarks = detect_landmarks(side_path)
-    back_landmarks = detect_landmarks(back_path)
-
-    if not front_landmarks or not side_landmarks or not back_landmarks:
-        return {"error": "Body detection failed"}
-
-    # -------- Calculate measurements --------
-
-    measurements = calculate_measurements(
-        front_landmarks,
-        side_landmarks,
-        back_landmarks,
-        height_cm
+    result = await _run_measurement_pipeline(
+        background_tasks=background_tasks,
+        front_image=front_image,
+        side_image=side_image,
+        back_image=back_image,
+        height_cm=height_cm,
+        user=user,
+        front_image_2=front_image_2,
+        front_image_3=front_image_3,
+        side_image_2=side_image_2,
+        side_image_3=side_image_3,
+        back_image_2=back_image_2,
+        back_image_3=back_image_3,
     )
 
-    if user and "error" not in measurements:
-        await save_user_measurements(user["id"], measurements)
-        schedule_avatar_generation(background_tasks, user["id"], measurements)
+    if "error" in result:
+        return result
 
-    # -------- Format landmarks for frontend --------
-
-    formatted_landmarks = []
-
-    for landmark in front_landmarks:
-        x, y = landmark.get("x", 0.0), landmark.get("y", 0.0)
-        z = landmark.get("z", 0.0)
-        formatted_landmarks.append({
-            "x": x,
-            "y": y,
-            "z": z
-        })
-
+    front_overlay = result.get("overlays", {}).get("front", {})
     return {
         "success": True,
-        "measurements": measurements,
-        "landmarks": formatted_landmarks
+        "measurements": result.get("raw_measurements", {}),
+        "confidence": result.get("confidence", {}),
+        "quality_score": result.get("quality_score", 0.0),
+        "warnings": result.get("warnings", []),
+        "landmarks": front_overlay.get("landmarks", []),
+        "silhouette": front_overlay.get("silhouette", []),
+        "measurement_details": result.get("measurement_details", {}),
     }

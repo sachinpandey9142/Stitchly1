@@ -230,3 +230,45 @@ def test_background_fallback_triggers_generation(client, auth_headers, fake_db, 
     assert scheduled == [("customer-1", VALID_MEASUREMENTS)]
     assert fake_db.users.documents[0]["body_measurements"] == VALID_MEASUREMENTS
     assert fake_db.users.documents[0]["avatar_generation_status"] == "none"
+
+
+def test_measure_endpoint_returns_ui_contract(client, monkeypatch):
+    enhanced_measurements = {
+        "shoulder_width_cm": 42.0,
+        "chest_cm": 96.0,
+        "waist_cm": 82.0,
+        "hip_width_cm": 38.0,
+        "hip_circumference_cm": 98.0,
+        "arm_length_cm": 60.0,
+        "leg_length_cm": 92.0,
+        "neck_cm": 36.0,
+        "torso_depth_cm": 22.0,
+        "measurement_details": {
+            "shoulder": {"value": 42.0, "confidence": 0.92},
+            "chest": {"value": 96.0, "confidence": 0.89},
+        },
+        "confidence": {"overall": 0.9},
+        "pixel_to_cm": 0.12,
+    }
+
+    monkeypatch.setattr(server, "ensure_ai_dependencies", lambda: None, raising=False)
+    monkeypatch.setattr(server, "detect_landmarks", lambda path: _fake_landmarks(), raising=False)
+    monkeypatch.setattr(server, "detect_pose", None, raising=False)
+    monkeypatch.setattr(server, "calculate_measurements", lambda *args, **kwargs: enhanced_measurements, raising=False)
+
+    response = client.post(
+        "/ai/measure",
+        files={
+            "front_image": ("front.jpg", b"front", "image/jpeg"),
+            "side_image": ("side.jpg", b"side", "image/jpeg"),
+            "back_image": ("back.jpg", b"back", "image/jpeg"),
+        },
+        data={"height_cm": "170"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["measurements"]["shoulder"] == 42.0
+    assert payload["measurements"]["chest"] == 96.0
+    assert payload["measurements"]["hip"] == 98.0
+    assert payload["legacy_measurements"]["hip_width_cm"] == 38.0

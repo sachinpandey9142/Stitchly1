@@ -22,3 +22,15 @@ allprojects {
 
 apply plugin: "expo-root-project"
 apply plugin: "com.facebook.react.rootproject"
+
+// Work around Gradle snapshotting failures on Windows when native outputs are hardlinks.
+if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+  gradle.taskGraph.whenReady { graph ->
+    graph.allTasks.each { task ->
+      def taskName = task.name.toLowerCase()
+      if (taskName.contains("cmake") || taskName.contains("native")) {
+        task.doNotTrackState("Native outputs may be hardlinks on Windows and are not always regular files.")
+      }
+    }
+  }
+}

@@ -25,6 +25,7 @@ export type User = {
   weight?: string;
   gender?: 'male' | 'female';
   bodyType?: 'slim' | 'fit' | 'bulk';
+  body_measurements?: Record<string, number>;
 };
 
 type RegisterData = {
@@ -42,6 +43,7 @@ type RegisterData = {
   weight?: string;
   gender?: 'male' | 'female';
   bodyType?: 'slim' | 'fit' | 'bulk';
+  body_measurements?: Record<string, number>;
 };
 
 type AuthContextType = {
@@ -95,6 +97,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       weight: registerData.weight,
       gender: registerData.gender,
       bodyType: registerData.bodyType,
+      body_measurements: registerData.body_measurements,
     };
 
     await AsyncStorage.setItem('auth_token', data.token);

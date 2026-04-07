@@ -8,7 +8,7 @@ import { useAuth } from '../../../src/context/AuthContext';
 import { Colors, Fonts, Spacing, Radius } from '../../../src/utils/theme';
 import { designCatalog } from "../../../src/data/designCatalog";
 import { Image } from "react-native";
-
+import { ScrollView } from "react-native";
 
 const designImages: any = {
   lehenga: {
@@ -45,9 +45,9 @@ export default function CustomerHome() {
   const [cities, setCities] = useState<string[]>([]);
   const [showCityPicker, setShowCityPicker] = useState(false);
   const [selectedDesign, setSelectedDesign] = useState<string | null>(null);
-  const [activeCategory, setActiveCategory] =
-  useState<keyof typeof designCatalog.women>("lehenga");
-  const [searchDesign, setSearchDesign] = useState("");
+  // const [activeCategory, setActiveCategory] =
+  // useState<keyof typeof designCatalog.women>("lehenga");
+  // const [searchDesign, setSearchDesign] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -63,7 +63,8 @@ export default function CustomerHome() {
   const fetchTailors = useCallback(async () => {
     try {
       let endpoint = '/tailors?';
-      const specialty = selectedDesign || selectedSpecialty;
+      const specialty =
+        selectedDesign?.split(" ")[0] || selectedSpecialty;
 
       if (specialty !== 'All') {
       endpoint += `specialty=${encodeURIComponent(specialty)}&`;
@@ -83,6 +84,11 @@ export default function CustomerHome() {
   useEffect(() => { setLoading(true); fetchTailors(); }, [fetchTailors]);
 
   const onRefresh = () => { setRefreshing(true); fetchTailors(); };
+
+  const selectedKey =
+  selectedSpecialty === "All"
+    ? null
+    : selectedSpecialty.toLowerCase() as keyof typeof designCatalog.women;
 
   const renderTailor = ({ item }: { item: any }) => (
     <TouchableOpacity testID={`tailor-card-${item.id}`} style={styles.card} activeOpacity={0.7} onPress={() => router.push(`/tailor/${item.id}`)}>
@@ -120,7 +126,8 @@ export default function CustomerHome() {
   );
 
   return (
-    <SafeAreaView style={styles.container} edges={['top']}>
+   <SafeAreaView style={{ flex: 1 }} edges={['top']}>
+  <ScrollView showsVerticalScrollIndicator={false}>
       <View style={styles.headerSection}>
         <View>
           <Text style={styles.greeting}>Hello, {user?.name?.split(' ')[0]}</Text>
@@ -212,34 +219,55 @@ export default function CustomerHome() {
           </TouchableOpacity>
         )}
       />
-  <View style={styles.designCarousel}>
+<FlatList
+  horizontal
+  data={
+    (selectedSpecialty === "All"
+      ? Object.values(designCatalog.women).flat()
+      : designCatalog.women[selectedKey!] || []
+    ).filter((design) =>
+      design.toLowerCase().includes(search.toLowerCase())
+    )
+  }
+  keyExtractor={(item, index) => item + index}
+  showsHorizontalScrollIndicator={false}
+  contentContainerStyle={styles.designCarousel}
+  renderItem={({ item: design, index }) => {
 
-{selectedSpecialty !== "All" && designCatalog.women[selectedSpecialty?.toLowerCase()]?.map((design) => (
-  
-  <TouchableOpacity
-    key={design}
-    style={styles.designCardNew}
-    onPress={() => setSelectedDesign(design)}
-  >
+    const category =
+      selectedSpecialty === "All"
+        ? (Object.keys(designCatalog.women).find(cat =>
+            designCatalog.women[cat as keyof typeof designCatalog.women].includes(design)
+          ) as keyof typeof designCatalog.women)
+        : selectedKey!;
 
-    {designImages[selectedSpecialty.toLowerCase()]?.[design] ? (
-      <Image
-        source={designImages[selectedSpecialty.toLowerCase()][design]}
-        style={styles.designCardImageNew}
-      />
-    ) : (
-      <View style={styles.designCardPlaceholderNew} />
-    )}
+    return (
+      <TouchableOpacity
+        style={[
+          styles.designCardNew,
+          selectedDesign === design && styles.designCardActive
+        ]}
+        onPress={() => setSelectedDesign(design)}
+        activeOpacity={0.8}
+      >
 
-    <Text style={styles.designCardTextNew}>
-      {design}
-    </Text>
+        {designImages[category]?.[design] ? (
+          <Image
+            source={designImages[category][design]}
+            style={styles.designCardImageNew}
+          />
+        ) : (
+          <View style={styles.designCardPlaceholderNew} />
+        )}
 
-  </TouchableOpacity>
+        <Text style={styles.designCardTextNew}>
+          {design}
+        </Text>
 
-))}
-
-</View>
+      </TouchableOpacity>
+    );
+  }}
+/>
 
       {loading ? (
         <View style={styles.loader}><ActivityIndicator size="large" color={Colors.primary} /></View>
@@ -265,6 +293,7 @@ export default function CustomerHome() {
           }
         />
       )}
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -299,11 +328,8 @@ const styles = StyleSheet.create({
   },
   searchInput: { flex: 1, fontFamily: Fonts.ui, fontSize: 16, color: Colors.text, marginLeft: 12 },
   filterList: { paddingHorizontal: Spacing.containerPadding, paddingVertical: 14, gap: 8 },
-  filterChip: {
-    paddingHorizontal: 16, paddingVertical: 8, borderRadius: Radius.full,
-    backgroundColor: Colors.surface, borderWidth: 1, borderColor: Colors.border,
-  },
-  filterChipActive: { backgroundColor: Colors.primary, borderColor: Colors.primary },
+ 
+  
   filterText: { fontFamily: Fonts.body, fontSize: 14, color: Colors.textMuted },
   filterTextActive: { color: Colors.textInverted },
   list: { paddingHorizontal: Spacing.containerPadding, paddingBottom: 20 },
@@ -369,14 +395,6 @@ designRow:{
   flexWrap:"wrap",
   gap:8
 },
-
-
-
-designCardActive:{
-  backgroundColor:Colors.primary,
-  borderColor:Colors.primary
-},
-
 designText:{
   fontFamily:Fonts.body,
   fontSize:13,
@@ -456,9 +474,9 @@ designImage:{
   height:120
 },
 designCarousel:{
-  flexDirection:"row",
   paddingHorizontal:Spacing.containerPadding,
-  marginTop:10
+  marginTop:10,
+  gap:12   // 🔥 spacing between cards (nice UI)
 },
 
 designCard:{
@@ -497,7 +515,8 @@ designCardNew:{
   shadowColor:"#000",
   shadowOpacity:0.08,
   shadowRadius:6,
-  elevation:3
+  elevation:3,
+  opacity:0.6
 },
 
 designCardImageNew:{
@@ -519,4 +538,25 @@ designCardTextNew:{
   fontFamily:Fonts.body,
   textAlign:"center"
 },
+filterChipActive: {
+  backgroundColor: Colors.primary,
+  borderColor: Colors.primary,
+},
+filterChip:{
+  paddingHorizontal: 16,
+  paddingVertical: 8,
+  borderRadius: Radius.full,
+  backgroundColor: Colors.surface,
+  borderWidth: 1,
+  borderColor: Colors.border,
+  minWidth: 80,          // 🔥 FIX WIDTH STABLE
+  alignItems: "center"
+},
+designCardActive: {
+  transform: [{ scale: 1.08 }],
+  borderColor: Colors.primary,
+  borderWidth: 2,
+  opacity: 1   // 🔥 IMPORTANT
+},
+
 });

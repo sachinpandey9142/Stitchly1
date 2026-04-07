@@ -1,4 +1,5 @@
 import copy
+import inspect
 import math
 import os
 import re
@@ -7,8 +8,19 @@ import types
 from pathlib import Path
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 from jose import jwt
+
+
+if "app" not in inspect.signature(httpx.Client.__init__).parameters:
+    _original_httpx_client_init = httpx.Client.__init__
+
+    def _compat_httpx_client_init(self, *args, **kwargs):
+        kwargs.pop("app", None)
+        return _original_httpx_client_init(self, *args, **kwargs)
+
+    httpx.Client.__init__ = _compat_httpx_client_init
 
 
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
@@ -25,7 +37,12 @@ if str(BACKEND_DIR) not in sys.path:
 
 def _install_ai_stubs():
     sys.modules.setdefault("cv2", types.ModuleType("cv2"))
-    sys.modules.setdefault("numpy", types.ModuleType("numpy"))
+    try:
+        import numpy as numpy_module
+    except Exception:
+        numpy_module = types.ModuleType("numpy")
+        numpy_module.ndarray = object
+    sys.modules.setdefault("numpy", numpy_module)
 
     ai_module = sys.modules.setdefault("ai", types.ModuleType("ai"))
     ai_module.__path__ = [str(BACKEND_DIR / "ai")]
@@ -50,6 +67,18 @@ def _install_ai_stubs():
 _install_ai_stubs()
 
 import server  # noqa: E402
+
+
+def _test_hash_password(password: str) -> str:
+    return f"test-hash::{password}"
+
+
+def _test_verify_password(plain_password: str, hashed_password: str) -> bool:
+    return hashed_password == _test_hash_password(plain_password)
+
+
+server.hash_password = _test_hash_password
+server.verify_password = _test_verify_password
 
 
 class FakeResult:
@@ -483,7 +512,8 @@ def client(fake_db, monkeypatch):
     monkeypatch.setattr(server, "db", fake_db, raising=False)
     monkeypatch.setattr(server, "client", FakeMotorClient(), raising=False)
     monkeypatch.setattr(server, "razorpay_client", FakeRazorpayClient(), raising=False)
-    server.frame_buffer.clear()
+    if hasattr(server, "frame_buffer"):
+        server.frame_buffer.clear()
     with TestClient(server.app) as test_client:
         yield test_client
 

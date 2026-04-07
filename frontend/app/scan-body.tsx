@@ -1,28 +1,111 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-  View,
-  Text,
+  ActivityIndicator,
+  Animated,
+  Dimensions,
+  Easing,
   Pressable,
   StyleSheet,
-  ActivityIndicator,
+  Text,
   TextInput,
-  Dimensions,
+  View,
 } from "react-native";
-
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Camera, useCameraDevice } from "react-native-vision-camera";
 import { useRouter } from "expo-router";
-import Svg, { Circle, Line } from "react-native-svg";
+import Svg, { Circle, Line, Path as SvgPath } from "react-native-svg";
 
-const { height, width } = Dimensions.get("window");
+import { Colors, Fonts, Radius, Spacing } from "../src/utils/theme";
 
 const BACKEND =
-  process.env.EXPO_PUBLIC_BACKEND_URL || "http://10.228.33.15:8000";
+  process.env.EXPO_PUBLIC_BACKEND_URL || "http://10.136.221.15:8000";
+const SCAN_RESULT_STORAGE_KEY = "stitchly_latest_scan_measurements";
 
-/* ============================= */
-/* Skeleton connections          */
-/* ============================= */
+const { width: screenWidth, height: screenHeight } = Dimensions.get("window");
 
-const connections = [
+type CaptureStep = "front" | "side" | "back";
+
+type Landmark = {
+  x: number;
+  y: number;
+  z?: number;
+  visibility?: number;
+};
+
+type SilhouettePoint = {
+  x: number;
+  y: number;
+};
+
+type OverlayState = {
+  landmarks: Landmark[];
+  silhouette: SilhouettePoint[];
+  instruction: string;
+  readyToCapture: boolean;
+  qualityScore: number;
+};
+
+type MeasurementKey = "shoulder" | "chest" | "waist" | "hip" | "arm" | "leg" | "neck";
+
+type MeasurementSet = {
+  shoulder: number;
+  chest: number;
+  waist: number;
+  hip: number;
+  arm: number;
+  leg: number;
+  neck: number;
+};
+
+type ScanResult = {
+  measurements: MeasurementSet;
+  measurement_details?: Record<
+    string,
+    {
+      value: number;
+      confidence: number;
+      method?: string;
+      landmark_confidence?: number;
+      silhouette_clarity?: number;
+      posture_score?: number;
+    }
+  >;
+  legacy_measurements?: Record<string, number>;
+  quality?: { overall_confidence?: number; pixel_to_cm?: number };
+  confidence?: Record<string, number>;
+  quality_score?: number;
+  warnings?: string[];
+};
+
+const MEASUREMENT_FIELDS: Array<{ key: MeasurementKey; label: string }> = [
+  { key: "shoulder", label: "Shoulder" },
+  { key: "chest", label: "Chest" },
+  { key: "waist", label: "Waist" },
+  { key: "hip", label: "Hip" },
+  { key: "arm", label: "Arm" },
+  { key: "leg", label: "Leg" },
+  { key: "neck", label: "Neck" },
+];
+
+const CAPTURE_STEPS: Array<{ key: CaptureStep; title: string; hint: string }> = [
+  {
+    key: "front",
+    title: "Step 1/3: Front",
+    hint: "Face camera, stand straight, keep full body visible.",
+  },
+  {
+    key: "side",
+    title: "Step 2/3: Side",
+    hint: "Turn 90° sideways with your full body visible.",
+  },
+  {
+    key: "back",
+    title: "Step 3/3: Back",
+    hint: "Turn your back to camera, keep shoulders level.",
+  },
+];
+
+const SKELETON_CONNECTIONS: Array<[number, number]> = [
   [11, 12],
   [11, 13],
   [13, 15],
@@ -37,491 +120,766 @@ const connections = [
   [26, 28],
 ];
 
-/* ============================= */
-/* Component                     */
-/* ============================= */
-
 export default function ScanBody() {
-  const device = useCameraDevice("back");
-  const camera = useRef<Camera>(null);
   const router = useRouter();
-
-  const [permission, setPermission] = useState(false);
-
-  const [heightCm, setHeightCm] = useState("");
-  const [startScan, setStartScan] = useState(false);
-
-  const [step, setStep] = useState<
-    "front" | "side" | "back" | "processing" | "done"
-  >("front");
-
-  const [frontImage, setFrontImage] = useState<string | null>(null);
-  const [sideImage, setSideImage] = useState<string | null>(null);
-
-  const [landmarks, setLandmarks] = useState<any[]>([]);
-  const [measurements, setMeasurements] = useState<any>(null);
-
-  const [stableFrames, setStableFrames] = useState(0);
-  const [shoulderHistory, setShoulderHistory] = useState<number[]>([]);
-  const [countdown, setCountdown] = useState<number | null>(null);
-
-  const [positionMessage, setPositionMessage] = useState(
-    "Align your body inside the outline"
-  );
-
+  const cameraRef = useRef<Camera>(null);
   const checkingRef = useRef(false);
 
-  /* ============================= */
-  /* Camera Permission             */
-  /* ============================= */
+  const device = useCameraDevice("back");
+
+  const [hasPermission, setHasPermission] = useState(false);
+  const [heightCm, setHeightCm] = useState("");
+  const [phase, setPhase] = useState<"height" | "capture" | "processing" | "done">("height");
+  const [stepIndex, setStepIndex] = useState(0);
+  const [stabilityFrames, setStabilityFrames] = useState(0);
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [result, setResult] = useState<ScanResult | null>(null);
+  const [editableInputs, setEditableInputs] = useState<Record<MeasurementKey, string> | null>(null);
+
+  const [captures, setCaptures] = useState<Partial<Record<CaptureStep, string[]>>>({});
+  const [overlay, setOverlay] = useState<OverlayState>({
+    landmarks: [],
+    silhouette: [],
+    instruction: "Align your body in frame",
+    readyToCapture: false,
+    qualityScore: 0,
+  });
+
+  const progressAnim = useRef(new Animated.Value(0)).current;
+  const pulseAnim = useRef(new Animated.Value(0)).current;
+
+  const currentStep = CAPTURE_STEPS[stepIndex];
 
   useEffect(() => {
-    const init = async () => {
+    const requestPermission = async () => {
       const status = await Camera.getCameraPermissionStatus();
-
       if (status === "granted") {
-        setPermission(true);
+        setHasPermission(true);
         return;
       }
-
-      const newStatus = await Camera.requestCameraPermission();
-      setPermission(newStatus === "granted");
+      const requested = await Camera.requestCameraPermission();
+      setHasPermission(requested === "granted");
     };
 
-    init();
+    requestPermission();
   }, []);
 
-  /* ============================= */
-  /* Position Loop                 */
-  /* ============================= */
+  useEffect(() => {
+    Animated.timing(progressAnim, {
+      toValue: (stepIndex + 1) / CAPTURE_STEPS.length,
+      duration: 240,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: false,
+    }).start();
+  }, [stepIndex, progressAnim]);
 
   useEffect(() => {
-    if (!startScan) return;
-    if (step === "processing" || step === "done") return;
+    if (phase !== "capture") return;
 
-    const interval = setInterval(checkBodyPosition, 900);
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, {
+          toValue: 1,
+          duration: 680,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.timing(pulseAnim, {
+          toValue: 0,
+          duration: 680,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+      ])
+    );
+
+    loop.start();
+    return () => loop.stop();
+  }, [phase, pulseAnim]);
+
+  useEffect(() => {
+    if (phase !== "capture") return;
+    if (countdown !== null) return;
+
+    const interval = setInterval(() => {
+      void checkPosition();
+    }, 1600);
 
     return () => clearInterval(interval);
-  }, [startScan, step, stableFrames, countdown]);
+  }, [phase, countdown, stepIndex, heightCm, stabilityFrames]);
 
-  /* ============================= */
-  /* Position Check                */
-  /* ============================= */
+  const silhouettePath = useMemo(() => {
+    if (!overlay.silhouette || overlay.silhouette.length < 3) return "";
 
-  const checkBodyPosition = async () => {
-    if (!camera.current) return;
+    let path = "";
+    overlay.silhouette.forEach((point, index) => {
+      const x = point.x * screenWidth;
+      const y = point.y * screenHeight;
+      path += `${index === 0 ? "M" : "L"} ${x} ${y} `;
+    });
+    return `${path} Z`;
+  }, [overlay.silhouette]);
+
+  const checkPosition = async () => {
+    if (!cameraRef.current) return;
     if (checkingRef.current) return;
-    if (countdown !== null) return;
+    if (!currentStep) return;
 
     checkingRef.current = true;
 
     try {
-      const photo = await camera.current.takePhoto({
-        qualityPrioritization: "speed",
+      const photo = await cameraRef.current.takePhoto({
+        enableShutterSound: false,
       });
 
-      const imagePath = "file://" + photo.path;
-
       const formData = new FormData();
-
       formData.append(
         "image",
         {
-          uri: imagePath,
-          name: "frame.jpg",
+          uri: `file://${photo.path}`,
+          name: `${currentStep.key}_frame.jpg`,
           type: "image/jpeg",
         } as any
       );
-
       formData.append("height_cm", heightCm);
+      formData.append("view", currentStep.key);
 
-      const res = await fetch(`${BACKEND}/ai/check-position`, {
+      const response = await fetch(`${BACKEND}/ai/check-position`, {
         method: "POST",
         body: formData,
       });
+      const data = await response.json();
 
-      const data = await res.json();
-
-      setLandmarks(data.landmarks || []);
-
-      if (!data.landmarks || data.landmarks.length < 28) {
-        setPositionMessage("Move into frame");
-        setStableFrames(0);
+      if (!response.ok || data?.error) {
+        setErrorMessage(data?.error || "Unable to detect body");
+        setStabilityFrames(0);
         return;
       }
 
-      const head = data.landmarks[0];
-      const ankle = data.landmarks[27];
+      setErrorMessage(null);
+      setOverlay({
+        landmarks: data.landmarks || [],
+        silhouette: data.silhouette || [],
+        instruction: data.instruction || "Adjust position",
+        readyToCapture: Boolean(data.ready_to_capture),
+        qualityScore: Number(data.quality_score || 0),
+      });
 
-      const bodyHeight = Math.abs(head.y - ankle.y);
-
-      if (bodyHeight < 0.45) {
-        setPositionMessage("Step back - full body required");
-        setStableFrames(0);
-        return;
+      if (data.ready_to_capture) {
+        const nextStable = stabilityFrames + 1;
+        setStabilityFrames(nextStable);
+        if (nextStable >= 2) {
+          startCountdown();
+        }
+      } else {
+        setStabilityFrames(0);
       }
-
-      const shoulderRaw = data.measurements?.shoulder_width_cm || 0;
-
-      const history = [...shoulderHistory, shoulderRaw].slice(-5);
-      setShoulderHistory(history);
-
-      const shoulder =
-        history.reduce((a, b) => a + b, 0) / history.length;
-
-      if (shoulder < 30) {
-        setPositionMessage("Move closer");
-        setStableFrames(0);
-        return;
-      }
-
-      if (shoulder > 60) {
-        setPositionMessage("Move back");
-        setStableFrames(0);
-        return;
-      }
-
-      if (data.instruction) {
-        setPositionMessage(data.instruction);
-        setStableFrames(0);
-        return;
-      }
-
-      setPositionMessage("Perfect Position");
-
-      const frames = stableFrames + 1;
-      setStableFrames(frames);
-
-      if (frames >= 2) startCountdown();
-    } catch (err) {
-      console.log("Position error", err);
+    } catch (error) {
+      setErrorMessage("Camera check failed. Try again.");
+      setStabilityFrames(0);
+    } finally {
+      checkingRef.current = false;
     }
-
-    checkingRef.current = false;
   };
-
-  /* ============================= */
-  /* Countdown                     */
-  /* ============================= */
 
   const startCountdown = () => {
     if (countdown !== null) return;
 
     setCountdown(3);
-
     const timer = setInterval(() => {
-      setCountdown((prev) => {
-        if (!prev) return null;
-
-        if (prev === 1) {
+      setCountdown((previous) => {
+        if (previous === null) return null;
+        if (previous <= 1) {
           clearInterval(timer);
-          takePicture();
-          setStableFrames(0);
+          void captureCurrentStep();
           return null;
         }
-
-        return prev - 1;
+        return previous - 1;
       });
     }, 1000);
   };
 
-  /* ============================= */
-  /* Capture                       */
-  /* ============================= */
-
-  const takePicture = async () => {
-    if (!camera.current) return;
+  const captureCurrentStep = async () => {
+    if (!cameraRef.current || !currentStep) return;
 
     try {
-      const photo = await camera.current.takePhoto();
-      const uri = "file://" + photo.path;
-
-      if (step === "front") {
-        setFrontImage(uri);
-        setStep("side");
-      } else if (step === "side") {
-        setSideImage(uri);
-        setStep("back");
-      } else if (step === "back") {
-        setStep("processing");
-        sendToBackend(frontImage, sideImage, uri);
+      const burstUris: string[] = [];
+      for (let index = 0; index < 3; index += 1) {
+        const photo = await cameraRef.current.takePhoto({ enableShutterSound: false });
+        burstUris.push(`file://${photo.path}`);
       }
-    } catch (err) {
-      console.log("capture error", err);
+
+      const nextCaptures = {
+        ...captures,
+        [currentStep.key]: burstUris,
+      };
+      setCaptures(nextCaptures);
+      setStabilityFrames(0);
+
+      if (currentStep.key !== "back") {
+        setStepIndex((prev) => prev + 1);
+        setOverlay({
+          landmarks: [],
+          silhouette: [],
+          instruction: "Reposition for next view",
+          readyToCapture: false,
+          qualityScore: 0,
+        });
+        return;
+      }
+
+      setPhase("processing");
+      await sendForMeasurement(nextCaptures);
+    } catch (error) {
+      setErrorMessage("Unable to capture image. Try again.");
     }
   };
 
-  /* ============================= */
-  /* Backend                       */
-  /* ============================= */
-
-  const sendToBackend = async (
-    front: string | null,
-    side: string | null,
-    back: string | null
-  ) => {
-    if (!front || !side || !back) return;
+  const sendForMeasurement = async (captured: Partial<Record<CaptureStep, string[]>>) => {
+    if (!captured.front?.length || !captured.side?.length || !captured.back?.length) {
+      setErrorMessage("Missing one or more captures. Please rescan.");
+      setPhase("capture");
+      return;
+    }
 
     const formData = new FormData();
 
-    formData.append("front_image", {
-      uri: front,
-      name: "front.jpg",
-      type: "image/jpeg",
-    } as any);
+    const appendBurst = (baseName: string, uris: string[]) => {
+      const fieldNames = [baseName, `${baseName}_2`, `${baseName}_3`];
+      uris.slice(0, 3).forEach((uri, index) => {
+        formData.append(
+          fieldNames[index],
+          {
+            uri,
+            name: `${baseName}_${index + 1}.jpg`,
+            type: "image/jpeg",
+          } as any
+        );
+      });
+    };
 
-    formData.append("side_image", {
-      uri: side,
-      name: "side.jpg",
-      type: "image/jpeg",
-    } as any);
-
-    formData.append("back_image", {
-      uri: back,
-      name: "back.jpg",
-      type: "image/jpeg",
-    } as any);
-
+    appendBurst("front_image", captured.front);
+    appendBurst("side_image", captured.side);
+    appendBurst("back_image", captured.back);
     formData.append("height_cm", heightCm);
 
     try {
-      const res = await fetch(`${BACKEND}/ai/scan-body`, {
+      const response = await fetch(`${BACKEND}/ai/measure`, {
         method: "POST",
         body: formData,
       });
+      const data = await response.json();
 
-      const data = await res.json();
+      if (!response.ok || data?.error) {
+        setErrorMessage(data?.error || "Body measurement failed. Please rescan.");
+        setPhase("capture");
+        return;
+      }
 
-      setMeasurements(data.measurements);
-      setStep("done");
-    } catch (err) {
-      console.log("AI error", err);
+      const scanResult: ScanResult = {
+        measurements: data.measurements,
+        measurement_details: data.measurement_details,
+        legacy_measurements: data.legacy_measurements,
+        quality: data.quality,
+        confidence: data.confidence,
+        quality_score: data.quality_score,
+        warnings: data.warnings || [],
+      };
+
+      const defaultInputs = MEASUREMENT_FIELDS.reduce((acc, field) => {
+        acc[field.key] = String(scanResult.measurements[field.key] ?? "");
+        return acc;
+      }, {} as Record<MeasurementKey, string>);
+      setEditableInputs(defaultInputs);
+
+      setResult(scanResult);
+      setErrorMessage(null);
+      setPhase("done");
+    } catch (error) {
+      setErrorMessage("Network error while measuring. Please try again.");
+      setPhase("capture");
     }
   };
 
-  /* ============================= */
-  /* UI                            */
-  /* ============================= */
+  const resetScan = () => {
+    setPhase("capture");
+    setStepIndex(0);
+    setCaptures({});
+    setResult(null);
+    setEditableInputs(null);
+    setErrorMessage(null);
+    setCountdown(null);
+    setStabilityFrames(0);
+    setOverlay({
+      landmarks: [],
+      silhouette: [],
+      instruction: "Align your body in frame",
+      readyToCapture: false,
+      qualityScore: 0,
+    });
+  };
 
-  if (!permission)
-    return (
-      <View style={styles.center}>
-        <Text>Camera permission required</Text>
-      </View>
+  const onEditMeasurement = (key: MeasurementKey, value: string) => {
+    setEditableInputs((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        [key]: value,
+      };
+    });
+  };
+
+  const persistEditedMeasurements = async () => {
+    if (!result || !editableInputs) {
+      router.back();
+      return;
+    }
+
+    const updatedMeasurements = MEASUREMENT_FIELDS.reduce((acc, field) => {
+      const parsed = Number(editableInputs[field.key]);
+      const fallbackValue = Number(result.measurements[field.key] || 0);
+      const value = Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackValue;
+      acc[field.key] = Number(value.toFixed(2));
+      return acc;
+    }, {} as MeasurementSet);
+
+    const overallConfidence =
+      result.quality?.overall_confidence ?? result.quality_score ?? result.confidence?.overall ?? 0;
+
+    await AsyncStorage.setItem(
+      SCAN_RESULT_STORAGE_KEY,
+      JSON.stringify({
+        height_cm: Number(heightCm),
+        measurements: updatedMeasurements,
+        measurement_details: result.measurement_details,
+        legacy_measurements: result.legacy_measurements,
+        quality: {
+          ...(result.quality || {}),
+          overall_confidence: Number(overallConfidence),
+        },
+        confidence: result.confidence,
+        quality_score: result.quality_score,
+        warnings: result.warnings || [],
+      })
     );
 
-  return (
-    <View style={styles.container}>
-      {!startScan ? (
-        <View style={styles.heightContainer}>
-          <Text style={styles.heightTitle}>Enter Your Height</Text>
+    router.back();
+  };
+
+  if (!hasPermission) {
+    return (
+      <View style={styles.centered}>
+        <Text style={styles.permissionText}>Camera permission is required for body scan.</Text>
+      </View>
+    );
+  }
+
+  if (phase === "height") {
+    return (
+      <View style={styles.heightScreen}>
+        <View style={styles.heightCard}>
+          <Text style={styles.heightTitle}>Enter Your Height (cm)</Text>
+          <Text style={styles.heightSubtext}>Height calibrates all body measurements accurately.</Text>
 
           <TextInput
             style={styles.heightInput}
             value={heightCm}
             keyboardType="numeric"
-            placeholder="Height in cm"
+            placeholder="e.g. 172"
+            placeholderTextColor={Colors.textMuted}
             onChangeText={setHeightCm}
           />
 
           <Pressable
-            style={styles.startButton}
+            style={styles.primaryButton}
             onPress={() => {
-              if (!heightCm) {
-                alert("Enter your height");
+              const parsed = Number(heightCm);
+              if (!parsed || parsed < 120 || parsed > 230) {
+                setErrorMessage("Enter a valid height between 120 and 230 cm.");
                 return;
               }
-              setStartScan(true);
+              setErrorMessage(null);
+              setPhase("capture");
+              setStepIndex(0);
             }}
           >
-            <Text style={{ color: "white" }}>Start Scan</Text>
+            <Text style={styles.primaryButtonText}>Continue to Guided Scan</Text>
           </Pressable>
+
+          {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
         </View>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.container}>
+      {device ? (
+        <Camera
+          ref={cameraRef}
+          style={StyleSheet.absoluteFill}
+          device={device}
+          isActive={phase !== "done"}
+          photo
+          enableZoomGesture
+        />
       ) : (
-        <>
-          {device && (
-            <Camera
-              ref={camera}
-              style={StyleSheet.absoluteFill}
-              device={device}
-              isActive
-              photo
-              fps={30}
-            />
-          )}
-
-          {/* Skeleton Overlay */}
-
-          <Svg style={StyleSheet.absoluteFill}>
-            {connections.map(([a, b], i) => {
-              const p1 = landmarks[a];
-              const p2 = landmarks[b];
-
-              if (!p1 || !p2) return null;
-
-              return (
-                <Line
-                  key={i}
-                  x1={`${p1.x * 100}%`}
-                  y1={`${p1.y * 100}%`}
-                  x2={`${p2.x * 100}%`}
-                  y2={`${p2.y * 100}%`}
-                  stroke="lime"
-                  strokeWidth="2"
-                />
-              );
-            })}
-
-            {landmarks.map((p, i) => (
-              <Circle
-                key={i}
-                cx={`${p.x * 100}%`}
-                cy={`${p.y * 100}%`}
-                r="4"
-                fill="lime"
-              />
-            ))}
-          </Svg>
-
-          {/* Overlay UI */}
-
-          <View style={styles.overlay}>
-            <Text style={styles.stepTitle}>
-              {step === "front" && "Front Scan"}
-              {step === "side" && "Turn Side"}
-              {step === "back" && "Turn Back"}
-            </Text>
-
-            <Text style={styles.instructions}>
-              {positionMessage}
-            </Text>
-
-            {countdown !== null && (
-              <Text style={styles.countdown}>{countdown}</Text>
-            )}
-
-            {step === "processing" && (
-              <>
-                <ActivityIndicator size="large" color="white" />
-                <Text style={styles.instructions}>
-                  Processing body scan...
-                </Text>
-              </>
-            )}
-
-            {step === "done" && measurements && (
-              <View style={styles.resultBox}>
-                <Text style={styles.resultTitle}>Measurements</Text>
-
-                <Text style={styles.resultText}>
-                  Shoulder: {measurements.shoulder_width_cm} cm
-                </Text>
-
-                <Text style={styles.resultText}>
-                  Hip: {measurements.hip_width_cm} cm
-                </Text>
-
-                <Pressable
-                  style={styles.doneButton}
-                  onPress={() => router.back()}
-                >
-                  <Text style={{ color: "white" }}>
-                    Use Measurements
-                  </Text>
-                </Pressable>
-              </View>
-            )}
-          </View>
-        </>
+        <View style={styles.centered}>
+          <Text style={styles.permissionText}>No camera device found.</Text>
+        </View>
       )}
+
+      <Svg style={StyleSheet.absoluteFill}>
+        {silhouettePath ? (
+          <SvgPath
+            d={silhouettePath}
+            fill="rgba(20, 184, 166, 0.16)"
+            stroke="rgba(20, 184, 166, 0.92)"
+            strokeWidth={2}
+          />
+        ) : null}
+
+        {SKELETON_CONNECTIONS.map(([from, to], index) => {
+          const first = overlay.landmarks[from];
+          const second = overlay.landmarks[to];
+          if (!first || !second) return null;
+          return (
+            <Line
+              key={`${from}-${to}-${index}`}
+              x1={String(first.x * screenWidth)}
+              y1={String(first.y * screenHeight)}
+              x2={String(second.x * screenWidth)}
+              y2={String(second.y * screenHeight)}
+              stroke="rgba(252, 211, 77, 0.95)"
+              strokeWidth={2.2}
+            />
+          );
+        })}
+
+        {overlay.landmarks.map((point, index) => (
+          <Circle
+            key={`point-${index}`}
+            cx={String(point.x * screenWidth)}
+            cy={String(point.y * screenHeight)}
+            r={2.8}
+            fill="rgba(255,255,255,0.9)"
+          />
+        ))}
+      </Svg>
+
+      <View style={styles.topHUD}>
+        <View style={styles.progressCard}>
+          <Text style={styles.stepText}>{currentStep?.title || "Preparing scan"}</Text>
+          <Text style={styles.hintText}>{currentStep?.hint || ""}</Text>
+          <View style={styles.progressTrack}>
+            <Animated.View
+              style={[
+                styles.progressFill,
+                {
+                  width: progressAnim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: ["0%", "100%"],
+                  }),
+                },
+              ]}
+            />
+          </View>
+        </View>
+      </View>
+
+      <View style={styles.bottomHUD}>
+        {phase === "processing" ? (
+          <View style={styles.statusCard}>
+            <ActivityIndicator color={Colors.textInverted} />
+            <Text style={styles.statusText}>Processing 3-view body measurements...</Text>
+          </View>
+        ) : null}
+
+        {phase === "capture" ? (
+          <Animated.View
+            style={[
+              styles.statusCard,
+              {
+                transform: [
+                  {
+                    scale: pulseAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [1, 1.03],
+                    }),
+                  },
+                ],
+              },
+            ]}
+          >
+            <Text style={styles.statusText}>{overlay.instruction}</Text>
+            <Text style={styles.qualityText}>Quality {(overlay.qualityScore * 100).toFixed(0)}%</Text>
+            {countdown !== null ? <Text style={styles.countdownText}>{countdown}</Text> : null}
+          </Animated.View>
+        ) : null}
+
+        {phase === "done" && result ? (
+          <View style={styles.resultCard}>
+            <Text style={styles.resultTitle}>Scan Complete</Text>
+
+            <Text style={styles.resultMeta}>
+              Confidence {((result.quality_score ?? result.quality?.overall_confidence ?? 0) * 100).toFixed(0)}%
+            </Text>
+
+            <View style={styles.editGrid}>
+              {MEASUREMENT_FIELDS.map((field) => (
+                <View key={field.key} style={styles.editRow}>
+                  <Text style={styles.editLabel}>{field.label}</Text>
+                  <TextInput
+                    style={styles.editInput}
+                    value={editableInputs?.[field.key] ?? String(result.measurements[field.key] ?? "")}
+                    keyboardType="decimal-pad"
+                    onChangeText={(value) => onEditMeasurement(field.key, value)}
+                  />
+                </View>
+              ))}
+            </View>
+
+            {(result.warnings || []).map((warning, index) => (
+              <Text key={`${warning}-${index}`} style={styles.warningLine}>
+                {warning}
+              </Text>
+            ))}
+
+            <Pressable style={styles.primaryButton} onPress={persistEditedMeasurements}>
+              <Text style={styles.primaryButtonText}>Use Measurements</Text>
+            </Pressable>
+
+            <Pressable style={styles.secondaryButton} onPress={resetScan}>
+              <Text style={styles.secondaryButtonText}>Scan Again</Text>
+            </Pressable>
+          </View>
+        ) : null}
+
+        {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+      </View>
     </View>
   );
 }
 
-/* ============================= */
-/* Styles                        */
-/* ============================= */
-
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "black" },
-
-  center: { flex: 1, justifyContent: "center", alignItems: "center" },
-
-  overlay: {
+  container: {
+    flex: 1,
+    backgroundColor: "#020617",
+  },
+  centered: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#020617",
+    paddingHorizontal: Spacing.containerPadding,
+  },
+  permissionText: {
+    fontFamily: Fonts.body,
+    color: Colors.textInverted,
+    fontSize: 15,
+    textAlign: "center",
+  },
+  heightScreen: {
+    flex: 1,
+    backgroundColor: "#03131A",
+    justifyContent: "center",
+    paddingHorizontal: Spacing.containerPadding,
+  },
+  heightCard: {
+    backgroundColor: "rgba(9, 33, 41, 0.92)",
+    borderRadius: Radius.lg,
+    borderWidth: 1,
+    borderColor: "rgba(45, 212, 191, 0.28)",
+    padding: 22,
+  },
+  heightTitle: {
+    fontFamily: Fonts.heading,
+    color: Colors.textInverted,
+    fontSize: 30,
+    marginBottom: 8,
+  },
+  heightSubtext: {
+    fontFamily: Fonts.body,
+    color: "rgba(255,255,255,0.78)",
+    fontSize: 14,
+    marginBottom: 18,
+    lineHeight: 20,
+  },
+  heightInput: {
+    height: 54,
+    borderRadius: Radius.md,
+    backgroundColor: Colors.surface,
+    fontFamily: Fonts.bodyBold,
+    fontSize: 18,
+    color: Colors.text,
+    textAlign: "center",
+    marginBottom: 14,
+  },
+  primaryButton: {
+    backgroundColor: Colors.primary,
+    borderRadius: Radius.full,
+    paddingVertical: 14,
+    alignItems: "center",
+    marginTop: 6,
+  },
+  primaryButtonText: {
+    fontFamily: Fonts.bodyBold,
+    color: Colors.textInverted,
+    fontSize: 15,
+  },
+  secondaryButton: {
+    borderRadius: Radius.full,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.35)",
+    paddingVertical: 12,
+    alignItems: "center",
+    marginTop: 10,
+  },
+  secondaryButtonText: {
+    fontFamily: Fonts.bodyBold,
+    color: Colors.textInverted,
+    fontSize: 14,
+  },
+  topHUD: {
     position: "absolute",
-    bottom: 60,
+    top: 54,
+    left: 0,
+    right: 0,
+    paddingHorizontal: Spacing.containerPadding,
+  },
+  progressCard: {
+    borderRadius: Radius.lg,
+    backgroundColor: "rgba(2, 6, 23, 0.66)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+    padding: 14,
+  },
+  stepText: {
+    fontFamily: Fonts.bodyBold,
+    color: Colors.textInverted,
+    fontSize: 16,
+  },
+  hintText: {
+    fontFamily: Fonts.body,
+    color: "rgba(255,255,255,0.82)",
+    fontSize: 13,
+    marginTop: 4,
+    marginBottom: 10,
+  },
+  progressTrack: {
+    height: 6,
+    borderRadius: Radius.full,
+    backgroundColor: "rgba(255,255,255,0.2)",
+    overflow: "hidden",
+  },
+  progressFill: {
+    height: 6,
+    borderRadius: Radius.full,
+    backgroundColor: Colors.primaryLight,
+  },
+  bottomHUD: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 30,
+    paddingHorizontal: Spacing.containerPadding,
+    alignItems: "center",
+  },
+  statusCard: {
     width: "100%",
     alignItems: "center",
-  },
-
-  instructions: { color: "white", fontSize: 16, marginTop: 10 },
-
-  countdown: {
-    fontSize: 80,
-    color: "white",
-    fontWeight: "bold",
-  },
-
-  heightContainer: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    backgroundColor: "black",
-  },
-
-  heightTitle: {
-    fontSize: 28,
-    color: "white",
-    marginBottom: 30,
-  },
-
-  heightInput: {
-    backgroundColor: "white",
-    width: 200,
-    height: 50,
-    borderRadius: 10,
-    textAlign: "center",
-    fontSize: 18,
-    marginBottom: 30,
-  },
-
-  startButton: {
-    backgroundColor: "#0F766E",
     paddingVertical: 14,
-    paddingHorizontal: 40,
-    borderRadius: 12,
+    paddingHorizontal: 16,
+    borderRadius: Radius.lg,
+    backgroundColor: "rgba(2, 6, 23, 0.74)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.2)",
   },
-
-  stepTitle: {
-    color: "white",
-    fontSize: 28,
-    fontWeight: "bold",
-    marginBottom: 10,
+  statusText: {
+    fontFamily: Fonts.bodyBold,
+    color: Colors.textInverted,
+    fontSize: 16,
+    textAlign: "center",
   },
-
-  resultBox: {
-    backgroundColor: "rgba(0,0,0,0.8)",
-    padding: 20,
-    borderRadius: 12,
-    alignItems: "center",
+  qualityText: {
+    marginTop: 4,
+    fontFamily: Fonts.ui,
+    color: "rgba(255,255,255,0.84)",
+    fontSize: 13,
   },
-
+  countdownText: {
+    marginTop: 4,
+    fontFamily: Fonts.bodyBold,
+    color: "#FCD34D",
+    fontSize: 44,
+    lineHeight: 52,
+  },
+  resultCard: {
+    width: "100%",
+    borderRadius: Radius.lg,
+    backgroundColor: "rgba(2, 6, 23, 0.88)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.25)",
+    padding: 18,
+  },
   resultTitle: {
-    color: "white",
-    fontSize: 22,
+    fontFamily: Fonts.heading,
+    color: Colors.textInverted,
+    fontSize: 26,
     marginBottom: 10,
+    textAlign: "center",
   },
-
-  resultText: {
-    color: "white",
-    fontSize: 18,
-    marginBottom: 5,
+  resultLine: {
+    fontFamily: Fonts.body,
+    color: Colors.textInverted,
+    fontSize: 15,
+    marginBottom: 4,
   },
-
-  doneButton: {
-    marginTop: 20,
-    backgroundColor: "green",
-    padding: 12,
-    borderRadius: 8,
+  resultMeta: {
+    fontFamily: Fonts.ui,
+    color: "rgba(255,255,255,0.84)",
+    fontSize: 13,
+    marginBottom: 10,
+    textAlign: "center",
+  },
+  editGrid: {
+    width: "100%",
+    marginBottom: 6,
+  },
+  editRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  editLabel: {
+    width: 92,
+    fontFamily: Fonts.body,
+    color: Colors.textInverted,
+    fontSize: 14,
+  },
+  editInput: {
+    flex: 1,
+    height: 40,
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.24)",
+    backgroundColor: "rgba(255,255,255,0.08)",
+    color: Colors.textInverted,
+    fontFamily: Fonts.bodyBold,
+    paddingHorizontal: 12,
+  },
+  warningLine: {
+    fontFamily: Fonts.body,
+    color: "#FCD34D",
+    fontSize: 12,
+    marginBottom: 4,
+  },
+  errorText: {
+    marginTop: 10,
+    fontFamily: Fonts.bodyBold,
+    color: "#FCA5A5",
+    fontSize: 13,
+    textAlign: "center",
   },
 });

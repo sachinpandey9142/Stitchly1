@@ -176,8 +176,8 @@ export default function DeliveryDashboard() {
   useFocusEffect(
   useCallback(() => {
     let isActive = true;
-    let refreshTimer = null;
-    let locationTimer = null;
+    let refreshTimer: ReturnType<typeof setInterval> | null = null;
+    let locationTimer: ReturnType<typeof setInterval> | null = null;
 
     const activateDashboard = async () => {
       try {
