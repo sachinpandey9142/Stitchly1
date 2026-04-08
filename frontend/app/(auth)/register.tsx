@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, Alert, ActivityIndicator, Animated, Modal, Pressable, Image } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
 import { Feather } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
@@ -28,6 +28,7 @@ const SCAN_RESULT_STORAGE_KEY = 'stitchly_latest_scan_measurements';
 
 export default function Register() {
   const router = useRouter();
+  const params = useLocalSearchParams<{ measurements?: string; height_cm?: string; warnings?: string; quality_score?: string }>();
   const { register } = useAuth();
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -70,8 +71,123 @@ export default function Register() {
   const [legLength, setLegLength] = useState('');
   const [neck, setNeck] = useState('');
   const [scanConfidence, setScanConfidence] = useState<number | null>(null);
+  const [scanWarningMessage, setScanWarningMessage] = useState<string | null>(null);
   const [legacyMeasurements, setLegacyMeasurements] = useState<Record<string, number>>({});
   const BODY_TYPES: ('slim' | 'fit' | 'bulk')[] = ['slim', 'fit', 'bulk'];
+
+  const applyScannedMeasurements = useCallback((payload: any) => {
+    if (!payload || typeof payload !== 'object') return false;
+
+    const scanned = payload?.measurements && typeof payload.measurements === 'object'
+      ? payload.measurements
+      : {};
+
+    let didApply = false;
+
+    if (typeof payload?.height_cm === 'number' && Number.isFinite(payload.height_cm)) {
+      setHeight(String(payload.height_cm));
+      didApply = true;
+    }
+
+    if (typeof scanned.shoulder === 'number') {
+      setShoulder(String(scanned.shoulder));
+      didApply = true;
+    }
+    if (typeof scanned.chest === 'number') {
+      setChest(String(scanned.chest));
+      didApply = true;
+    }
+    if (typeof scanned.waist === 'number') {
+      setWaist(String(scanned.waist));
+      didApply = true;
+    }
+    if (typeof scanned.hip === 'number') {
+      setHip(String(scanned.hip));
+      didApply = true;
+    }
+    if (typeof scanned.arm === 'number') {
+      setArmLength(String(scanned.arm));
+      didApply = true;
+    }
+    if (typeof scanned.leg === 'number') {
+      setLegLength(String(scanned.leg));
+      didApply = true;
+    }
+    if (typeof scanned.neck === 'number') {
+      setNeck(String(scanned.neck));
+      didApply = true;
+    }
+
+    if (payload?.quality && typeof payload.quality.overall_confidence === 'number') {
+      setScanConfidence(payload.quality.overall_confidence);
+      didApply = true;
+    } else if (typeof payload?.quality_score === 'number' && Number.isFinite(payload.quality_score)) {
+      setScanConfidence(payload.quality_score);
+      didApply = true;
+    }
+
+    if (payload?.legacy_measurements && typeof payload.legacy_measurements === 'object') {
+      setLegacyMeasurements(payload.legacy_measurements);
+      didApply = true;
+    }
+
+    const payloadWarnings = Array.isArray(payload?.warnings)
+      ? payload.warnings.filter((warning: unknown): warning is string => typeof warning === 'string' && warning.trim().length > 0)
+      : [];
+
+    const confidenceCandidate =
+      typeof payload?.quality?.overall_confidence === 'number'
+        ? payload.quality.overall_confidence
+        : typeof payload?.quality_score === 'number'
+          ? payload.quality_score
+          : null;
+
+    if (payloadWarnings.length > 0 || (typeof confidenceCandidate === 'number' && confidenceCandidate < 0.6)) {
+      setScanWarningMessage('Measurements may be slightly inaccurate');
+    } else {
+      setScanWarningMessage(null);
+    }
+
+    return didApply;
+  }, []);
+
+  useEffect(() => {
+    if (typeof params.measurements !== 'string' || !params.measurements.trim()) return;
+
+    try {
+      const parsedMeasurements = JSON.parse(params.measurements);
+      const parsedHeight = typeof params.height_cm === 'string' ? Number(params.height_cm) : NaN;
+      let parsedWarnings: string[] = [];
+      if (typeof params.warnings === 'string' && params.warnings.trim()) {
+        try {
+          const warningsPayload = JSON.parse(params.warnings);
+          if (Array.isArray(warningsPayload)) {
+            parsedWarnings = warningsPayload.filter(
+              (warning): warning is string => typeof warning === 'string' && warning.trim().length > 0
+            );
+          }
+        } catch {
+          parsedWarnings = [];
+        }
+      }
+
+      const parsedQuality = typeof params.quality_score === 'string' ? Number(params.quality_score) : NaN;
+      const didApply = applyScannedMeasurements({
+        measurements: parsedMeasurements,
+        height_cm: Number.isFinite(parsedHeight) ? parsedHeight : undefined,
+        warnings: parsedWarnings,
+        quality_score: Number.isFinite(parsedQuality) ? parsedQuality : undefined,
+      });
+
+      if (didApply) {
+        Alert.alert('AI measurements imported', 'Review and edit values before creating account.');
+      }
+
+      void AsyncStorage.removeItem(SCAN_RESULT_STORAGE_KEY);
+    } catch (error) {
+      console.log('scan params parse error', error);
+    }
+  }, [params.measurements, params.height_cm, params.warnings, params.quality_score, applyScannedMeasurements]);
 
   useEffect(() => {
   const loadRecent = async () => {
@@ -99,6 +215,10 @@ useEffect(() => {
 
 useFocusEffect(
   useCallback(() => {
+    if (typeof params.measurements === 'string' && params.measurements.trim()) {
+      return;
+    }
+
     let isMounted = true;
 
     const hydrateScanResult = async () => {
@@ -107,27 +227,12 @@ useFocusEffect(
         if (!raw || !isMounted) return;
 
         const parsed = JSON.parse(raw);
-        const scanned = parsed?.measurements || {};
-
-        if (typeof parsed?.height_cm === 'number') setHeight(String(parsed.height_cm));
-        if (typeof scanned.shoulder === 'number') setShoulder(String(scanned.shoulder));
-        if (typeof scanned.chest === 'number') setChest(String(scanned.chest));
-        if (typeof scanned.waist === 'number') setWaist(String(scanned.waist));
-        if (typeof scanned.hip === 'number') setHip(String(scanned.hip));
-        if (typeof scanned.arm === 'number') setArmLength(String(scanned.arm));
-        if (typeof scanned.leg === 'number') setLegLength(String(scanned.leg));
-        if (typeof scanned.neck === 'number') setNeck(String(scanned.neck));
-
-        if (parsed?.quality && typeof parsed.quality.overall_confidence === 'number') {
-          setScanConfidence(parsed.quality.overall_confidence);
-        }
-
-        if (parsed?.legacy_measurements && typeof parsed.legacy_measurements === 'object') {
-          setLegacyMeasurements(parsed.legacy_measurements);
-        }
+        const didApply = applyScannedMeasurements(parsed);
 
         await AsyncStorage.removeItem(SCAN_RESULT_STORAGE_KEY);
-        Alert.alert('AI measurements imported', 'Review and edit values before creating account.');
+        if (didApply) {
+          Alert.alert('AI measurements imported', 'Review and edit values before creating account.');
+        }
       } catch (error) {
         console.log('scan hydration error', error);
       }
@@ -138,7 +243,7 @@ useFocusEffect(
     return () => {
       isMounted = false;
     };
-  }, [])
+  }, [params.measurements, applyScannedMeasurements])
 );
 
 const toPositiveNumber = (value: string): number | undefined => {
@@ -656,6 +761,10 @@ const getBodyImage = (type: 'slim' | 'fit' | 'bulk') => {
       Last scan confidence: {(scanConfidence * 100).toFixed(0)}%
     </Text>
   )}
+
+  {scanWarningMessage ? (
+    <Text style={styles.scanMeta}>{scanWarningMessage}</Text>
+  ) : null}
  
   {/* Height & Weight Row */}
   <View style={{ flexDirection: 'row', gap: 10 }}>

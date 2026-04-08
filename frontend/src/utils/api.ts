@@ -17,12 +17,29 @@ export const api = {
 
     const url = `${BASE_URL}/api${endpoint}`;
     const response = await fetch(url, { ...options, headers });
-    const data = await response.json();
+    const raw = await response.text();
+    let data: any = null;
+
+    if (raw) {
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        data = raw;
+      }
+    }
 
     if (!response.ok) {
-      throw new Error(data.detail || 'Request failed');
+      const detail =
+        data && typeof data === 'object' && 'detail' in data
+          ? String((data as { detail: unknown }).detail)
+          : typeof data === 'string' && data.trim().length > 0
+            ? data
+            : `Request failed (${response.status})`;
+
+      throw new Error(detail);
     }
-    return data;
+
+    return data ?? {};
   },
 
   get(endpoint: string) {

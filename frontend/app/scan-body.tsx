@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Alert,
   ActivityIndicator,
   Animated,
   Dimensions,
@@ -364,15 +365,47 @@ export default function ScanBody() {
     appendBurst("back_image", captured.back);
     formData.append("height_cm", heightCm);
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, 15000);
+
     try {
       const response = await fetch(`${BACKEND}/ai/measure`, {
         method: "POST",
         body: formData,
+        signal: controller.signal,
       });
-      const data = await response.json();
+      const text = await response.text();
+      console.log("AI RAW RESPONSE:", text);
 
-      if (!response.ok || data?.error) {
-        setErrorMessage(data?.error || "Body measurement failed. Please rescan.");
+      let data: any;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        setErrorMessage("Invalid response from server. Please try again.");
+        Alert.alert("Scan Failed", "Invalid response from server. Please try again.");
+        setPhase("capture");
+        return;
+      }
+
+      const backendError = data?.error || data?.detail || null;
+      if (backendError) {
+        setErrorMessage(String(backendError));
+        Alert.alert("Scan issue", String(backendError));
+      }
+
+      if (!response.ok && (!data?.measurements || typeof data.measurements !== "object")) {
+        const message = String(backendError || "Body measurement failed. Please rescan.");
+        setErrorMessage(message);
+        Alert.alert("Scan Failed", message);
+        setPhase("capture");
+        return;
+      }
+
+      if (!data?.measurements || typeof data.measurements !== "object") {
+        setErrorMessage("Scan completed but measurements were missing in response.");
+        Alert.alert("Scan Failed", "Measurements were missing in response.");
         setPhase("capture");
         return;
       }
@@ -394,11 +427,53 @@ export default function ScanBody() {
       setEditableInputs(defaultInputs);
 
       setResult(scanResult);
-      setErrorMessage(null);
+      setErrorMessage(backendError ? String(backendError) : null);
+
+      const overallConfidence =
+        scanResult.quality?.overall_confidence ??
+        scanResult.quality_score ??
+        scanResult.confidence?.overall ??
+        0;
+
+      await AsyncStorage.setItem(
+        SCAN_RESULT_STORAGE_KEY,
+        JSON.stringify({
+          height_cm: Number(heightCm),
+          measurements: scanResult.measurements,
+          measurement_details: scanResult.measurement_details,
+          legacy_measurements: scanResult.legacy_measurements,
+          quality: {
+            ...(scanResult.quality || {}),
+            overall_confidence: Number(overallConfidence),
+          },
+          confidence: scanResult.confidence,
+          quality_score: scanResult.quality_score,
+          warnings: scanResult.warnings || [],
+        })
+      );
+
       setPhase("done");
+
+      router.replace({
+        pathname: "/(auth)/register",
+        params: {
+          measurements: JSON.stringify(scanResult.measurements),
+          height_cm: String(Number(heightCm)),
+          warnings: JSON.stringify(scanResult.warnings || []),
+          quality_score: String(scanResult.quality_score ?? 0),
+        },
+      });
     } catch (error) {
-      setErrorMessage("Network error while measuring. Please try again.");
+      if (error instanceof Error && error.name === "AbortError") {
+        setErrorMessage("Scan timed out after 15 seconds. Please try again.");
+        Alert.alert("Scan Failed", "Request timed out. Please rescan.");
+      } else {
+        setErrorMessage("Network error while measuring. Please try again.");
+        Alert.alert("Scan Failed", "Network error while measuring. Please try again.");
+      }
       setPhase("capture");
+    } finally {
+      clearTimeout(timeoutId);
     }
   };
 

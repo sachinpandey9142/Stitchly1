@@ -8,6 +8,8 @@ import numpy as np
 VISIBILITY_THRESHOLD = 0.55
 MIN_OVERALL_CONFIDENCE = 0.55
 MIN_METRIC_CONFIDENCE = 0.42
+LOW_QUALITY_WARNING_THRESHOLD = 0.60
+EXTREME_LOW_QUALITY_THRESHOLD = 0.30
 MAX_TILT_DELTA = 0.06
 SEGMENTATION_THRESHOLD = 0.35
 
@@ -107,7 +109,7 @@ def _landmark_confidence(landmarks: List[Any], indices: Iterable[int]) -> float:
     return _average(values)
 
 
-def _downsample_contour(contour: Optional[np.ndarray], max_points: int = 180) -> List[List[float]]:
+def _downsample_contour(contour: Optional[np.ndarray], max_points: int = 320) -> List[List[float]]:
     if contour is None or contour.size == 0:
         return []
     points = contour.reshape(-1, 2)
@@ -130,7 +132,7 @@ def _extract_primary_contour(mask: Optional[np.ndarray]) -> Dict[str, Any]:
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return {"contour": None, "clarity": 0.0, "area_ratio": 0.0, "binary_mask": binary}
 
@@ -160,17 +162,21 @@ def _extract_primary_contour(mask: Optional[np.ndarray]) -> Dict[str, Any]:
 
 def _coerce_view(view: Any) -> Dict[str, Any]:
     if isinstance(view, dict):
-        landmarks = view.get("landmarks") or []
+        landmarks = list(view.get("landmarks") or [])
         mask = view.get("segmentation_mask")
         image_width = int(view.get("image_width") or 1000)
         image_height = int(view.get("image_height") or 1000)
         pose_confidence = float(view.get("pose_confidence") or 0.0)
     else:
-        landmarks = view or []
+        landmarks = list(view or [])
         mask = None
         image_width = 1000
         image_height = 1000
         pose_confidence = _landmark_confidence(landmarks, (0, 11, 12, 23, 24, 27, 28))
+
+    raw_landmark_count = len(landmarks)
+    if raw_landmark_count < 33:
+        landmarks = landmarks + [{"x": 0.5, "y": 0.5, "visibility": 0.0}] * (33 - raw_landmark_count)
 
     if image_width <= 0:
         image_width = 1000
@@ -183,6 +189,7 @@ def _coerce_view(view: Any) -> Dict[str, Any]:
     contour_info = _extract_primary_contour(mask)
     return {
         "landmarks": landmarks,
+        "raw_landmark_count": raw_landmark_count,
         "mask": mask,
         "image_width": image_width,
         "image_height": image_height,
@@ -191,8 +198,95 @@ def _coerce_view(view: Any) -> Dict[str, Any]:
     }
 
 
+def _visible_landmark_count(landmarks: List[Any], minimum_visibility: float = 0.2) -> int:
+    return sum(1 for landmark in landmarks if _get_visibility(landmark) >= minimum_visibility)
+
+
 def _validate_landmarks(landmarks: List[Any]) -> bool:
-    return isinstance(landmarks, list) and len(landmarks) >= 33
+    return (
+        isinstance(landmarks, list)
+        and len(landmarks) >= 33
+        and _visible_landmark_count(landmarks, minimum_visibility=0.2) >= 10
+    )
+
+
+def _select_view_with_fallback(
+    primary_name: str,
+    primary_view: Dict[str, Any],
+    fallback_views: List[Tuple[str, Dict[str, Any]]],
+    warnings: List[str],
+) -> Dict[str, Any]:
+    if _validate_landmarks(primary_view.get("landmarks") or []):
+        return primary_view
+
+    for fallback_name, fallback_view in fallback_views:
+        if _validate_landmarks(fallback_view.get("landmarks") or []):
+            warnings.append(f"{primary_name.capitalize()} view was weak; estimated using {fallback_name} view.")
+            return fallback_view
+
+    warnings.append(f"{primary_name.capitalize()} view has limited landmarks; estimates may be approximate.")
+    return primary_view
+
+
+def _fallback_measurements_from_height(height_cm: float) -> Dict[str, float]:
+    shoulder_width_cm = max(height_cm * 0.25, 30.0)
+    chest_cm = max(height_cm * 0.53, 70.0)
+    waist_cm = max(chest_cm * 0.85, 58.0)
+    hip_circumference_cm = max(waist_cm * 1.05, 74.0)
+    arm_length_cm = max(height_cm * 0.36, 45.0)
+    leg_length_cm = max(height_cm * ANTHRO_LEG_RATIO, 62.0)
+    neck_cm = max(chest_cm * 0.36, 28.0)
+    hip_width_cm = max(hip_circumference_cm / (math.pi * 0.88), 30.0)
+    torso_depth_cm = max(waist_cm / (math.pi * 2.1), 14.0)
+
+    return {
+        "shoulder_width_cm": shoulder_width_cm,
+        "chest_cm": chest_cm,
+        "waist_cm": waist_cm,
+        "hip_width_cm": hip_width_cm,
+        "hip_circumference_cm": hip_circumference_cm,
+        "arm_length_cm": arm_length_cm,
+        "leg_length_cm": leg_length_cm,
+        "neck_cm": neck_cm,
+        "torso_depth_cm": torso_depth_cm,
+    }
+
+
+def _fill_missing_measurements(measurements: Dict[str, float], height_cm: float, warnings: List[str]) -> None:
+    fallback = _fallback_measurements_from_height(height_cm)
+    used_ratio_fallback = False
+
+    for key in RAW_METRIC_KEYS:
+        value = float(measurements.get(key, 0.0) or 0.0)
+        if not math.isfinite(value) or value <= 0.0:
+            measurements[key] = fallback[key]
+            used_ratio_fallback = True
+
+    if measurements["waist_cm"] <= 0.0 and measurements["chest_cm"] > 0.0:
+        measurements["waist_cm"] = measurements["chest_cm"] * 0.85
+        used_ratio_fallback = True
+    if measurements["hip_circumference_cm"] <= 0.0 and measurements["waist_cm"] > 0.0:
+        measurements["hip_circumference_cm"] = measurements["waist_cm"] * 1.05
+        used_ratio_fallback = True
+    if measurements["neck_cm"] <= 0.0 and measurements["chest_cm"] > 0.0:
+        measurements["neck_cm"] = measurements["chest_cm"] * 0.36
+        used_ratio_fallback = True
+
+    if measurements["chest_cm"] <= 0.0:
+        measurements["chest_cm"] = max(height_cm * 0.53, 70.0)
+        used_ratio_fallback = True
+    if measurements["waist_cm"] <= 0.0:
+        measurements["waist_cm"] = measurements["chest_cm"] * 0.85
+        used_ratio_fallback = True
+    if measurements["hip_circumference_cm"] <= 0.0:
+        measurements["hip_circumference_cm"] = measurements["waist_cm"] * 1.05
+        used_ratio_fallback = True
+    if measurements["shoulder_width_cm"] <= 0.0:
+        measurements["shoulder_width_cm"] = max(height_cm * 0.25, 30.0)
+        used_ratio_fallback = True
+
+    if used_ratio_fallback:
+        warnings.append("Some body parts not fully detected; estimated using body ratios.")
 
 
 def _contour_intersection_width(contour: np.ndarray, y_value: float) -> float:
@@ -223,6 +317,22 @@ def _contour_intersection_width(contour: np.ndarray, y_value: float) -> float:
     return max(0.0, intersections[-1] - intersections[0])
 
 
+def _contour_band_width(contour: Optional[np.ndarray], y_value: float, tolerance: float = 3.0) -> float:
+    if contour is None or contour.size == 0:
+        return 0.0
+
+    points = contour.reshape(-1, 2)
+    if points.size == 0:
+        return 0.0
+
+    band = points[np.abs(points[:, 1] - y_value) <= tolerance]
+    if len(band) < 2:
+        return 0.0
+
+    xs = band[:, 0]
+    return float(max(xs) - min(xs))
+
+
 def _contour_width_pixels(view: Dict[str, Any], y_norm: float) -> Tuple[float, float]:
     contour_info = view.get("contour_info") or {}
     contour = contour_info.get("contour")
@@ -235,7 +345,9 @@ def _contour_width_pixels(view: Dict[str, Any], y_norm: float) -> Tuple[float, f
 
     widths: List[float] = []
     for offset in offsets:
-        width = _contour_intersection_width(contour, y_center + offset)
+        width = _contour_band_width(contour, y_center + offset, tolerance=3.0)
+        if width <= 0.0:
+            width = _contour_intersection_width(contour, y_center + offset)
         if width > 0.0:
             widths.append(width)
 
@@ -393,6 +505,52 @@ def _posture_score(front: Dict[str, Any]) -> Tuple[float, bool]:
     return score, hard_fail
 
 
+def _midpoint(point_a: Tuple[float, float], point_b: Tuple[float, float]) -> Tuple[float, float]:
+    return ((point_a[0] + point_b[0]) * 0.5, (point_a[1] + point_b[1]) * 0.5)
+
+
+def _interpolated_anchors(landmarks: List[Any]) -> Dict[str, Tuple[float, float]]:
+    left_shoulder = _get_xy(landmarks[11])
+    right_shoulder = _get_xy(landmarks[12])
+    left_hip = _get_xy(landmarks[23])
+    right_hip = _get_xy(landmarks[24])
+    left_knee = _get_xy(landmarks[25])
+    right_knee = _get_xy(landmarks[26])
+
+    mid_shoulder = _midpoint(left_shoulder, right_shoulder)
+    mid_hip = _midpoint(left_hip, right_hip)
+    mid_torso = _midpoint(mid_shoulder, mid_hip)
+    mid_knee = _midpoint(left_knee, right_knee)
+    mid_thigh = _midpoint(mid_hip, mid_knee)
+
+    return {
+        "mid_shoulder": mid_shoulder,
+        "mid_hip": mid_hip,
+        "mid_torso": mid_torso,
+        "mid_thigh": mid_thigh,
+    }
+
+
+def _measurement_confidence_score(landmark_visibility_score: float, silhouette_quality_score: float, posture_score: float) -> float:
+    return _clamp(
+        (0.4 * landmark_visibility_score) + (0.4 * silhouette_quality_score) + (0.2 * posture_score),
+        0.0,
+        1.0,
+    )
+
+
+def _ui_measurements_from_raw(measurements: Dict[str, float]) -> Dict[str, float]:
+    return {
+        "shoulder": round(float(measurements.get("shoulder_width_cm", 0.0)), 2),
+        "chest": round(float(measurements.get("chest_cm", 0.0)), 2),
+        "waist": round(float(measurements.get("waist_cm", 0.0)), 2),
+        "hip": round(float(measurements.get("hip_circumference_cm", measurements.get("hip_width_cm", 0.0))), 2),
+        "arm": round(float(measurements.get("arm_length_cm", 0.0)), 2),
+        "leg": round(float(measurements.get("leg_length_cm", 0.0)), 2),
+        "neck": round(float(measurements.get("neck_cm", 0.0)), 2),
+    }
+
+
 def _view_width_estimate(
     view: Dict[str, Any],
     y_norm: float,
@@ -452,363 +610,477 @@ def _metric_detail(
     }
 
 
-def _validate_outliers(measurements: Dict[str, float], warnings: List[str]) -> Optional[str]:
-    chest = measurements["chest_cm"]
-    waist = measurements["waist_cm"]
-    hip = measurements["hip_circumference_cm"]
+def _validate_outliers(measurements: Dict[str, float], warnings: List[str]) -> None:
+    ranges = {
+        "shoulder_width_cm": (28.0, 65.0),
+        "chest_cm": (60.0, 150.0),
+        "waist_cm": (45.0, 145.0),
+        "hip_width_cm": (28.0, 70.0),
+        "hip_circumference_cm": (70.0, 165.0),
+        "arm_length_cm": (40.0, 90.0),
+        "leg_length_cm": (55.0, 130.0),
+        "neck_cm": (25.0, 55.0),
+        "torso_depth_cm": (12.0, 45.0),
+    }
 
-    if chest < 60.0 or chest > 150.0:
-        return "Please stand straight and ensure full body is visible"
-    if waist < 45.0 or waist > 145.0:
-        return "Please stand straight and ensure full body is visible"
-    if hip < 70.0 or hip > 165.0:
-        return "Please stand straight and ensure full body is visible"
+    for key, (minimum, maximum) in ranges.items():
+        value = float(measurements.get(key, 0.0) or 0.0)
+        if value <= 0.0:
+            continue
 
-    if measurements["shoulder_width_cm"] < 28.0 or measurements["shoulder_width_cm"] > 65.0:
-        return "Please stand straight and ensure full body is visible"
+        clamped = _clamp(value, minimum, maximum)
+        if abs(clamped - value) > 0.01:
+            measurements[key] = clamped
+            warnings.append("Some measurements were adjusted due to low scan quality.")
 
-    if waist > chest:
-        warnings.append("Waist exceeds chest; verify pose and try another scan for best fit.")
-    if measurements["leg_length_cm"] < 55.0 or measurements["leg_length_cm"] > 130.0:
-        return "Please stand straight and ensure full body is visible"
-    if measurements["arm_length_cm"] < 40.0 or measurements["arm_length_cm"] > 90.0:
-        return "Please stand straight and ensure full body is visible"
-    if measurements["neck_cm"] < 25.0 or measurements["neck_cm"] > 55.0:
-        return "Please stand straight and ensure full body is visible"
-
-    return None
+    if measurements["waist_cm"] > measurements["chest_cm"]:
+        measurements["waist_cm"] = min(measurements["waist_cm"], measurements["chest_cm"] * 0.96)
+        warnings.append("Waist estimate was corrected from partial scan data.")
 
 
 def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, height_cm):
-    try:
-        height_cm = float(height_cm)
-    except (TypeError, ValueError):
-        return {"error": "Please enter a valid height in cm"}
-
-    if height_cm < 120.0 or height_cm > 230.0:
-        return {"error": "Please enter a realistic height between 120 cm and 230 cm"}
-
-    front = _coerce_view(front_landmarks)
-    side = _coerce_view(side_landmarks)
-    back = _coerce_view(back_landmarks)
-
-    if not (
-        _validate_landmarks(front["landmarks"])
-        and _validate_landmarks(side["landmarks"])
-        and _validate_landmarks(back["landmarks"])
-    ):
-        return {"error": "Stand straight and keep full body in frame"}
-
-    required_indices = (11, 12, 23, 24, 25, 26, 27, 28)
-    for view in (front, side, back):
-        if _landmark_confidence(view["landmarks"], required_indices) < VISIBILITY_THRESHOLD:
-            return {"error": "Stand straight and keep full body in frame"}
-
-    posture_score, posture_failed = _posture_score(front)
-    if posture_failed:
-        return {"error": "Stand straight and keep full body in frame"}
-
-    torso_ratio = _average([value for value in (_torso_ratio(front), _torso_ratio(back)) if value > 0.0])
-    distance_score = _distance_score(torso_ratio)
-    if distance_score <= 0.0:
-        return {"error": "Please stand at a comfortable distance and keep full body in frame"}
-
-    front_height_px = _body_height_pixels(front)
-    back_height_px = _body_height_pixels(back)
-    if front_height_px <= 0.0:
-        return {"error": "Stand straight and keep full body in frame"}
-
-    front_landmarks_data = front["landmarks"]
-    back_landmarks_data = back["landmarks"]
-    side_landmarks_data = side["landmarks"]
-
-    shoulder_anchor_px = _average(
-        [
-            _landmark_distance_pixels(front_landmarks_data, 11, 12, front["image_width"], front["image_height"]),
-            _landmark_distance_pixels(back_landmarks_data, 11, 12, back["image_width"], back["image_height"]),
-        ]
-    )
-    hip_anchor_px = _average(
-        [
-            _landmark_distance_pixels(front_landmarks_data, 23, 24, front["image_width"], front["image_height"]),
-            _landmark_distance_pixels(back_landmarks_data, 23, 24, back["image_width"], back["image_height"]),
-        ]
-    )
-    leg_anchor_px = _average(
-        [
-            _segment_chain_length_pixels(front_landmarks_data, [23, 25, 27], front["image_width"], front["image_height"]),
-            _segment_chain_length_pixels(front_landmarks_data, [24, 26, 28], front["image_width"], front["image_height"]),
-        ]
-    )
-
-    height_scale = height_cm / front_height_px
-    width_scale_shoulder = (height_cm * ANTHRO_SHOULDER_RATIO) / shoulder_anchor_px if shoulder_anchor_px > 0.0 else 0.0
-    width_scale_hip = (height_cm * ANTHRO_HIP_RATIO) / hip_anchor_px if hip_anchor_px > 0.0 else 0.0
-    leg_scale = (height_cm * ANTHRO_LEG_RATIO) / leg_anchor_px if leg_anchor_px > 0.0 else 0.0
-
-    pixel_to_cm = _weighted_scale(
-        [
-            (height_scale, 0.45),
-            (width_scale_shoulder, 0.25),
-            (width_scale_hip, 0.15),
-            (leg_scale, 0.15),
-        ]
-    )
-    if pixel_to_cm <= 0.0:
-        return {"error": "Stand straight and keep full body in frame"}
-
-    distance_norm = _clamp(TARGET_TORSO_RATIO / max(torso_ratio, 1e-6), 0.94, 1.06)
-    pixel_to_cm *= distance_norm
-
-    shoulder_y = _average([_get_xy(front_landmarks_data[11])[1], _get_xy(front_landmarks_data[12])[1]])
-    hip_y = _average([_get_xy(front_landmarks_data[23])[1], _get_xy(front_landmarks_data[24])[1]])
-    chest_y = shoulder_y + ((hip_y - shoulder_y) * 0.36)
-    waist_y = shoulder_y + ((hip_y - shoulder_y) * 0.64)
-    neck_y = _clamp(shoulder_y - ((hip_y - shoulder_y) * 0.16), 0.0, 1.0)
-
-    front_shoulder_px, front_shoulder_conf, front_shoulder_sil = _view_width_estimate(front, shoulder_y, (11, 12))
-    back_shoulder_px, back_shoulder_conf, back_shoulder_sil = _view_width_estimate(back, shoulder_y, (11, 12))
-    shoulder_width_px, shoulder_shape_conf = _weighted_fusion(
-        [
-            (front_shoulder_px, front_shoulder_conf),
-            (back_shoulder_px, back_shoulder_conf),
-        ],
-        fallback=shoulder_anchor_px,
-    )
-
-    front_chest_px, front_chest_conf, front_chest_sil = _view_width_estimate(front, chest_y, (11, 12))
-    back_chest_px, back_chest_conf, back_chest_sil = _view_width_estimate(back, chest_y, (11, 12))
-    chest_width_px, chest_width_conf = _weighted_fusion(
-        [
-            (front_chest_px, front_chest_conf),
-            (back_chest_px, back_chest_conf),
-            (shoulder_width_px * 0.92, 0.25),
-        ],
-        fallback=shoulder_width_px * 0.9,
-    )
-
-    front_waist_px, front_waist_conf, front_waist_sil = _view_width_estimate(front, waist_y, (23, 24))
-    back_waist_px, back_waist_conf, back_waist_sil = _view_width_estimate(back, waist_y, (23, 24))
-    waist_width_px, waist_width_conf = _weighted_fusion(
-        [
-            (front_waist_px, front_waist_conf),
-            (back_waist_px, back_waist_conf),
-            ((chest_width_px + hip_anchor_px) * 0.5, 0.2),
-        ],
-        fallback=(chest_width_px + hip_anchor_px) * 0.5,
-    )
-
-    front_hip_px, front_hip_conf, front_hip_sil = _view_width_estimate(front, hip_y, (23, 24))
-    back_hip_px, back_hip_conf, back_hip_sil = _view_width_estimate(back, hip_y, (23, 24))
-    hip_width_px, hip_width_conf = _weighted_fusion(
-        [
-            (front_hip_px, front_hip_conf),
-            (back_hip_px, back_hip_conf),
-            (hip_anchor_px, 0.25),
-        ],
-        fallback=hip_anchor_px,
-    )
-
-    side_torso_depth_px = _average(
-        [
-            _landmark_distance_pixels(side_landmarks_data, 11, 23, side["image_width"], side["image_height"]),
-            _landmark_distance_pixels(side_landmarks_data, 12, 24, side["image_width"], side["image_height"]),
-        ]
-    ) * 0.42
-
-    side_chest_depth_px, side_chest_depth_conf, side_chest_sil = _view_width_estimate(side, chest_y)
-    side_waist_depth_px, side_waist_depth_conf, side_waist_sil = _view_width_estimate(side, waist_y)
-    side_hip_depth_px, side_hip_depth_conf, side_hip_sil = _view_width_estimate(side, hip_y)
-    side_neck_depth_px, side_neck_depth_conf, side_neck_sil = _view_width_estimate(side, neck_y)
-
-    chest_depth_px = side_chest_depth_px if side_chest_depth_px > 0.0 else side_torso_depth_px * 0.98
-    waist_depth_px = side_waist_depth_px if side_waist_depth_px > 0.0 else side_torso_depth_px * 0.92
-    hip_depth_px = side_hip_depth_px if side_hip_depth_px > 0.0 else side_torso_depth_px * 1.06
-
-    front_neck_width_px, front_neck_conf, front_neck_sil = _view_width_estimate(front, neck_y, (7, 8))
-    back_neck_width_px, back_neck_conf, back_neck_sil = _view_width_estimate(back, neck_y, (7, 8))
-    neck_width_px, neck_width_conf = _weighted_fusion(
-        [
-            (front_neck_width_px, front_neck_conf),
-            (back_neck_width_px, back_neck_conf),
-        ],
-        fallback=max(front_neck_width_px, back_neck_width_px),
-    )
-    neck_depth_px = side_neck_depth_px if side_neck_depth_px > 0.0 else side_torso_depth_px * 0.56
-
-    shoulder_width_cm = shoulder_width_px * pixel_to_cm
-    chest_width_cm = chest_width_px * pixel_to_cm
-    waist_width_cm = waist_width_px * pixel_to_cm
-    hip_width_cm = hip_width_px * pixel_to_cm
-
-    chest_depth_cm = chest_depth_px * pixel_to_cm
-    waist_depth_cm = waist_depth_px * pixel_to_cm
-    hip_depth_cm = hip_depth_px * pixel_to_cm
-    neck_width_cm = neck_width_px * pixel_to_cm
-    neck_depth_cm = neck_depth_px * pixel_to_cm
-
-    chest_cm = _ellipse_circumference(chest_width_cm, chest_depth_cm)
-    waist_cm = _ellipse_circumference(waist_width_cm, waist_depth_cm)
-    hip_circumference_cm = _ellipse_circumference(hip_width_cm, hip_depth_cm)
-    neck_cm = _ellipse_circumference(neck_width_cm, neck_depth_cm)
-
-    arm_length_cm = _average(
-        [
-            _segment_chain_length_pixels(front_landmarks_data, [11, 13, 15], front["image_width"], front["image_height"]),
-            _segment_chain_length_pixels(front_landmarks_data, [12, 14, 16], front["image_width"], front["image_height"]),
-            _segment_chain_length_pixels(back_landmarks_data, [11, 13, 15], back["image_width"], back["image_height"]),
-            _segment_chain_length_pixels(back_landmarks_data, [12, 14, 16], back["image_width"], back["image_height"]),
-        ]
-    ) * pixel_to_cm
-
-    leg_length_cm = _average(
-        [
-            _segment_chain_length_pixels(front_landmarks_data, [23, 25, 27], front["image_width"], front["image_height"]),
-            _segment_chain_length_pixels(front_landmarks_data, [24, 26, 28], front["image_width"], front["image_height"]),
-            _segment_chain_length_pixels(back_landmarks_data, [23, 25, 27], back["image_width"], back["image_height"]),
-            _segment_chain_length_pixels(back_landmarks_data, [24, 26, 28], back["image_width"], back["image_height"]),
-        ]
-    ) * pixel_to_cm
-
-    torso_depth_cm = waist_depth_cm
-
-    measurements = {
-        "shoulder_width_cm": shoulder_width_cm,
-        "chest_cm": chest_cm,
-        "waist_cm": waist_cm,
-        "hip_width_cm": hip_width_cm,
-        "hip_circumference_cm": hip_circumference_cm,
-        "arm_length_cm": arm_length_cm,
-        "leg_length_cm": leg_length_cm,
-        "neck_cm": neck_cm,
-        "torso_depth_cm": torso_depth_cm,
-    }
-
     warnings: List[str] = []
-    outlier_error = _validate_outliers(measurements, warnings)
-    if outlier_error:
-        return {"error": outlier_error}
 
-    if torso_ratio < 0.18:
-        warnings.append("User appears far from camera; scan confidence reduced.")
-    if torso_ratio > 0.37:
-        warnings.append("User appears close to camera; scan confidence reduced.")
+    try:
+        parsed_height = float(height_cm)
+    except (TypeError, ValueError):
+        parsed_height = 170.0
+        warnings.append("Invalid height input; using default 170 cm.")
 
-    shoulder_landmark_conf = _average(
-        [
-            _landmark_confidence(front_landmarks_data, (11, 12)),
-            _landmark_confidence(back_landmarks_data, (11, 12)),
-        ]
-    )
-    torso_landmark_conf = _average(
-        [
-            _landmark_confidence(front_landmarks_data, (11, 12, 23, 24)),
-            _landmark_confidence(back_landmarks_data, (11, 12, 23, 24)),
-            _landmark_confidence(side_landmarks_data, (11, 12, 23, 24)),
-        ]
-    )
-    limb_landmark_conf = _average(
-        [
-            _landmark_confidence(front_landmarks_data, (11, 13, 15, 12, 14, 16, 23, 25, 27, 24, 26, 28)),
-            _landmark_confidence(back_landmarks_data, (11, 13, 15, 12, 14, 16, 23, 25, 27, 24, 26, 28)),
-        ]
-    )
+    if not math.isfinite(parsed_height) or parsed_height <= 0.0:
+        parsed_height = 170.0
+        warnings.append("Invalid height input; using default 170 cm.")
 
-    silhouette_torso_clarity = _average(
-        [
-            front_chest_sil,
-            front_waist_sil,
-            front_hip_sil,
-            back_chest_sil,
-            back_waist_sil,
-            back_hip_sil,
-            side_chest_sil,
-            side_waist_sil,
-            side_hip_sil,
-        ]
-    )
+    if parsed_height < 120.0 or parsed_height > 230.0:
+        warnings.append("Height outside expected range; calibration was clamped.")
+    height_cm = _clamp(parsed_height, 120.0, 230.0)
 
-    shoulder_conf = _clamp(
-        (0.45 * shoulder_landmark_conf)
-        + (0.30 * _average([front_shoulder_sil, back_shoulder_sil]))
-        + (0.15 * posture_score)
-        + (0.10 * distance_score),
-        0.0,
-        1.0,
-    )
-    chest_conf = _clamp((0.40 * torso_landmark_conf) + (0.35 * _average([front_chest_sil, back_chest_sil, side_chest_sil])) + (0.15 * posture_score) + (0.10 * distance_score), 0.0, 1.0)
-    waist_conf = _clamp((0.40 * torso_landmark_conf) + (0.35 * _average([front_waist_sil, back_waist_sil, side_waist_sil])) + (0.15 * posture_score) + (0.10 * distance_score), 0.0, 1.0)
-    hip_conf = _clamp((0.40 * torso_landmark_conf) + (0.35 * _average([front_hip_sil, back_hip_sil, side_hip_sil])) + (0.15 * posture_score) + (0.10 * distance_score), 0.0, 1.0)
-    arm_conf = _clamp((0.70 * limb_landmark_conf) + (0.20 * posture_score) + (0.10 * distance_score), 0.0, 1.0)
-    leg_conf = _clamp((0.70 * limb_landmark_conf) + (0.20 * posture_score) + (0.10 * distance_score), 0.0, 1.0)
-    neck_conf = _clamp((0.35 * torso_landmark_conf) + (0.40 * _average([front_neck_sil, back_neck_sil, side_neck_sil])) + (0.15 * posture_score) + (0.10 * distance_score), 0.0, 1.0)
+    front_raw = _coerce_view(front_landmarks)
+    side_raw = _coerce_view(side_landmarks)
+    back_raw = _coerce_view(back_landmarks)
 
-    if measurements["waist_cm"] > measurements["chest_cm"]:
-        waist_conf = _clamp(waist_conf * 0.9, 0.0, 1.0)
+    def _build_fallback_response(base_warnings: List[str], confidence_score: float = 0.55) -> Dict[str, Any]:
+        fallback_measurements = _fallback_measurements_from_height(height_cm)
+        _fill_missing_measurements(fallback_measurements, height_cm, base_warnings)
+        _validate_outliers(fallback_measurements, base_warnings)
 
-    confidences = {
-        "shoulder": shoulder_conf,
-        "chest": chest_conf,
-        "waist": waist_conf,
-        "hip": hip_conf,
-        "arm": arm_conf,
-        "leg": leg_conf,
-        "neck": neck_conf,
-    }
-    quality_score = _clamp((0.80 * _average(confidences.values())) + (0.12 * posture_score) + (0.08 * distance_score), 0.0, 1.0)
-    confidences["overall"] = quality_score
+        ui_measurements = _ui_measurements_from_raw(fallback_measurements)
+        confidence_score = _clamp(confidence_score, 0.0, 1.0)
+        fallback_confidences = {
+            "shoulder": confidence_score,
+            "chest": confidence_score,
+            "waist": confidence_score,
+            "hip": confidence_score,
+            "arm": confidence_score,
+            "leg": confidence_score,
+            "neck": confidence_score,
+            "overall": confidence_score,
+        }
 
-    if quality_score < MIN_OVERALL_CONFIDENCE or min(value for key, value in confidences.items() if key != "overall") < MIN_METRIC_CONFIDENCE:
-        return {"error": "Stand straight and keep full body in frame"}
+        fallback_details = {
+            "shoulder": _metric_detail(fallback_measurements["shoulder_width_cm"], confidence_score, "ratio fallback", confidence_score, confidence_score, 0.5),
+            "chest": _metric_detail(fallback_measurements["chest_cm"], confidence_score, "ratio fallback", confidence_score, confidence_score, 0.5),
+            "waist": _metric_detail(fallback_measurements["waist_cm"], confidence_score, "ratio fallback", confidence_score, confidence_score, 0.5),
+            "hip": _metric_detail(fallback_measurements["hip_circumference_cm"], confidence_score, "ratio fallback", confidence_score, confidence_score, 0.5),
+            "arm": _metric_detail(fallback_measurements["arm_length_cm"], confidence_score, "ratio fallback", confidence_score, confidence_score, 0.5),
+            "leg": _metric_detail(fallback_measurements["leg_length_cm"], confidence_score, "ratio fallback", confidence_score, confidence_score, 0.5),
+            "neck": _metric_detail(fallback_measurements["neck_cm"], confidence_score, "ratio fallback", confidence_score, confidence_score, 0.5),
+        }
 
-    measurement_details = {
-        "shoulder": _metric_detail(measurements["shoulder_width_cm"], shoulder_conf, "landmark+contour fusion", shoulder_landmark_conf, _average([front_shoulder_sil, back_shoulder_sil]), posture_score),
-        "chest": _metric_detail(measurements["chest_cm"], chest_conf, "multi-view ellipse", torso_landmark_conf, _average([front_chest_sil, back_chest_sil, side_chest_sil]), posture_score),
-        "waist": _metric_detail(measurements["waist_cm"], waist_conf, "multi-view ellipse", torso_landmark_conf, _average([front_waist_sil, back_waist_sil, side_waist_sil]), posture_score),
-        "hip": _metric_detail(measurements["hip_circumference_cm"], hip_conf, "multi-view ellipse", torso_landmark_conf, _average([front_hip_sil, back_hip_sil, side_hip_sil]), posture_score),
-        "arm": _metric_detail(measurements["arm_length_cm"], arm_conf, "landmark chain", limb_landmark_conf, 0.0, posture_score),
-        "leg": _metric_detail(measurements["leg_length_cm"], leg_conf, "landmark chain", limb_landmark_conf, 0.0, posture_score),
-        "neck": _metric_detail(measurements["neck_cm"], neck_conf, "multi-view ellipse", torso_landmark_conf, _average([front_neck_sil, back_neck_sil, side_neck_sil]), posture_score),
-    }
+        normalized_contours = {
+            "front": _downsample_contour((front_raw.get("contour_info") or {}).get("contour")),
+            "side": _downsample_contour((side_raw.get("contour_info") or {}).get("contour")),
+            "back": _downsample_contour((back_raw.get("contour_info") or {}).get("contour")),
+        }
 
-    ui_measurements = {
-        "shoulder": round(measurements["shoulder_width_cm"], 2),
-        "chest": round(measurements["chest_cm"], 2),
-        "waist": round(measurements["waist_cm"], 2),
-        "hip": round(measurements["hip_circumference_cm"], 2),
-        "arm": round(measurements["arm_length_cm"], 2),
-        "leg": round(measurements["leg_length_cm"], 2),
-        "neck": round(measurements["neck_cm"], 2),
-    }
+        response: Dict[str, Any] = {
+            "measurements": ui_measurements,
+            "confidence": {key: round(value, 3) for key, value in fallback_confidences.items()},
+            "confidence_score": round(confidence_score, 3),
+            "quality_score": round(confidence_score, 3),
+            "warnings": list(dict.fromkeys(base_warnings)),
+            "measurement_details": fallback_details,
+            "pixel_to_cm": 0.0,
+            "scale_components": {
+                "height_scale": 0.0,
+                "width_scale": 0.0,
+                "leg_scale": 0.0,
+                "distance_normalization": 1.0,
+            },
+            "scan_artifacts": {
+                "contours": normalized_contours,
+                "silhouette_clarity": 0.0,
+                "posture_score": 0.5,
+                "distance_score": 0.5,
+            },
+        }
 
-    normalized_contours = {
-        "front": _downsample_contour((front.get("contour_info") or {}).get("contour")),
-        "side": _downsample_contour((side.get("contour_info") or {}).get("contour")),
-        "back": _downsample_contour((back.get("contour_info") or {}).get("contour")),
-    }
+        for key in RAW_METRIC_KEYS:
+            response[key] = round(float(fallback_measurements[key]), 2)
 
-    response: Dict[str, Any] = {
-        "measurements": ui_measurements,
-        "confidence": {key: round(value, 3) for key, value in confidences.items()},
-        "quality_score": round(quality_score, 3),
-        "warnings": warnings,
-        "measurement_details": measurement_details,
-        "pixel_to_cm": round(pixel_to_cm, 6),
-        "scale_components": {
-            "height_scale": round(height_scale, 6),
-            "width_scale": round(_average([value for value in (width_scale_shoulder, width_scale_hip) if value > 0.0]), 6),
-            "leg_scale": round(leg_scale, 6),
-            "distance_normalization": round(distance_norm, 4),
-        },
-        "scan_artifacts": {
-            "contours": normalized_contours,
-            "silhouette_clarity": round(silhouette_torso_clarity, 3),
-            "posture_score": round(posture_score, 3),
-            "distance_score": round(distance_score, 3),
-        },
-    }
+        return response
 
-    for key in RAW_METRIC_KEYS:
-        response[key] = round(float(measurements[key]), 2)
+    try:
+        view_validity = {
+            "front": _validate_landmarks(front_raw["landmarks"]),
+            "side": _validate_landmarks(side_raw["landmarks"]),
+            "back": _validate_landmarks(back_raw["landmarks"]),
+        }
 
-    return response
+        if not any(view_validity.values()):
+            warnings.append("Scan not perfect, using estimation.")
+            warnings.append("No reliable landmark set was fully detected.")
+            return _build_fallback_response(warnings, confidence_score=0.5)
+
+        if not view_validity["front"]:
+            warnings.append("Front view landmarks were incomplete.")
+        if not view_validity["side"]:
+            warnings.append("Side view landmarks were incomplete.")
+        if not view_validity["back"]:
+            warnings.append("Back view landmarks were incomplete.")
+
+        required_indices = (11, 12, 23, 24, 25, 26, 27, 28)
+        for view_name, view in (("front", front_raw), ("side", side_raw), ("back", back_raw)):
+            if _landmark_confidence(view["landmarks"], required_indices) < VISIBILITY_THRESHOLD:
+                warnings.append(f"{view_name.capitalize()} view confidence is low.")
+
+        front = _select_view_with_fallback("front", front_raw, [("back", back_raw), ("side", side_raw)], warnings)
+        side = _select_view_with_fallback("side", side_raw, [("front", front_raw), ("back", back_raw)], warnings)
+        back = _select_view_with_fallback("back", back_raw, [("front", front_raw), ("side", side_raw)], warnings)
+
+        posture_score, posture_failed = _posture_score(front)
+        if posture_failed:
+            warnings.append("Posture not ideal.")
+
+        torso_ratio_values = [value for value in (_torso_ratio(front), _torso_ratio(back), _torso_ratio(side)) if value > 0.0]
+        torso_ratio = _average(torso_ratio_values)
+        if torso_ratio <= 0.0:
+            torso_ratio = TARGET_TORSO_RATIO
+            warnings.append("Camera distance estimate unavailable; using default ratio.")
+
+        distance_score = _distance_score(torso_ratio)
+        if distance_score <= 0.0:
+            distance_score = 0.4
+            warnings.append("Camera distance not ideal; using estimation.")
+
+        front_height_px = _body_height_pixels(front)
+        back_height_px = _body_height_pixels(back)
+        side_height_px = _body_height_pixels(side)
+        pixel_height = max(front_height_px, back_height_px, side_height_px)
+        if pixel_height <= 0.0:
+            pixel_height = max(float(front["image_height"]) * 0.78, 1.0)
+            warnings.append("Body height landmarks were incomplete; using approximate pixel height.")
+
+        front_landmarks_data = front["landmarks"]
+        back_landmarks_data = back["landmarks"]
+        side_landmarks_data = side["landmarks"]
+        anchors = _interpolated_anchors(front_landmarks_data)
+
+        shoulder_anchor_px = _average(
+            [
+                _landmark_distance_pixels(front_landmarks_data, 11, 12, front["image_width"], front["image_height"]),
+                _landmark_distance_pixels(back_landmarks_data, 11, 12, back["image_width"], back["image_height"]),
+            ]
+        )
+        hip_anchor_px = _average(
+            [
+                _landmark_distance_pixels(front_landmarks_data, 23, 24, front["image_width"], front["image_height"]),
+                _landmark_distance_pixels(back_landmarks_data, 23, 24, back["image_width"], back["image_height"]),
+            ]
+        )
+        leg_anchor_px = _average(
+            [
+                _segment_chain_length_pixels(front_landmarks_data, [23, 25, 27], front["image_width"], front["image_height"]),
+                _segment_chain_length_pixels(front_landmarks_data, [24, 26, 28], front["image_width"], front["image_height"]),
+                _segment_chain_length_pixels(back_landmarks_data, [23, 25, 27], back["image_width"], back["image_height"]),
+                _segment_chain_length_pixels(back_landmarks_data, [24, 26, 28], back["image_width"], back["image_height"]),
+            ]
+        )
+
+        expected_shoulder_cm = height_cm * 0.25
+        height_scale = height_cm / max(pixel_height, 1.0)
+        shoulder_scale = expected_shoulder_cm / shoulder_anchor_px if shoulder_anchor_px > 0.0 else 0.0
+        if shoulder_scale <= 0.0:
+            shoulder_scale = height_scale
+            warnings.append("Shoulder scale was estimated from body height.")
+
+        scale = (height_scale * 0.6) + (shoulder_scale * 0.4)
+        hip_scale = (height_cm * ANTHRO_HIP_RATIO) / hip_anchor_px if hip_anchor_px > 0.0 else 0.0
+        leg_scale = (height_cm * ANTHRO_LEG_RATIO) / leg_anchor_px if leg_anchor_px > 0.0 else 0.0
+        if hip_scale > 0.0:
+            scale = (scale * 0.85) + (hip_scale * 0.15)
+        if leg_scale > 0.0:
+            scale = (scale * 0.9) + (leg_scale * 0.1)
+
+        pixel_to_cm = scale
+        if pixel_to_cm <= 0.0:
+            pixel_to_cm = height_scale
+            warnings.append("Scale calibration fallback applied.")
+        if pixel_to_cm <= 0.0:
+            pixel_to_cm = 0.1
+            warnings.append("Scale calibration used low-confidence default.")
+
+        distance_norm = _clamp(TARGET_TORSO_RATIO / max(torso_ratio, 1e-6), 0.93, 1.07)
+        pixel_to_cm *= distance_norm
+
+        shoulder_y = anchors["mid_shoulder"][1]
+        hip_y = anchors["mid_hip"][1]
+        torso_y = anchors["mid_torso"][1]
+        chest_y = shoulder_y + ((torso_y - shoulder_y) * 0.75)
+        waist_y = torso_y + ((hip_y - torso_y) * 0.55)
+        neck_y = _clamp(shoulder_y - ((hip_y - shoulder_y) * 0.16), 0.0, 1.0)
+
+        front_shoulder_px, front_shoulder_conf, front_shoulder_sil = _view_width_estimate(front, shoulder_y, (11, 12))
+        back_shoulder_px, back_shoulder_conf, back_shoulder_sil = _view_width_estimate(back, shoulder_y, (11, 12))
+        shoulder_width_px, _ = _weighted_fusion(
+            [
+                (front_shoulder_px, front_shoulder_conf),
+                (back_shoulder_px, back_shoulder_conf),
+                (shoulder_anchor_px, 0.25),
+            ],
+            fallback=shoulder_anchor_px,
+        )
+
+        front_chest_px, front_chest_conf, front_chest_sil = _view_width_estimate(front, chest_y, (11, 12))
+        back_chest_px, back_chest_conf, back_chest_sil = _view_width_estimate(back, chest_y, (11, 12))
+        chest_width_px, _ = _weighted_fusion(
+            [
+                (front_chest_px, front_chest_conf),
+                (back_chest_px, back_chest_conf),
+                (shoulder_width_px * 0.92, 0.2),
+            ],
+            fallback=max(shoulder_width_px * 0.9, shoulder_anchor_px * 0.9),
+        )
+
+        front_waist_px, front_waist_conf, front_waist_sil = _view_width_estimate(front, waist_y, (23, 24))
+        back_waist_px, back_waist_conf, back_waist_sil = _view_width_estimate(back, waist_y, (23, 24))
+        waist_width_px, _ = _weighted_fusion(
+            [
+                (front_waist_px, front_waist_conf),
+                (back_waist_px, back_waist_conf),
+                (chest_width_px * 0.85, 0.2),
+            ],
+            fallback=max(chest_width_px * 0.84, hip_anchor_px * 0.9),
+        )
+
+        front_hip_px, front_hip_conf, front_hip_sil = _view_width_estimate(front, hip_y, (23, 24))
+        back_hip_px, back_hip_conf, back_hip_sil = _view_width_estimate(back, hip_y, (23, 24))
+        hip_width_px, _ = _weighted_fusion(
+            [
+                (front_hip_px, front_hip_conf),
+                (back_hip_px, back_hip_conf),
+                (hip_anchor_px, 0.25),
+            ],
+            fallback=hip_anchor_px,
+        )
+
+        side_torso_depth_px = _average(
+            [
+                _landmark_distance_pixels(side_landmarks_data, 11, 23, side["image_width"], side["image_height"]),
+                _landmark_distance_pixels(side_landmarks_data, 12, 24, side["image_width"], side["image_height"]),
+            ]
+        ) * 0.42
+
+        side_chest_depth_px, _, side_chest_sil = _view_width_estimate(side, chest_y)
+        side_waist_depth_px, _, side_waist_sil = _view_width_estimate(side, waist_y)
+        side_hip_depth_px, _, side_hip_sil = _view_width_estimate(side, hip_y)
+        side_neck_depth_px, _, side_neck_sil = _view_width_estimate(side, neck_y)
+
+        chest_depth_px = side_chest_depth_px if side_chest_depth_px > 0.0 else max(side_torso_depth_px * 0.98, chest_width_px * 0.58)
+        waist_depth_px = side_waist_depth_px if side_waist_depth_px > 0.0 else max(side_torso_depth_px * 0.92, waist_width_px * 0.55)
+        hip_depth_px = side_hip_depth_px if side_hip_depth_px > 0.0 else max(side_torso_depth_px * 1.06, hip_width_px * 0.58)
+
+        front_neck_width_px, front_neck_conf, front_neck_sil = _view_width_estimate(front, neck_y, (7, 8))
+        back_neck_width_px, back_neck_conf, back_neck_sil = _view_width_estimate(back, neck_y, (7, 8))
+        neck_width_px, _ = _weighted_fusion(
+            [
+                (front_neck_width_px, front_neck_conf),
+                (back_neck_width_px, back_neck_conf),
+            ],
+            fallback=max(front_neck_width_px, back_neck_width_px),
+        )
+        neck_depth_px = side_neck_depth_px if side_neck_depth_px > 0.0 else max(side_torso_depth_px * 0.56, neck_width_px * 0.52)
+
+        shoulder_width_cm = shoulder_width_px * pixel_to_cm
+        chest_width_cm = chest_width_px * pixel_to_cm
+        waist_width_cm = waist_width_px * pixel_to_cm
+        hip_width_cm = hip_width_px * pixel_to_cm
+
+        chest_depth_cm = chest_depth_px * pixel_to_cm
+        waist_depth_cm = waist_depth_px * pixel_to_cm
+        hip_depth_cm = hip_depth_px * pixel_to_cm
+        neck_width_cm = neck_width_px * pixel_to_cm
+        neck_depth_cm = neck_depth_px * pixel_to_cm
+
+        chest_cm = _ellipse_circumference(chest_width_cm, chest_depth_cm)
+        waist_cm = _ellipse_circumference(waist_width_cm, waist_depth_cm)
+        hip_circumference_cm = _ellipse_circumference(hip_width_cm, hip_depth_cm)
+        neck_cm = _ellipse_circumference(neck_width_cm, neck_depth_cm)
+
+        arm_length_cm = _average(
+            [
+                _segment_chain_length_pixels(front_landmarks_data, [11, 13, 15], front["image_width"], front["image_height"]),
+                _segment_chain_length_pixels(front_landmarks_data, [12, 14, 16], front["image_width"], front["image_height"]),
+                _segment_chain_length_pixels(back_landmarks_data, [11, 13, 15], back["image_width"], back["image_height"]),
+                _segment_chain_length_pixels(back_landmarks_data, [12, 14, 16], back["image_width"], back["image_height"]),
+            ]
+        ) * pixel_to_cm
+
+        leg_length_cm = _average(
+            [
+                _segment_chain_length_pixels(front_landmarks_data, [23, 25, 27], front["image_width"], front["image_height"]),
+                _segment_chain_length_pixels(front_landmarks_data, [24, 26, 28], front["image_width"], front["image_height"]),
+                _segment_chain_length_pixels(back_landmarks_data, [23, 25, 27], back["image_width"], back["image_height"]),
+                _segment_chain_length_pixels(back_landmarks_data, [24, 26, 28], back["image_width"], back["image_height"]),
+            ]
+        ) * pixel_to_cm
+
+        measurements = {
+            "shoulder_width_cm": shoulder_width_cm,
+            "chest_cm": chest_cm,
+            "waist_cm": waist_cm,
+            "hip_width_cm": hip_width_cm,
+            "hip_circumference_cm": hip_circumference_cm,
+            "arm_length_cm": arm_length_cm,
+            "leg_length_cm": leg_length_cm,
+            "neck_cm": neck_cm,
+            "torso_depth_cm": waist_depth_cm,
+        }
+
+        _fill_missing_measurements(measurements, height_cm, warnings)
+        _validate_outliers(measurements, warnings)
+
+        if torso_ratio < 0.18:
+            warnings.append("User appears far from camera; confidence reduced.")
+        if torso_ratio > 0.37:
+            warnings.append("User appears close to camera; confidence reduced.")
+
+        shoulder_landmark_conf = _average(
+            [
+                _landmark_confidence(front_landmarks_data, (11, 12)),
+                _landmark_confidence(back_landmarks_data, (11, 12)),
+            ]
+        )
+        torso_landmark_conf = _average(
+            [
+                _landmark_confidence(front_landmarks_data, (11, 12, 23, 24)),
+                _landmark_confidence(back_landmarks_data, (11, 12, 23, 24)),
+                _landmark_confidence(side_landmarks_data, (11, 12, 23, 24)),
+            ]
+        )
+        limb_landmark_conf = _average(
+            [
+                _landmark_confidence(front_landmarks_data, (11, 13, 15, 12, 14, 16, 23, 25, 27, 24, 26, 28)),
+                _landmark_confidence(back_landmarks_data, (11, 13, 15, 12, 14, 16, 23, 25, 27, 24, 26, 28)),
+            ]
+        )
+
+        shoulder_silhouette = _average([front_shoulder_sil, back_shoulder_sil])
+        chest_silhouette = _average([front_chest_sil, back_chest_sil, side_chest_sil])
+        waist_silhouette = _average([front_waist_sil, back_waist_sil, side_waist_sil])
+        hip_silhouette = _average([front_hip_sil, back_hip_sil, side_hip_sil])
+        neck_silhouette = _average([front_neck_sil, back_neck_sil, side_neck_sil])
+        limb_silhouette = _clamp(_average([chest_silhouette, waist_silhouette, hip_silhouette]) * 0.6, 0.0, 1.0)
+
+        shoulder_conf = _measurement_confidence_score(shoulder_landmark_conf, shoulder_silhouette, posture_score)
+        chest_conf = _measurement_confidence_score(torso_landmark_conf, chest_silhouette, posture_score)
+        waist_conf = _measurement_confidence_score(torso_landmark_conf, waist_silhouette, posture_score)
+        hip_conf = _measurement_confidence_score(torso_landmark_conf, hip_silhouette, posture_score)
+        arm_conf = _measurement_confidence_score(limb_landmark_conf, limb_silhouette, posture_score)
+        leg_conf = _measurement_confidence_score(limb_landmark_conf, limb_silhouette, posture_score)
+        neck_conf = _measurement_confidence_score(torso_landmark_conf, neck_silhouette, posture_score)
+
+        confidences = {
+            "shoulder": shoulder_conf,
+            "chest": chest_conf,
+            "waist": waist_conf,
+            "hip": hip_conf,
+            "arm": arm_conf,
+            "leg": leg_conf,
+            "neck": neck_conf,
+        }
+        quality_score = _clamp(_average(confidences.values()), 0.0, 1.0)
+        confidences["overall"] = quality_score
+
+        min_metric_conf = min(value for key, value in confidences.items() if key != "overall")
+        if quality_score < LOW_QUALITY_WARNING_THRESHOLD or min_metric_conf < MIN_METRIC_CONFIDENCE:
+            warnings.append("Measurements may be slightly inaccurate.")
+        if quality_score < EXTREME_LOW_QUALITY_THRESHOLD:
+            warnings.append("Scan not perfect, using estimation.")
+
+        measurement_details = {
+            "shoulder": _metric_detail(measurements["shoulder_width_cm"], shoulder_conf, "interpolated landmark + contour fusion", shoulder_landmark_conf, shoulder_silhouette, posture_score),
+            "chest": _metric_detail(measurements["chest_cm"], chest_conf, "front/side ellipse fusion", torso_landmark_conf, chest_silhouette, posture_score),
+            "waist": _metric_detail(measurements["waist_cm"], waist_conf, "front/side ellipse fusion", torso_landmark_conf, waist_silhouette, posture_score),
+            "hip": _metric_detail(measurements["hip_circumference_cm"], hip_conf, "front/side ellipse fusion", torso_landmark_conf, hip_silhouette, posture_score),
+            "arm": _metric_detail(measurements["arm_length_cm"], arm_conf, "landmark chain", limb_landmark_conf, limb_silhouette, posture_score),
+            "leg": _metric_detail(measurements["leg_length_cm"], leg_conf, "landmark chain", limb_landmark_conf, limb_silhouette, posture_score),
+            "neck": _metric_detail(measurements["neck_cm"], neck_conf, "contour + side depth fusion", torso_landmark_conf, neck_silhouette, posture_score),
+        }
+
+        ui_measurements = _ui_measurements_from_raw(measurements)
+        if not ui_measurements or not any(value > 0.0 for value in ui_measurements.values()):
+            warnings.append("Scan not perfect, using estimation.")
+            warnings.append("No reliable geometry extracted from this scan.")
+            return _build_fallback_response(warnings, confidence_score=0.52)
+
+        fallback_ui = _ui_measurements_from_raw(_fallback_measurements_from_height(height_cm))
+        for key, value in ui_measurements.items():
+            if value <= 0.0:
+                ui_measurements[key] = fallback_ui[key]
+                warnings.append(f"{key.capitalize()} was estimated from body ratios.")
+
+        normalized_contours = {
+            "front": _downsample_contour((front.get("contour_info") or {}).get("contour")),
+            "side": _downsample_contour((side.get("contour_info") or {}).get("contour")),
+            "back": _downsample_contour((back.get("contour_info") or {}).get("contour")),
+        }
+
+        silhouette_torso_clarity = _average(
+            [
+                front_chest_sil,
+                front_waist_sil,
+                front_hip_sil,
+                back_chest_sil,
+                back_waist_sil,
+                back_hip_sil,
+                side_chest_sil,
+                side_waist_sil,
+                side_hip_sil,
+            ]
+        )
+
+        response: Dict[str, Any] = {
+            "measurements": ui_measurements,
+            "confidence": {key: round(value, 3) for key, value in confidences.items()},
+            "confidence_score": round(quality_score, 3),
+            "quality_score": round(quality_score, 3),
+            "warnings": list(dict.fromkeys(warnings)),
+            "measurement_details": measurement_details,
+            "pixel_to_cm": round(pixel_to_cm, 6),
+            "scale_components": {
+                "height_scale": round(height_scale, 6),
+                "width_scale": round(shoulder_scale, 6),
+                "leg_scale": round(leg_scale, 6),
+                "distance_normalization": round(distance_norm, 4),
+            },
+            "scan_artifacts": {
+                "contours": normalized_contours,
+                "silhouette_clarity": round(silhouette_torso_clarity, 3),
+                "posture_score": round(posture_score, 3),
+                "distance_score": round(distance_score, 3),
+            },
+        }
+
+        for key in RAW_METRIC_KEYS:
+            response[key] = round(float(measurements.get(key, 0.0)), 2)
+
+        if not response.get("measurements"):
+            warnings.append("Scan not perfect, using estimation.")
+            return _build_fallback_response(warnings, confidence_score=0.5)
+
+        return response
+    except Exception:
+        warnings.append("Scan not perfect, using estimation.")
+        warnings.append("Processing fallback applied due to runtime exception.")
+        return _build_fallback_response(warnings, confidence_score=0.5)

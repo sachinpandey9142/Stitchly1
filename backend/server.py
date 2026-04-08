@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from jose import jwt, JWTError
 from passlib.context import CryptContext
+import bcrypt
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import razorpay
 import numpy as np
@@ -785,10 +786,15 @@ class DeliveryLocationUpdate(BaseModel):
 # ===================== AUTH HELPERS =====================
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    if not hashed:
+        return False
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
 
 def create_token(data: dict) -> str:
     user = {
@@ -943,9 +949,10 @@ async def login(data: UserLogin):
     user = await db.users.find_one({"email": data.email.lower()}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    if not verify_password(data.password, user["password_hash"]):
+    password_hash = user.get("password_hash")
+    if not verify_password(data.password, password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    if user["status"] == "blocked":
+    if user.get("status") == "blocked":
         raise HTTPException(status_code=403, detail="Account blocked")
 
     token = issue_token_for_user(user)
@@ -2234,10 +2241,27 @@ async def _run_measurement_pipeline(
     back_views = _detect_pose_candidates("back", _non_empty_uploads(back_image, back_image_2, back_image_3))
 
     if not front_views or not side_views or not back_views:
-        return {"error": "Please stand straight and ensure full body is visible"}
+        fallback_measurements = calculate_measurements(
+            front_views[0] if front_views else {},
+            side_views[0] if side_views else {},
+            back_views[0] if back_views else {},
+            height_cm,
+        )
+        if fallback_measurements.get("measurements"):
+            fallback_warnings = list(fallback_measurements.get("warnings") or [])
+            fallback_warnings.append("Scan not perfect, using limited view estimation.")
+            fallback_measurements["warnings"] = fallback_warnings
+            front_views = front_views or [{}]
+            side_views = side_views or [{}]
+            back_views = back_views or [{}]
+            measurement_candidates = [fallback_measurements]
+        else:
+            return {"error": "Please stand straight and ensure full body is visible"}
+    else:
+        measurement_candidates: List[dict] = []
 
-    measurement_candidates: List[dict] = []
     last_error: Optional[dict] = None
+    pipeline_warnings: List[str] = []
     sample_count = max(len(front_views), len(side_views), len(back_views))
 
     for index in range(sample_count):
@@ -2245,16 +2269,43 @@ async def _run_measurement_pipeline(
         side_view = side_views[min(index, len(side_views) - 1)]
         back_view = back_views[min(index, len(back_views) - 1)]
 
-        if not front_view.get("landmarks") or not side_view.get("landmarks") or not back_view.get("landmarks"):
-            last_error = {"error": "Please stand straight and ensure full body is visible"}
-            continue
+        if not front_view.get("landmarks"):
+            pipeline_warnings.append("Front view landmarks were weak.")
+        if not side_view.get("landmarks"):
+            pipeline_warnings.append("Side view landmarks were weak.")
+        if not back_view.get("landmarks"):
+            pipeline_warnings.append("Back view landmarks were weak.")
 
         measurements = calculate_measurements(front_view, side_view, back_view, height_cm)
         if "error" in measurements:
             last_error = measurements
+
+            if measurements.get("measurements"):
+                soft_candidate = dict(measurements)
+                soft_warnings = list(soft_candidate.get("warnings") or [])
+                if measurements.get("error"):
+                    soft_warnings.append(str(measurements.get("error")))
+                soft_candidate["warnings"] = soft_warnings
+                soft_candidate.pop("error", None)
+                measurement_candidates.append(soft_candidate)
             continue
 
         measurement_candidates.append(measurements)
+
+    if not measurement_candidates:
+        strongest_view = max(
+            [*front_views, *side_views, *back_views],
+            key=lambda view: float(view.get("pose_confidence", 0.0)) + (0.01 * len(view.get("landmarks") or [])),
+        )
+
+        if strongest_view.get("landmarks"):
+            fallback_measurements = calculate_measurements(strongest_view, strongest_view, strongest_view, height_cm)
+            if fallback_measurements.get("measurements"):
+                fallback_warnings = list(fallback_measurements.get("warnings") or [])
+                fallback_warnings.append("Generated from limited scan data.")
+                fallback_measurements["warnings"] = fallback_warnings
+                fallback_measurements.pop("error", None)
+                measurement_candidates.append(fallback_measurements)
 
     if not measurement_candidates:
         return last_error or {"error": "Please stand straight and ensure full body is visible"}
@@ -2278,6 +2329,9 @@ async def _run_measurement_pipeline(
     if "overall" not in confidence:
         confidence["overall"] = round(quality_score, 3)
     warnings = list(measurements.get("warnings") or [])
+    for warning in pipeline_warnings:
+        if warning and warning not in warnings:
+            warnings.append(warning)
 
     return {
         "success": True,

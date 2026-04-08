@@ -1,3 +1,4 @@
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,22 @@ def _fake_landmarks():
     landmarks[27].update({"x": 0.44, "y": 0.95})
     landmarks[28].update({"x": 0.56, "y": 0.95})
     return landmarks
+
+
+def _low_confidence_landmarks():
+    landmarks = _fake_landmarks()
+    for landmark in landmarks:
+        landmark["visibility"] = 0.4
+    return landmarks
+
+
+def _load_real_measurement_calculator_module():
+    module_path = Path(__file__).resolve().parents[1] / "ai" / "measurement_calculator.py"
+    spec = importlib.util.spec_from_file_location("real_measurement_calculator", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_valid_measurements_generate_vertices(monkeypatch):
@@ -272,3 +289,40 @@ def test_measure_endpoint_returns_ui_contract(client, monkeypatch):
     assert payload["measurements"]["chest"] == 96.0
     assert payload["measurements"]["hip"] == 98.0
     assert payload["legacy_measurements"]["hip_width_cm"] == 38.0
+
+
+def test_measurement_calculator_fallback_with_missing_side_view():
+    measurement_calculator = _load_real_measurement_calculator_module()
+    result = measurement_calculator.calculate_measurements(_fake_landmarks(), [], _fake_landmarks(), 170)
+
+    assert "error" not in result
+    assert result["measurements"]["chest"] > 0
+    assert result["measurements"]["waist"] > 0
+    assert isinstance(result.get("warnings"), list)
+
+
+def test_measurement_calculator_low_quality_returns_measurements_with_warning():
+    measurement_calculator = _load_real_measurement_calculator_module()
+    result = measurement_calculator.calculate_measurements(_low_confidence_landmarks(), [], [], 170)
+
+    assert "error" not in result
+    assert result["measurements"]["shoulder"] > 0
+    assert "Measurements may be slightly inaccurate." in result.get("warnings", [])
+
+
+def test_measurement_calculator_invalid_height_still_returns_measurements():
+    measurement_calculator = _load_real_measurement_calculator_module()
+    result = measurement_calculator.calculate_measurements(_fake_landmarks(), _fake_landmarks(), _fake_landmarks(), "bad-height")
+
+    assert "error" not in result
+    assert result["measurements"]["chest"] > 0
+    assert isinstance(result.get("warnings"), list)
+
+
+def test_measurement_calculator_empty_views_still_returns_fallback_measurements():
+    measurement_calculator = _load_real_measurement_calculator_module()
+    result = measurement_calculator.calculate_measurements([], [], [], 170)
+
+    assert "error" not in result
+    assert result["measurements"]["waist"] > 0
+    assert result.get("confidence", {}).get("overall", 0) > 0
