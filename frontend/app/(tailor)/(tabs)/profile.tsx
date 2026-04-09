@@ -1,11 +1,10 @@
-import React, { useState, useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import {
   View,
   Text,
   TouchableOpacity,
   StyleSheet,
   ScrollView,
-  TextInput,
   Alert,
   ActivityIndicator,
   Image,
@@ -18,6 +17,29 @@ import { useAuth } from "../../../src/context/AuthContext";
 import { api } from "../../../src/utils/api";
 import { Colors, Fonts, Spacing, Radius } from "../../../src/utils/theme";
 
+const formatPriceValue = (value: unknown): number | null => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return numeric;
+};
+
+const formatComplexityLabel = (value: unknown): string => {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return text.charAt(0).toUpperCase() + text.slice(1).toLowerCase();
+};
+
+const formatPriceRangeLabel = (service: any): string => {
+  const minPrice =
+    formatPriceValue(service?.price_min) ?? formatPriceValue(service?.price) ?? 0;
+  const maxPrice =
+    formatPriceValue(service?.price_max) ?? formatPriceValue(service?.price) ?? minPrice;
+
+  if (!minPrice) return "₹0";
+  if (minPrice === maxPrice) return `₹${Math.round(minPrice)}`;
+  return `₹${Math.round(minPrice)} - ₹${Math.round(maxPrice)}`;
+};
+
 export default function TailorProfile() {
   const router = useRouter();
   const { user, logout } = useAuth();
@@ -25,16 +47,8 @@ export default function TailorProfile() {
   const [services, setServices] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const [newService, setNewService] = useState({
-    service_name: "",
-    price: "",
-    category: "",
-  });
-
-  const [showAdd, setShowAdd] = useState(false);
-
   useEffect(() => {
-    fetchServices();
+    void fetchServices();
   }, []);
 
   const fetchServices = async () => {
@@ -45,47 +59,6 @@ export default function TailorProfile() {
     finally {
       setLoading(false);
     }
-  };
-
-  const handleAddService = async () => {
-    if (!newService.service_name || !newService.price || !newService.category) {
-      Alert.alert("Error", "Fill all fields");
-      return;
-    }
-
-    try {
-      await api.post("/tailor/services", {
-        ...newService,
-        price: parseFloat(newService.price),
-      });
-
-      setNewService({
-        service_name: "",
-        price: "",
-        category: "",
-      });
-
-      setShowAdd(false);
-      fetchServices();
-    } catch (err: any) {
-      Alert.alert("Error", err.message);
-    }
-  };
-
-  const handleDeleteService = async (id: string) => {
-    Alert.alert("Delete", "Remove this service?", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Delete",
-        style: "destructive",
-        onPress: async () => {
-          try {
-            await api.delete(`/tailor/services/${id}`);
-            fetchServices();
-          } catch {}
-        },
-      },
-    ]);
   };
 
   const handleLogout = async () => {
@@ -165,67 +138,21 @@ export default function TailorProfile() {
         {/* SERVICES SECTION */}
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>My Services</Text>
-
-            <TouchableOpacity
-              style={styles.specializationBtn}
-              onPress={() => router.push("/(tailor)/select-specializations")}
-            >
-              <Text style={styles.specializationText}>
-                Select Specializations
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              testID="add-service-btn"
-              onPress={() => setShowAdd(!showAdd)}
-            >
-              <Feather
-                name={showAdd ? "x" : "plus"}
-                size={22}
-                color={Colors.primary}
-              />
-            </TouchableOpacity>
+            <Text style={styles.sectionTitle}>Specializations & Pricing</Text>
           </View>
 
-          {showAdd && (
-            <View style={styles.addForm}>
-              <TextInput
-                style={styles.formInput}
-                placeholder="Service name"
-                placeholderTextColor={Colors.textMuted}
-                value={newService.service_name}
-                onChangeText={(t) =>
-                  setNewService({ ...newService, service_name: t })
-                }
-              />
+          <TouchableOpacity
+            style={styles.specializationBtn}
+            onPress={() => router.push("/(tailor)/select-specializations")}
+            activeOpacity={0.85}
+          >
+            <Feather name="sliders" size={16} color={Colors.textInverted} />
+            <Text style={styles.specializationText}>Select Specializations & Pricing</Text>
+          </TouchableOpacity>
 
-              <TextInput
-                style={styles.formInput}
-                placeholder="Price (INR)"
-                placeholderTextColor={Colors.textMuted}
-                value={newService.price}
-                keyboardType="numeric"
-                onChangeText={(t) =>
-                  setNewService({ ...newService, price: t })
-                }
-              />
-
-              <TextInput
-                style={styles.formInput}
-                placeholder="Category"
-                placeholderTextColor={Colors.textMuted}
-                value={newService.category}
-                onChangeText={(t) =>
-                  setNewService({ ...newService, category: t })
-                }
-              />
-
-              <TouchableOpacity style={styles.saveBtn} onPress={handleAddService}>
-                <Text style={styles.saveBtnText}>Add Service</Text>
-              </TouchableOpacity>
-            </View>
-          )}
+          <Text style={styles.sectionHint}>
+            Choose categories, then tap each selected category to add service name and price range.
+          </Text>
 
           {loading ? (
             <ActivityIndicator color={Colors.primary} />
@@ -234,14 +161,13 @@ export default function TailorProfile() {
               <View key={s.id} style={styles.serviceRow}>
                 <View style={styles.serviceInfo}>
                   <Text style={styles.serviceName}>{s.service_name}</Text>
-                  <Text style={styles.serviceCategory}>{s.category}</Text>
+                  <Text style={styles.serviceCategory}>
+                    {s.category}
+                    {formatComplexityLabel(s.complexity) ? ` • ${formatComplexityLabel(s.complexity)}` : ""}
+                  </Text>
                 </View>
 
-                <Text style={styles.servicePrice}>₹{s.price}</Text>
-
-                <TouchableOpacity onPress={() => handleDeleteService(s.id)}>
-                  <Feather name="trash-2" size={18} color={Colors.error} />
-                </TouchableOpacity>
+                <Text style={styles.servicePrice}>{formatPriceRangeLabel(s)}</Text>
               </View>
             ))
           )}
@@ -387,10 +313,7 @@ const styles = StyleSheet.create({
   },
 
   sectionHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 14,
+    marginBottom: 10,
   },
 
   sectionTitle: {
@@ -400,47 +323,28 @@ const styles = StyleSheet.create({
   },
 
   specializationBtn: {
-    backgroundColor: Colors.surface,
-    borderWidth: 1,
-    borderColor: Colors.primary,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+    backgroundColor: Colors.primary,
     borderRadius: Radius.md,
-  },
-
-  specializationText: {
-    color: Colors.primary,
-    fontWeight: "600",
-    fontSize: 12,
-  },
-
-  addForm: {
-    backgroundColor: Colors.subtle,
-    borderRadius: Radius.md,
-    padding: 14,
-    marginBottom: 14,
-  },
-
-  formInput: {
-    backgroundColor: Colors.surface,
-    borderRadius: Radius.md,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    padding: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
     marginBottom: 10,
   },
 
-  saveBtn: {
-    backgroundColor: Colors.primary,
-    borderRadius: Radius.full,
-    paddingVertical: 12,
-    alignItems: "center",
+  specializationText: {
+    color: Colors.textInverted,
+    fontFamily: Fonts.bodyBold,
+    fontSize: 14,
   },
 
-  saveBtnText: {
-    fontFamily: Fonts.bodyBold,
-    fontSize: 15,
-    color: Colors.textInverted,
+  sectionHint: {
+    fontFamily: Fonts.ui,
+    fontSize: 12,
+    color: Colors.textMuted,
+    marginBottom: 10,
   },
 
   serviceRow: {

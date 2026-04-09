@@ -184,7 +184,13 @@ export default function CustomerSearch() {
           contentContainerStyle={styles.resultsList}
           showsVerticalScrollIndicator={false}
           renderItem={({ item }) => (
-            <TouchableOpacity style={styles.tailorCard} onPress={() => router.push(`/tailor/${item.id}`)}>
+            <TouchableOpacity
+              style={styles.tailorCard}
+              onPress={() => {
+                const categoryQuery = selectedCategory ? `?category=${encodeURIComponent(selectedCategory)}` : '';
+                router.push(`/tailor/${item.id}${categoryQuery}`);
+              }}
+            >
               <Text style={styles.tailorName}>{item.name}</Text>
               <Text style={styles.tailorMeta}>
                 {item.city || 'Unknown city'}

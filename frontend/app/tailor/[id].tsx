@@ -1,24 +1,75 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, ScrollView, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { api } from '../../src/utils/api';
 import { Colors, Fonts, Spacing, Radius } from '../../src/utils/theme';
+import { CATEGORY_CAROUSEL, CATEGORY_SPECIALITY_MAP } from '../../src/utils/customerDiscovery';
+
+const formatPriceRangeLabel = (service: any): string => {
+  const minPrice = Number(service?.price_min ?? service?.price ?? 0);
+  const maxPrice = Number(service?.price_max ?? service?.price ?? minPrice);
+
+  if (!Number.isFinite(minPrice) || minPrice <= 0) return '₹0';
+  if (!Number.isFinite(maxPrice) || maxPrice <= 0 || maxPrice === minPrice) {
+    return `₹${Math.round(minPrice)}`;
+  }
+
+  return `₹${Math.round(minPrice)} - ₹${Math.round(maxPrice)}`;
+};
+
+const formatComplexityLabel = (value: unknown): string => {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  return text.charAt(0).toUpperCase() + text.slice(1).toLowerCase();
+};
 
 export default function TailorDetail() {
-  const { id } = useLocalSearchParams<{ id: string }>();
+  const { id, category } = useLocalSearchParams<{ id: string; category?: string }>();
   const router = useRouter();
   const [tailor, setTailor] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
+  const selectedCategoryKey = typeof category === 'string' ? category : '';
+
   useEffect(() => {
     (async () => {
-      try { const data = await api.get(`/tailors/${id}`); setTailor(data); }
-      catch (err) { console.error(err); }
-      finally { setLoading(false); }
+      try {
+        const data = await api.get(`/tailors/${id}`);
+        setTailor(data);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setLoading(false);
+      }
     })();
   }, [id]);
+
+  const categoryMatcherSet = useMemo(() => {
+    if (!selectedCategoryKey) return new Set<string>();
+
+    const categoryItem = CATEGORY_CAROUSEL.find((item) => item.key === selectedCategoryKey);
+    const mappedSpeciality = CATEGORY_SPECIALITY_MAP[selectedCategoryKey] || '';
+
+    return new Set(
+      [selectedCategoryKey, categoryItem?.label || '', mappedSpeciality]
+        .filter(Boolean)
+        .map((item) => String(item).toLowerCase())
+    );
+  }, [selectedCategoryKey]);
+
+  const visibleServices = useMemo(() => {
+    const allServices = tailor?.services || [];
+    if (categoryMatcherSet.size === 0) return allServices;
+
+    const filtered = allServices.filter((service: any) => {
+      const serviceCategory = String(service?.category || '').toLowerCase();
+      return categoryMatcherSet.has(serviceCategory);
+    });
+
+    return filtered.length > 0 ? filtered : allServices;
+  }, [tailor?.services, categoryMatcherSet]);
 
   if (loading) return <View style={styles.loader}><ActivityIndicator size="large" color={Colors.primary} /></View>;
   if (!tailor) return <View style={styles.loader}><Text style={styles.errorText}>Tailor not found</Text></View>;
@@ -54,17 +105,31 @@ export default function TailorDetail() {
 
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Services & Pricing</Text>
-          {tailor.services?.map((s: any) => (
-            <TouchableOpacity key={s.id} testID={`service-${s.id}`} style={styles.serviceRow} activeOpacity={0.7} onPress={() => router.push(`/place-order/${id}?service=${encodeURIComponent(s.service_name)}`)}>
-              <View style={styles.serviceInfo}>
-                <Text style={styles.serviceName}>{s.service_name}</Text>
-                <Text style={styles.serviceCategory}>{s.category}</Text>
-              </View>
-              <Text style={styles.servicePrice}>{'\u20B9'}{s.price}</Text>
-              <Feather name="chevron-right" size={18} color={Colors.textMuted} />
-            </TouchableOpacity>
-          ))}
-          {(!tailor.services || tailor.services.length === 0) && <Text style={styles.emptyText}>No services listed</Text>}
+          {visibleServices.map((s: any) => {
+            const query = `service=${encodeURIComponent(s.service_name)}&serviceId=${encodeURIComponent(s.id)}`;
+            const categoryQuery = selectedCategoryKey ? `&category=${encodeURIComponent(selectedCategoryKey)}` : '';
+
+            return (
+              <TouchableOpacity
+                key={s.id}
+                testID={`service-${s.id}`}
+                style={styles.serviceRow}
+                activeOpacity={0.7}
+                onPress={() => router.push(`/place-order/${id}?${query}${categoryQuery}`)}
+              >
+                <View style={styles.serviceInfo}>
+                  <Text style={styles.serviceName}>{s.service_name}</Text>
+                  <Text style={styles.serviceCategory}>
+                    {s.category}
+                    {formatComplexityLabel(s.complexity) ? ` • ${formatComplexityLabel(s.complexity)}` : ''}
+                  </Text>
+                </View>
+                <Text style={styles.servicePrice}>{formatPriceRangeLabel(s)}</Text>
+                <Feather name="chevron-right" size={18} color={Colors.textMuted} />
+              </TouchableOpacity>
+            );
+          })}
+          {visibleServices.length === 0 && <Text style={styles.emptyText}>No services listed</Text>}
         </View>
 
         {tailor.reviews?.length > 0 && (
@@ -120,7 +185,7 @@ const styles = StyleSheet.create({
   serviceInfo: { flex: 1 },
   serviceName: { fontFamily: Fonts.bodyBold, fontSize: 15, color: Colors.text },
   serviceCategory: { fontFamily: Fonts.ui, fontSize: 13, color: Colors.textMuted },
-  servicePrice: { fontFamily: Fonts.bodyBold, fontSize: 17, color: Colors.primary, marginRight: 8 },
+  servicePrice: { fontFamily: Fonts.bodyBold, fontSize: 15, color: Colors.primary, marginRight: 8 },
   reviewRow: { paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: Colors.subtle },
   reviewHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   reviewName: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.text },

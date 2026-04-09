@@ -769,13 +769,20 @@ class UserProfileUpdate(BaseModel):
 
 class ServiceCreate(BaseModel):
     service_name: str
-    price: float
     category: str
+    price: float
+    complexity: Optional[str] = None
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
 
 class OrderCreate(BaseModel):
     tailor_id: str
+    service_id: Optional[str] = None
     service_type: str
     description: str
+    measurement_type: str = "manual"
+    send_reference_cloth: bool = False
+    reference_cloth_note: Optional[str] = None
     reference_image: Optional[str] = None
     pickup_address: str
     delivery_address: Optional[str] = None
@@ -798,6 +805,35 @@ class DeliveryAvailabilityUpdate(BaseModel):
 class DeliveryLocationUpdate(BaseModel):
     latitude: float
     longitude: float
+
+
+def normalize_service_payload(data: ServiceCreate) -> Dict[str, Any]:
+    service_name = data.service_name.strip()
+    category = data.category.strip()
+    if not service_name or not category:
+        raise HTTPException(status_code=400, detail="Service name and category are required")
+
+    base_price = float(data.price)
+    min_price = float(data.price_min) if data.price_min is not None else base_price
+    max_price = float(data.price_max) if data.price_max is not None else max(base_price, min_price)
+
+    if min_price <= 0 or max_price <= 0:
+        raise HTTPException(status_code=400, detail="Price values must be greater than zero")
+
+    if min_price > max_price:
+        min_price, max_price = max_price, min_price
+
+    if base_price < min_price or base_price > max_price:
+        base_price = min_price
+
+    return {
+        "service_name": service_name,
+        "category": category,
+        "complexity": (data.complexity or "").strip(),
+        "price": round(base_price, 2),
+        "price_min": round(min_price, 2),
+        "price_max": round(max_price, 2),
+    }
 
 
 # ===================== AUTH HELPERS =====================
@@ -1046,9 +1082,14 @@ async def list_tailors(
     for tailor in tailors:
         services = await db.tailor_services.find({"tailor_id": tailor["id"]}, {"_id": 0}).to_list(100)
         tailor["services"] = services
-        prices = [s["price"] for s in services] if services else [0]
-        tailor["min_price"] = min(prices)
-        tailor["max_price"] = max(prices)
+        if services:
+            min_prices = [float(s.get("price_min", s.get("price", 0))) for s in services]
+            max_prices = [float(s.get("price_max", s.get("price", 0))) for s in services]
+            tailor["min_price"] = min(min_prices)
+            tailor["max_price"] = max(max_prices)
+        else:
+            tailor["min_price"] = 0
+            tailor["max_price"] = 0
 
     if max_price:
         tailors = [t for t in tailors if t.get("min_price", 0) <= max_price]
@@ -1077,10 +1118,26 @@ async def create_order(data: OrderCreate, user=Depends(require_customer)):
     if not tailor:
         raise HTTPException(status_code=404, detail="Tailor not found")
 
-    service = await db.tailor_services.find_one(
-        {"tailor_id": data.tailor_id, "service_name": data.service_type}, {"_id": 0}
-    )
-    price = service["price"] if service else 500
+    service = None
+    if data.service_id:
+        service = await db.tailor_services.find_one(
+            {"id": data.service_id, "tailor_id": data.tailor_id}, {"_id": 0}
+        )
+
+    if not service:
+        service = await db.tailor_services.find_one(
+            {"tailor_id": data.tailor_id, "service_name": data.service_type}, {"_id": 0}
+        )
+
+    base_price = float(service.get("price", service.get("price_min", 500))) if service else 500.0
+
+    measurement_type = (data.measurement_type or "manual").strip().lower()
+    if measurement_type not in {"ai", "manual", "expert"}:
+        measurement_type = "manual"
+
+    # Expert-assisted measurement carries an extra fee, while AI/manual stay free.
+    measurement_fee = 49.0 if measurement_type == "expert" else 0.0
+    price = round(base_price + measurement_fee, 2)
 
     settings = await db.settings.find_one({"key": "commission_percentage"}, {"_id": 0})
     commission_pct = settings["value"] if settings else 10.0
@@ -1109,9 +1166,19 @@ async def create_order(data: OrderCreate, user=Depends(require_customer)):
         "delivery_partner_name": "",
         "delivery_partner_phone": "",
         "delivery_phase": "",
-        "service_type": data.service_type,
+        "service_id": (service or {}).get("id", data.service_id or ""),
+        "service_type": (service or {}).get("service_name", data.service_type),
+        "service_category": (service or {}).get("category", ""),
+        "service_complexity": (service or {}).get("complexity", ""),
+        "service_price_min": float((service or {}).get("price_min", base_price)),
+        "service_price_max": float((service or {}).get("price_max", base_price)),
+        "service_base_price": round(base_price, 2),
         "description": data.description,
         "reference_image": data.reference_image or "",
+        "measurement_type": measurement_type,
+        "measurement_fee": measurement_fee,
+        "send_reference_cloth": bool(data.send_reference_cloth),
+        "reference_cloth_note": (data.reference_cloth_note or "").strip(),
         "pickup_address": data.pickup_address,
         "delivery_address": data.delivery_address or data.pickup_address,
         "price": price,
@@ -1292,12 +1359,11 @@ async def get_my_services(user=Depends(require_tailor)):
 
 @api_router.post("/tailor/services")
 async def add_service(data: ServiceCreate, user=Depends(require_tailor)):
+    normalized = normalize_service_payload(data)
     service = {
         "id": str(uuid.uuid4()),
         "tailor_id": user["id"],
-        "service_name": data.service_name,
-        "price": data.price,
-        "category": data.category
+        **normalized,
     }
     await db.tailor_services.insert_one(service)
     service.pop("_id", None)
@@ -1305,9 +1371,10 @@ async def add_service(data: ServiceCreate, user=Depends(require_tailor)):
 
 @api_router.put("/tailor/services/{service_id}")
 async def update_service(service_id: str, data: ServiceCreate, user=Depends(require_tailor)):
+    normalized = normalize_service_payload(data)
     result = await db.tailor_services.update_one(
         {"id": service_id, "tailor_id": user["id"]},
-        {"$set": {"service_name": data.service_name, "price": data.price, "category": data.category}}
+        {"$set": normalized}
     )
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Service not found")

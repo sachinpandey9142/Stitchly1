@@ -198,7 +198,10 @@ export default function CustomerHome() {
       testID={`home-tailor-${item.id}`}
       style={styles.tailorCard}
       activeOpacity={0.85}
-      onPress={() => router.push(`/tailor/${item.id}`)}
+      onPress={() => {
+        const categoryQuery = selectedCategory ? `?category=${encodeURIComponent(selectedCategory)}` : '';
+        router.push(`/tailor/${item.id}${categoryQuery}`);
+      }}
     >
       <View style={styles.tailorCardHeader}>
         <View style={styles.tailorAvatar}>

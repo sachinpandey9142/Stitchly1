@@ -148,7 +148,13 @@ export default function NearbyTailorsTab() {
           contentContainerStyle={styles.listContent}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
           renderItem={({ item }) => (
-            <TouchableOpacity style={styles.card} onPress={() => router.push(`/tailor/${item.id}`)}>
+            <TouchableOpacity
+              style={styles.card}
+              onPress={() => {
+                const categoryQuery = selectedCategory ? `?category=${encodeURIComponent(selectedCategory)}` : '';
+                router.push(`/tailor/${item.id}${categoryQuery}`);
+              }}
+            >
               <View style={styles.cardTop}>
                 <Text style={styles.name}>{item.name}</Text>
                 {item.distanceKm != null ? <Text style={styles.distance}>{item.distanceKm.toFixed(1)} km</Text> : null}

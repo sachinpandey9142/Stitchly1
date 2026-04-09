@@ -52,6 +52,12 @@ export default function OrderDetail() {
   if (loading) return <View style={styles.loader}><ActivityIndicator size="large" color={Colors.primary} /></View>;
   if (!order) return <View style={styles.loader}><Text style={styles.errorText}>Order not found</Text></View>;
 
+  const measurementLabel = order.measurement_type === 'ai'
+    ? 'AI Measurement'
+    : order.measurement_type === 'expert'
+      ? 'Expert Measurement'
+      : 'Self Measurement';
+
   const currentIdx = Math.max(ORDER_STEPS.indexOf(order.status), 0);
 
   return (
@@ -73,6 +79,9 @@ export default function OrderDetail() {
           <View style={styles.infoRow}><Feather name="user" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>Customer: {order.customer_name}</Text></View>
           <View style={styles.infoRow}><Feather name="scissors" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>Tailor: {order.tailor_name}</Text></View>
           {order.delivery_partner_name && order.status !== 'placed' ? <View style={styles.infoRow}><Feather name="truck" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>Delivery: {order.delivery_partner_name}</Text></View> : null}
+          <View style={styles.infoRow}><Feather name="sliders" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>Measurement: {measurementLabel}</Text></View>
+          {order.send_reference_cloth ? <View style={styles.infoRow}><Feather name="archive" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>Reference cloth: Yes</Text></View> : null}
+          {order.reference_cloth_note ? <Text style={styles.referenceNote}>{order.reference_cloth_note}</Text> : null}
           <View style={styles.infoRow}><Feather name="map-pin" size={14} color={Colors.textMuted} /><Text style={styles.infoText}>Pickup: {order.pickup_address}</Text></View>
         </View>
 
@@ -88,7 +97,9 @@ export default function OrderDetail() {
         </View>
 
         <View style={styles.priceSection}>
-          <View style={styles.priceRow}><Text style={styles.priceLabel}>Service Price</Text><Text style={styles.priceValue}>{'\u20B9'}{order.price}</Text></View>
+          <View style={styles.priceRow}><Text style={styles.priceLabel}>Service Price</Text><Text style={styles.priceValue}>{'\u20B9'}{order.service_base_price ?? order.price}</Text></View>
+          {order.measurement_fee ? <View style={styles.priceRow}><Text style={styles.priceLabel}>Measurement Fee</Text><Text style={styles.priceValue}>{'\u20B9'}{order.measurement_fee}</Text></View> : null}
+          <View style={styles.priceRow}><Text style={styles.priceLabel}>Total Price</Text><Text style={styles.priceValue}>{'\u20B9'}{order.price}</Text></View>
           <View style={styles.priceRow}><Text style={styles.priceLabel}>Payment Method</Text><Text style={styles.priceValue}>{order.payment_method === 'cod' ? 'Cash on Delivery' : 'Online'}</Text></View>
           <View style={styles.priceRow}><Text style={styles.priceLabel}>Payment Status</Text><Text style={[styles.priceValue, { color: order.payment_status === 'completed' ? Colors.success : Colors.warning }]}>{order.payment_status}</Text></View>
         </View>
@@ -138,6 +149,13 @@ const styles = StyleSheet.create({
   desc: { fontFamily: Fonts.ui, fontSize: 14, color: Colors.textMuted, marginBottom: 12 },
   infoRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
   infoText: { fontFamily: Fonts.ui, fontSize: 14, color: Colors.text, marginLeft: 8 },
+  referenceNote: {
+    marginBottom: 8,
+    marginLeft: 22,
+    fontFamily: Fonts.ui,
+    fontSize: 13,
+    color: Colors.textMuted,
+  },
   stepRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 4, position: 'relative' },
   stepDot: { width: 12, height: 12, borderRadius: 6, marginRight: 12 },
   stepLine: { position: 'absolute', left: 5, top: 12, width: 2, height: 18 },
