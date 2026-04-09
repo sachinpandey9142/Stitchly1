@@ -196,7 +196,7 @@ const CAPTURE_STEPS: Array<{ key: CaptureStep; title: string; hint: string }> = 
   {
     key: "side",
     title: "Step 2/3: Side",
-    hint: "Turn 90° sideways and keep full body inside the frame box.",
+    hint: "Turn 90° sideways, arms close to body, keep full body inside frame box.",
   },
   {
     key: "back",

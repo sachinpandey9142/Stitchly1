@@ -424,8 +424,8 @@ def _enforce_proportional_consistency(measurements: Dict[str, float], warnings: 
             updated = True
 
     if chest > 0.0 and waist > 0.0:
-        waist_min = chest * 0.70
-        waist_max = chest * 0.92
+        waist_min = chest * 0.78
+        waist_max = chest * 0.94
         corrected = _clamp(waist, waist_min, waist_max)
         if abs(corrected - waist) > 0.05:
             measurements["waist_cm"] = corrected
@@ -433,8 +433,8 @@ def _enforce_proportional_consistency(measurements: Dict[str, float], warnings: 
             updated = True
 
     if chest > 0.0 and hip_circ > 0.0:
-        hip_min = max(waist * 1.03 if waist > 0.0 else chest * 0.90, chest * 0.90)
-        hip_max = chest * 1.08
+        hip_min = max(waist * 1.03 if waist > 0.0 else chest * 0.92, chest * 0.92)
+        hip_max = chest * 1.10
         corrected = _clamp(hip_circ, hip_min, hip_max)
         if abs(corrected - hip_circ) > 0.05:
             measurements["hip_circumference_cm"] = corrected
@@ -442,8 +442,8 @@ def _enforce_proportional_consistency(measurements: Dict[str, float], warnings: 
             updated = True
 
     if shoulder > 0.0 and neck > 0.0:
-        neck_min = shoulder * 0.72
-        neck_max = shoulder * 0.92
+        neck_min = shoulder * 0.70
+        neck_max = shoulder * 0.84
         corrected = _clamp(neck, neck_min, neck_max)
         if abs(corrected - neck) > 0.05:
             measurements["neck_cm"] = corrected
@@ -451,6 +451,71 @@ def _enforce_proportional_consistency(measurements: Dict[str, float], warnings: 
 
     if updated:
         warnings.append("Body proportion consistency correction was applied.")
+
+
+def _correct_torso_underestimation(measurements: Dict[str, float], warnings: List[str]) -> None:
+    chest = float(measurements.get("chest_cm", 0.0) or 0.0)
+    waist = float(measurements.get("waist_cm", 0.0) or 0.0)
+    hip = float(measurements.get("hip_circumference_cm", 0.0) or 0.0)
+
+    if chest <= 0.0 or waist <= 0.0:
+        return
+
+    waist_floor = chest * 0.87
+    if hip > 0.0:
+        waist_floor = max(waist_floor, hip * 0.88)
+
+    if waist < waist_floor * 0.97:
+        corrected_waist = max(waist * 0.12 + waist_floor * 0.88, waist_floor * 0.995)
+        measurements["waist_cm"] = corrected_waist
+        waist = corrected_waist
+        warnings.append("Waist estimate was corrected for torso under-segmentation.")
+
+    if hip > 0.0:
+        hip_floor = max(waist * 1.03, chest * 0.94)
+        if hip < hip_floor * 0.96:
+            corrected_hip = max(hip * 0.14 + hip_floor * 0.86, hip_floor * 0.992)
+            measurements["hip_circumference_cm"] = corrected_hip
+            warnings.append("Hip estimate was corrected for torso under-segmentation.")
+
+
+def _apply_final_measurement_bias_correction(
+    measurements: Dict[str, float],
+    height_cm: float,
+    warnings: List[str],
+) -> None:
+    shoulder = float(measurements.get("shoulder_width_cm", 0.0) or 0.0)
+    chest = float(measurements.get("chest_cm", 0.0) or 0.0)
+    arm = float(measurements.get("arm_length_cm", 0.0) or 0.0)
+    leg = float(measurements.get("leg_length_cm", 0.0) or 0.0)
+
+    adjusted = False
+
+    if shoulder > 0.0 and chest > 0.0:
+        shoulder_target = (chest / 2.10) * 0.6 + (height_cm * 0.255) * 0.4
+        corrected_shoulder = _clamp(shoulder, shoulder_target * 0.92, shoulder_target * 1.10)
+        if abs(corrected_shoulder - shoulder) > 0.05:
+            measurements["shoulder_width_cm"] = corrected_shoulder
+            shoulder = corrected_shoulder
+            adjusted = True
+
+    if arm > 0.0:
+        arm_target = (height_cm * 0.355) * 0.72 + (max(shoulder, 1.0) * 1.30) * 0.28
+        corrected_arm = _clamp((arm * 0.78) + (arm_target * 0.22), height_cm * 0.33, height_cm * 0.38)
+        if abs(corrected_arm - arm) > 0.05:
+            measurements["arm_length_cm"] = corrected_arm
+            adjusted = True
+
+    if leg > 0.0:
+        # Raw hip-knee-ankle path tends to approximate outseam; normalize to inseam-like estimate.
+        inseam_estimate = leg * 0.90
+        corrected_leg = _clamp(inseam_estimate, height_cm * 0.44, height_cm * 0.49)
+        if abs(corrected_leg - leg) > 0.05:
+            measurements["leg_length_cm"] = corrected_leg
+            adjusted = True
+
+    if adjusted:
+        warnings.append("Final anthropometric bias correction was applied.")
 
 
 def _stabilize_measurements_with_priors(
@@ -785,6 +850,119 @@ def _interpolate_point(
         (point_a[0] * (1.0 - r)) + (point_b[0] * r),
         (point_a[1] * (1.0 - r)) + (point_b[1] * r),
     )
+
+
+def _interpolated_pair_width_pixels(
+    landmarks: List[Any],
+    left_start_index: int,
+    left_end_index: int,
+    right_start_index: int,
+    right_end_index: int,
+    ratio: float,
+    image_width: int,
+) -> float:
+    required_indices = (left_start_index, left_end_index, right_start_index, right_end_index)
+    if any(index >= len(landmarks) or index < 0 for index in required_indices):
+        return 0.0
+
+    left_start = _get_xy(landmarks[left_start_index])
+    left_end = _get_xy(landmarks[left_end_index])
+    right_start = _get_xy(landmarks[right_start_index])
+    right_end = _get_xy(landmarks[right_end_index])
+
+    left_point = _interpolate_point(left_start, left_end, ratio)
+    right_point = _interpolate_point(right_start, right_end, ratio)
+    return abs(float(right_point[0]) - float(left_point[0])) * image_width
+
+
+def _torso_center_x_normalized(landmarks: List[Any], y_norm: float) -> float:
+    if len(landmarks) <= 24:
+        return 0.5
+
+    left_shoulder = _get_xy(landmarks[11])
+    right_shoulder = _get_xy(landmarks[12])
+    left_hip = _get_xy(landmarks[23])
+    right_hip = _get_xy(landmarks[24])
+
+    shoulder_mid = _midpoint(left_shoulder, right_shoulder)
+    hip_mid = _midpoint(left_hip, right_hip)
+    shoulder_y = shoulder_mid[1]
+    hip_y = hip_mid[1]
+
+    if abs(hip_y - shoulder_y) <= 1e-6:
+        return _clamp(shoulder_mid[0], 0.0, 1.0)
+
+    ratio = _clamp((float(y_norm) - shoulder_y) / (hip_y - shoulder_y), 0.0, 1.0)
+    center_x = (shoulder_mid[0] * (1.0 - ratio)) + (hip_mid[0] * ratio)
+    return _clamp(center_x, 0.0, 1.0)
+
+
+def _mask_core_width_pixels(
+    mask: Optional[np.ndarray],
+    y_norm: float,
+    center_x_norm: float,
+    max_half_width_px: float,
+) -> Tuple[float, float]:
+    if mask is None or mask.size == 0:
+        return 0.0, 0.0
+
+    if mask.ndim > 2:
+        mask = mask[:, :, 0]
+
+    height, width = mask.shape[:2]
+    center_row = int(_clamp(y_norm, 0.0, 1.0) * max(height - 1, 1))
+    center_x = int(_clamp(center_x_norm, 0.0, 1.0) * max(width - 1, 1))
+    half_limit = max(0, int(max_half_width_px))
+
+    row_padding = max(1, int(height * 0.015))
+    min_row = max(0, center_row - row_padding)
+    max_row = min(height - 1, center_row + row_padding)
+
+    widths: List[float] = []
+    confidences: List[float] = []
+
+    for row in range(min_row, max_row + 1):
+        row_values = mask[row, :]
+        body_indices = np.where(row_values >= SEGMENTATION_THRESHOLD)[0]
+        if body_indices.size < 2:
+            continue
+
+        runs: List[Tuple[int, int]] = []
+        start = int(body_indices[0])
+        previous = int(body_indices[0])
+        for raw_index in body_indices[1:]:
+            current = int(raw_index)
+            if current == previous + 1:
+                previous = current
+                continue
+            runs.append((start, previous))
+            start = current
+            previous = current
+        runs.append((start, previous))
+
+        containing_runs = [run for run in runs if run[0] <= center_x <= run[1]]
+        if containing_runs:
+            left, right = max(containing_runs, key=lambda run: run[1] - run[0])
+        else:
+            left, right = min(runs, key=lambda run: abs(((run[0] + run[1]) * 0.5) - center_x))
+
+        if half_limit > 0:
+            left = max(left, center_x - half_limit)
+            right = min(right, center_x + half_limit)
+
+        if right - left < 2:
+            continue
+
+        segment = row_values[left:right + 1]
+        widths.append(float(right - left))
+        confidences.append(float(np.mean(segment)) if segment.size > 0 else 0.0)
+
+    if not widths:
+        return 0.0, 0.0
+
+    coverage = len(widths) / float((max_row - min_row + 1) or 1)
+    confidence = _clamp((0.72 * _average(confidences)) + (0.28 * coverage), 0.0, 1.0)
+    return _median(widths), confidence
 
 
 def _interpolated_anchors(landmarks: List[Any]) -> Dict[str, Tuple[float, float]]:
@@ -1210,22 +1388,84 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         back_chest_px, back_chest_conf, back_chest_sil = _view_width_estimate(back, chest_y, (11, 12))
         front_chest_profile_px, front_chest_profile_conf = _profile_width_pixels(front, chest_y)
         back_chest_profile_px, back_chest_profile_conf = _profile_width_pixels(back, chest_y)
+
+        chest_landmark_span_px = _average(
+            [
+                _interpolated_pair_width_pixels(front_landmarks_data, 11, 23, 12, 24, 0.28, front["image_width"]),
+                _interpolated_pair_width_pixels(back_landmarks_data, 11, 23, 12, 24, 0.28, back["image_width"]),
+            ]
+        )
+        waist_landmark_span_px = _average(
+            [
+                _interpolated_pair_width_pixels(front_landmarks_data, 11, 23, 12, 24, 0.72, front["image_width"]),
+                _interpolated_pair_width_pixels(back_landmarks_data, 11, 23, 12, 24, 0.72, back["image_width"]),
+            ]
+        )
+        hip_landmark_span_px = hip_anchor_px
+
+        front_chest_core_px, front_chest_core_conf = _mask_core_width_pixels(
+            front.get("mask"),
+            chest_y,
+            _torso_center_x_normalized(front_landmarks_data, chest_y),
+            shoulder_anchor_px * 0.49,
+        )
+        back_chest_core_px, back_chest_core_conf = _mask_core_width_pixels(
+            back.get("mask"),
+            chest_y,
+            _torso_center_x_normalized(back_landmarks_data, chest_y),
+            shoulder_anchor_px * 0.49,
+        )
+        front_waist_core_px, front_waist_core_conf = _mask_core_width_pixels(
+            front.get("mask"),
+            waist_y,
+            _torso_center_x_normalized(front_landmarks_data, waist_y),
+            shoulder_anchor_px * 0.43,
+        )
+        back_waist_core_px, back_waist_core_conf = _mask_core_width_pixels(
+            back.get("mask"),
+            waist_y,
+            _torso_center_x_normalized(back_landmarks_data, waist_y),
+            shoulder_anchor_px * 0.43,
+        )
+        front_hip_core_px, front_hip_core_conf = _mask_core_width_pixels(
+            front.get("mask"),
+            hip_y,
+            _torso_center_x_normalized(front_landmarks_data, hip_y),
+            max(hip_anchor_px * 0.56, shoulder_anchor_px * 0.46),
+        )
+        back_hip_core_px, back_hip_core_conf = _mask_core_width_pixels(
+            back.get("mask"),
+            hip_y,
+            _torso_center_x_normalized(back_landmarks_data, hip_y),
+            max(hip_anchor_px * 0.56, shoulder_anchor_px * 0.46),
+        )
+
         chest_contour_px, _ = _weighted_fusion(
             [
                 (front_chest_profile_px, front_chest_profile_conf * 1.2),
                 (back_chest_profile_px, back_chest_profile_conf),
                 (front_chest_px, front_chest_conf * 0.9),
                 (back_chest_px, back_chest_conf * 0.9),
+                (front_chest_core_px, front_chest_core_conf * 1.45),
+                (back_chest_core_px, back_chest_core_conf * 1.35),
             ],
             fallback=max(front_chest_px, back_chest_px),
         )
 
-        if chest_contour_px > 0.0 and shoulder_width_px > 0.0:
-            chest_width_px = (chest_contour_px * 0.55) + (shoulder_width_px * 0.45)
-        elif chest_contour_px > 0.0:
-            chest_width_px = chest_contour_px
-        else:
-            chest_width_px = max(shoulder_width_px * 0.9, shoulder_anchor_px * 0.9)
+        if chest_landmark_span_px > 0.0 and chest_contour_px > 0.0:
+            chest_contour_px = min(chest_contour_px, chest_landmark_span_px * 1.22)
+
+        chest_width_px, _ = _weighted_fusion(
+            [
+                (chest_contour_px, 0.45),
+                (chest_landmark_span_px, 0.85),
+                (shoulder_anchor_px * 0.92, 0.30),
+            ],
+            fallback=max(chest_contour_px, chest_landmark_span_px, shoulder_anchor_px * 0.9),
+        )
+
+        if chest_landmark_span_px > 0.0:
+            chest_width_px = _clamp(chest_width_px, chest_landmark_span_px * 0.92, chest_landmark_span_px * 1.18)
 
         front_waist_px, front_waist_conf, front_waist_sil = _view_width_estimate(front, waist_y, (23, 24))
         back_waist_px, back_waist_conf, back_waist_sil = _view_width_estimate(back, waist_y, (23, 24))
@@ -1233,14 +1473,26 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
             [
                 (front_waist_px, front_waist_conf),
                 (back_waist_px, back_waist_conf),
+                (front_waist_core_px, front_waist_core_conf * 1.35),
+                (back_waist_core_px, back_waist_core_conf * 1.3),
             ],
             fallback=0.0,
         )
 
-        if waist_contour_px > 0.0 and chest_width_px > 0.0:
-            waist_width_px = (waist_contour_px * 0.64) + ((chest_width_px * 0.82) * 0.36)
-        else:
-            waist_width_px = max(waist_contour_px, chest_width_px * 0.84, hip_anchor_px * 0.9)
+        if waist_landmark_span_px > 0.0 and waist_contour_px > 0.0:
+            waist_contour_px = min(waist_contour_px, waist_landmark_span_px * 1.18)
+
+        waist_width_px, _ = _weighted_fusion(
+            [
+                (waist_contour_px, 0.34),
+                (waist_landmark_span_px, 0.90),
+                (chest_width_px * 0.82, 0.24),
+            ],
+            fallback=max(waist_contour_px, waist_landmark_span_px, chest_width_px * 0.80),
+        )
+
+        if waist_landmark_span_px > 0.0:
+            waist_width_px = _clamp(waist_width_px, waist_landmark_span_px * 0.88, waist_landmark_span_px * 1.16)
 
         front_hip_px, front_hip_conf, front_hip_sil = _view_width_estimate(front, hip_y, (23, 24))
         back_hip_px, back_hip_conf, back_hip_sil = _view_width_estimate(back, hip_y, (23, 24))
@@ -1248,21 +1500,33 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
             [
                 (front_hip_px, front_hip_conf),
                 (back_hip_px, back_hip_conf),
+                (front_hip_core_px, front_hip_core_conf * 1.2),
+                (back_hip_core_px, back_hip_core_conf * 1.15),
             ],
             fallback=0.0,
         )
 
-        if hip_contour_px > 0.0 and hip_anchor_px > 0.0:
-            hip_width_px = (hip_contour_px * 0.64) + (hip_anchor_px * 0.36)
-        else:
-            hip_width_px = max(hip_contour_px, hip_anchor_px)
+        if hip_landmark_span_px > 0.0 and hip_contour_px > 0.0:
+            hip_contour_px = min(hip_contour_px, hip_landmark_span_px * 1.20)
+
+        hip_width_px, _ = _weighted_fusion(
+            [
+                (hip_contour_px, 0.40),
+                (hip_landmark_span_px, 0.80),
+                (waist_width_px * 1.06, 0.25),
+            ],
+            fallback=max(hip_contour_px, hip_landmark_span_px, waist_width_px * 1.02),
+        )
+
+        if hip_landmark_span_px > 0.0:
+            hip_width_px = _clamp(hip_width_px, hip_landmark_span_px * 0.90, hip_landmark_span_px * 1.18)
 
         if shoulder_width_px > 0.0 and chest_width_px > 0.0:
             chest_width_px = min(chest_width_px, shoulder_width_px * 0.96)
         if chest_width_px > 0.0 and waist_width_px > 0.0:
-            waist_width_px = min(waist_width_px, chest_width_px * 0.97)
+            waist_width_px = min(waist_width_px, chest_width_px * 0.90)
         if chest_width_px > 0.0 and hip_width_px > 0.0:
-            hip_width_px = min(hip_width_px, chest_width_px * 1.08)
+            hip_width_px = min(hip_width_px, chest_width_px * 1.02)
 
         side_torso_depth_px = _average(
             [
@@ -1280,9 +1544,9 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         side_hip_depth_px, _, side_hip_sil = _view_width_estimate(side, hip_y)
         side_neck_depth_px, _, side_neck_sil = _view_width_estimate(side, neck_y)
 
-        chest_depth_fallback_px = max(side_torso_depth_px * 0.92, chest_width_px * 0.52)
-        waist_depth_fallback_px = max(side_torso_depth_px * 0.88, waist_width_px * 0.48)
-        hip_depth_fallback_px = max(side_torso_depth_px * 0.98, hip_width_px * 0.52)
+        chest_depth_fallback_px = max(side_torso_depth_px * 0.82, chest_width_px * 0.44)
+        waist_depth_fallback_px = max(side_torso_depth_px * 0.78, waist_width_px * 0.40)
+        hip_depth_fallback_px = max(side_torso_depth_px * 0.86, hip_width_px * 0.45)
 
         chest_depth_px = _perspective_corrected_depth(
             side_chest_depth_px,
@@ -1307,11 +1571,11 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         )
 
         if chest_width_px > 0.0:
-            chest_depth_px = _clamp(chest_depth_px, chest_width_px * 0.40, chest_width_px * 0.76)
+            chest_depth_px = _clamp(chest_depth_px, chest_width_px * 0.34, chest_width_px * 0.62)
         if waist_width_px > 0.0:
-            waist_depth_px = _clamp(waist_depth_px, waist_width_px * 0.38, waist_width_px * 0.72)
+            waist_depth_px = _clamp(waist_depth_px, waist_width_px * 0.32, waist_width_px * 0.58)
         if hip_width_px > 0.0:
-            hip_depth_px = _clamp(hip_depth_px, hip_width_px * 0.44, hip_width_px * 0.80)
+            hip_depth_px = _clamp(hip_depth_px, hip_width_px * 0.36, hip_width_px * 0.64)
 
         front_neck_width_px, front_neck_conf, front_neck_sil = _view_width_estimate(front, neck_y, (7, 8))
         back_neck_width_px, back_neck_conf, back_neck_sil = _view_width_estimate(back, neck_y, (7, 8))
@@ -1325,12 +1589,12 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         neck_depth_px = _perspective_corrected_depth(
             side_neck_depth_px,
             neck_width_px,
-            max(side_torso_depth_px * 0.52, neck_width_px * 0.42),
+            max(side_torso_depth_px * 0.44, neck_width_px * 0.34),
             side_turn_cos,
             side_turn_sin,
         )
         if neck_width_px > 0.0:
-            neck_depth_px = _clamp(neck_depth_px, neck_width_px * 0.40, neck_width_px * 0.74)
+            neck_depth_px = _clamp(neck_depth_px, neck_width_px * 0.34, neck_width_px * 0.58)
 
         shoulder_width_cm = shoulder_width_px * pixel_to_cm
         chest_width_cm = chest_width_px * pixel_to_cm
@@ -1357,7 +1621,7 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
             ]
         ) * pixel_to_cm
 
-        leg_length_cm = _average(
+        leg_length_outseam_cm = _average(
             [
                 _segment_chain_length_pixels(front_landmarks_data, [23, 25, 27], front["image_width"], front["image_height"]),
                 _segment_chain_length_pixels(front_landmarks_data, [24, 26, 28], front["image_width"], front["image_height"]),
@@ -1365,6 +1629,7 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
                 _segment_chain_length_pixels(back_landmarks_data, [24, 26, 28], back["image_width"], back["image_height"]),
             ]
         ) * pixel_to_cm
+        leg_length_cm = leg_length_outseam_cm * 0.90
 
         measurements = {
             "shoulder_width_cm": shoulder_width_cm,
@@ -1381,6 +1646,7 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         _fill_missing_measurements(measurements, height_cm, warnings)
         _validate_outliers(measurements, warnings)
         _enforce_proportional_consistency(measurements, warnings)
+        _correct_torso_underestimation(measurements, warnings)
 
         if torso_ratio < 0.18:
             warnings.append("User appears far from camera; confidence reduced.")
@@ -1435,6 +1701,10 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         confidences["overall"] = quality_score
 
         _stabilize_measurements_with_priors(measurements, height_cm, quality_score, warnings)
+        _apply_final_measurement_bias_correction(measurements, height_cm, warnings)
+        _enforce_proportional_consistency(measurements, warnings)
+        _correct_torso_underestimation(measurements, warnings)
+        _validate_outliers(measurements, warnings)
 
         min_metric_conf = min(value for key, value in confidences.items() if key != "overall")
         if quality_score < LOW_QUALITY_WARNING_THRESHOLD or min_metric_conf < MIN_METRIC_CONFIDENCE:

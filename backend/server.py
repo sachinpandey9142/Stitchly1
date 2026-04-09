@@ -462,14 +462,14 @@ def _estimate_position_feedback(
     if shoulder_tilt > 0.08:
         return {"instruction": "Stand straight", "ready_to_capture": False, "quality_score": 0.35}
 
-    if view_name in {"front", "back"} and arm_spread > 0.31:
+    if view_name in {"front", "back"} and arm_spread > 0.25:
         return {
             "instruction": "Keep arms relaxed near torso",
             "ready_to_capture": False,
             "quality_score": 0.30,
         }
 
-    if view_name == "side" and shoulder_span > 0.16:
+    if view_name == "side" and shoulder_span > 0.14:
         return {
             "instruction": "Turn more sideways (about 90°)",
             "ready_to_capture": False,

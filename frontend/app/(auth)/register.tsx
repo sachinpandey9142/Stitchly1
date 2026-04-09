@@ -26,6 +26,8 @@ const ROLES = [
 ];
 
 const SCAN_RESULT_STORAGE_KEY = 'stitchly_latest_scan_measurements';
+const CM_PER_INCH = 2.54;
+type MeasurementUnit = 'cm' | 'in';
 
 export default function Register() {
   const router = useRouter();
@@ -68,6 +70,7 @@ export default function Register() {
   const [isMoving, setIsMoving] = useState(false);
   const [height, setHeight] = useState('');
   const [weight, setWeight] = useState('');
+  const [measurementUnit, setMeasurementUnit] = useState<MeasurementUnit>('cm');
   const [bodyType, setBodyType] = useState<'slim' | 'fit' | 'bulk' | ''>('');
   const [gender, setGender] = useState<'male' | 'female'>('male');
   const [shoulder, setShoulder] = useState('');
@@ -258,6 +261,41 @@ const toPositiveNumber = (value: string): number | undefined => {
   if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
   return parsed;
 };
+
+const sanitizeNumericInput = (value: string): string => {
+  const sanitized = value.replace(/[^0-9.]/g, '');
+  const firstDot = sanitized.indexOf('.');
+  if (firstDot === -1) return sanitized;
+  return sanitized.slice(0, firstDot + 1) + sanitized.slice(firstDot + 1).replace(/\./g, '');
+};
+
+const formatUnitValue = (value: number): string => {
+  if (!Number.isFinite(value)) return '';
+  const fixed = value.toFixed(2);
+  return fixed.replace(/\.00$/, '').replace(/(\.\d)0$/, '$1');
+};
+
+const toDisplayUnitValue = useCallback((valueCm: string): string => {
+  const parsed = Number(valueCm);
+  if (!Number.isFinite(parsed) || parsed <= 0) return valueCm || '';
+  const converted = measurementUnit === 'in' ? parsed / CM_PER_INCH : parsed;
+  return formatUnitValue(converted);
+}, [measurementUnit]);
+
+const toCanonicalCmValue = useCallback((inputValue: string): string => {
+  const sanitized = sanitizeNumericInput(inputValue);
+  if (!sanitized) return '';
+
+  const parsed = Number(sanitized);
+  if (!Number.isFinite(parsed) || parsed <= 0) return '';
+
+  const cmValue = measurementUnit === 'in' ? parsed * CM_PER_INCH : parsed;
+  return formatUnitValue(cmValue);
+}, [measurementUnit]);
+
+const setMeasurementInput = useCallback((setter: React.Dispatch<React.SetStateAction<string>>, inputValue: string) => {
+  setter(toCanonicalCmValue(inputValue));
+}, [toCanonicalCmValue]);
 
 const buildBodyMeasurementsPayload = () => {
   if (role !== 'customer') return undefined;
@@ -1050,6 +1088,26 @@ const getBodyImage = (type: 'slim' | 'fit' | 'bulk') => {
     {'  '}Body Details
   </Text>
 
+  <View style={styles.measurementUnitRow}>
+    <Text style={styles.measurementUnitLabel}>Show Sizes In</Text>
+    <View style={styles.measurementUnitToggle}>
+      <TouchableOpacity
+        style={[styles.measurementUnitBtn, measurementUnit === 'cm' && styles.measurementUnitBtnActive]}
+        onPress={() => setMeasurementUnit('cm')}
+        activeOpacity={0.8}
+      >
+        <Text style={[styles.measurementUnitBtnText, measurementUnit === 'cm' && styles.measurementUnitBtnTextActive]}>cm</Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={[styles.measurementUnitBtn, measurementUnit === 'in' && styles.measurementUnitBtnActive]}
+        onPress={() => setMeasurementUnit('in')}
+        activeOpacity={0.8}
+      >
+        <Text style={[styles.measurementUnitBtnText, measurementUnit === 'in' && styles.measurementUnitBtnTextActive]}>in</Text>
+      </TouchableOpacity>
+    </View>
+  </View>
+
   <Pressable style={styles.scanButton} onPress={() => router.push('/scan-body')}>
     <Feather name="camera" size={16} color={Colors.textInverted} />
     <Text style={styles.scanButtonText}>Start AI Body Scan</Text>
@@ -1068,14 +1126,14 @@ const getBodyImage = (type: 'slim' | 'fit' | 'bulk') => {
   {/* Height & Weight Row */}
   <View style={{ flexDirection: 'row', gap: 10 }}>
     <View style={[styles.inputGroup, { flex: 1 }]}>
-      <Text style={styles.label}>Height (cm)</Text>
+      <Text style={styles.label}>Height ({measurementUnit})</Text>
       <View style={styles.inputContainer}>
         <TextInput
           style={styles.inputNoPad}
-          placeholder="e.g. 170"
+          placeholder={measurementUnit === 'cm' ? 'e.g. 170' : 'e.g. 67'}
           placeholderTextColor={Colors.textMuted}
-          value={height}
-          onChangeText={setHeight}
+          value={toDisplayUnitValue(height)}
+          onChangeText={(value) => setMeasurementInput(setHeight, value)}
           keyboardType="numeric"
         />
       </View>
@@ -1098,51 +1156,100 @@ const getBodyImage = (type: 'slim' | 'fit' | 'bulk') => {
 
   <View style={styles.measurementGrid}>
     <View style={styles.measurementTile}>
-      <Text style={styles.label}>Shoulder</Text>
+      <Text style={styles.label}>Shoulder ({measurementUnit})</Text>
       <View style={styles.inputContainer}>
-        <TextInput value={shoulder} placeholder="Shoulder" placeholderTextColor={Colors.textMuted} onChangeText={setShoulder} keyboardType="numeric" style={styles.inputNoPad} />
+        <TextInput
+          value={toDisplayUnitValue(shoulder)}
+          placeholder="Shoulder"
+          placeholderTextColor={Colors.textMuted}
+          onChangeText={(value) => setMeasurementInput(setShoulder, value)}
+          keyboardType="numeric"
+          style={styles.inputNoPad}
+        />
       </View>
     </View>
 
     <View style={styles.measurementTile}>
-      <Text style={styles.label}>Chest</Text>
+      <Text style={styles.label}>Chest ({measurementUnit})</Text>
       <View style={styles.inputContainer}>
-        <TextInput value={chest} placeholder="Chest" placeholderTextColor={Colors.textMuted} onChangeText={setChest} keyboardType="numeric" style={styles.inputNoPad} />
+        <TextInput
+          value={toDisplayUnitValue(chest)}
+          placeholder="Chest"
+          placeholderTextColor={Colors.textMuted}
+          onChangeText={(value) => setMeasurementInput(setChest, value)}
+          keyboardType="numeric"
+          style={styles.inputNoPad}
+        />
       </View>
     </View>
 
     <View style={styles.measurementTile}>
-      <Text style={styles.label}>Waist</Text>
+      <Text style={styles.label}>Waist ({measurementUnit})</Text>
       <View style={styles.inputContainer}>
-        <TextInput value={waist} placeholder="Waist" placeholderTextColor={Colors.textMuted} onChangeText={setWaist} keyboardType="numeric" style={styles.inputNoPad} />
+        <TextInput
+          value={toDisplayUnitValue(waist)}
+          placeholder="Waist"
+          placeholderTextColor={Colors.textMuted}
+          onChangeText={(value) => setMeasurementInput(setWaist, value)}
+          keyboardType="numeric"
+          style={styles.inputNoPad}
+        />
       </View>
     </View>
 
     <View style={styles.measurementTile}>
-      <Text style={styles.label}>Hip</Text>
+      <Text style={styles.label}>Hip ({measurementUnit})</Text>
       <View style={styles.inputContainer}>
-        <TextInput value={hip} placeholder="Hip" placeholderTextColor={Colors.textMuted} onChangeText={setHip} keyboardType="numeric" style={styles.inputNoPad} />
+        <TextInput
+          value={toDisplayUnitValue(hip)}
+          placeholder="Hip"
+          placeholderTextColor={Colors.textMuted}
+          onChangeText={(value) => setMeasurementInput(setHip, value)}
+          keyboardType="numeric"
+          style={styles.inputNoPad}
+        />
       </View>
     </View>
 
     <View style={styles.measurementTile}>
-      <Text style={styles.label}>Arm Length</Text>
+      <Text style={styles.label}>Arm Length ({measurementUnit})</Text>
       <View style={styles.inputContainer}>
-        <TextInput value={armLength} placeholder="Arm Length" placeholderTextColor={Colors.textMuted} onChangeText={setArmLength} keyboardType="numeric" style={styles.inputNoPad} />
+        <TextInput
+          value={toDisplayUnitValue(armLength)}
+          placeholder="Arm Length"
+          placeholderTextColor={Colors.textMuted}
+          onChangeText={(value) => setMeasurementInput(setArmLength, value)}
+          keyboardType="numeric"
+          style={styles.inputNoPad}
+        />
       </View>
     </View>
 
     <View style={styles.measurementTile}>
-      <Text style={styles.label}>Leg Length</Text>
+      <Text style={styles.label}>Leg Length ({measurementUnit})</Text>
       <View style={styles.inputContainer}>
-        <TextInput value={legLength} placeholder="Leg Length" placeholderTextColor={Colors.textMuted} onChangeText={setLegLength} keyboardType="numeric" style={styles.inputNoPad} />
+        <TextInput
+          value={toDisplayUnitValue(legLength)}
+          placeholder="Leg Length"
+          placeholderTextColor={Colors.textMuted}
+          onChangeText={(value) => setMeasurementInput(setLegLength, value)}
+          keyboardType="numeric"
+          style={styles.inputNoPad}
+        />
       </View>
     </View>
 
     <View style={[styles.measurementTile, { width: '100%' }]}>
-      <Text style={styles.label}>Neck</Text>
+      <Text style={styles.label}>Neck ({measurementUnit})</Text>
       <View style={styles.inputContainer}>
-        <TextInput value={neck} placeholder="Neck" placeholderTextColor={Colors.textMuted} onChangeText={setNeck} keyboardType="numeric" style={styles.inputNoPad} />
+        <TextInput
+          value={toDisplayUnitValue(neck)}
+          placeholder="Neck"
+          placeholderTextColor={Colors.textMuted}
+          onChangeText={(value) => setMeasurementInput(setNeck, value)}
+          keyboardType="numeric"
+          style={styles.inputNoPad}
+        />
       </View>
     </View>
   </View>
@@ -1444,6 +1551,51 @@ bodySection: {
   marginTop: 20,
   borderWidth: 1,
   borderColor: Colors.primary + '20',
+},
+
+measurementUnitRow: {
+  flexDirection: 'row',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  marginBottom: 12,
+},
+
+measurementUnitLabel: {
+  fontFamily: Fonts.ui,
+  fontSize: 13,
+  color: Colors.textMuted,
+},
+
+measurementUnitToggle: {
+  flexDirection: 'row',
+  backgroundColor: Colors.surface,
+  borderRadius: Radius.full,
+  borderWidth: 1,
+  borderColor: Colors.border,
+  padding: 2,
+},
+
+measurementUnitBtn: {
+  minWidth: 54,
+  alignItems: 'center',
+  justifyContent: 'center',
+  borderRadius: Radius.full,
+  paddingVertical: 6,
+  paddingHorizontal: 12,
+},
+
+measurementUnitBtnActive: {
+  backgroundColor: Colors.primary,
+},
+
+measurementUnitBtnText: {
+  fontFamily: Fonts.bodyBold,
+  fontSize: 12,
+  color: Colors.textMuted,
+},
+
+measurementUnitBtnTextActive: {
+  color: Colors.textInverted,
 },
 
 scanButton: {
