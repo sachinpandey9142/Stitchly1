@@ -84,3 +84,55 @@ def test_delivery_updates_require_assigned_driver(client, auth_headers):
         json={"status": "picked_up"},
     )
     assert other_driver_update.status_code == 404
+
+
+def test_delivery_pickup_details_are_saved_for_tailor(client, auth_headers):
+    create_order = client.post(
+        "/api/orders",
+        headers=auth_headers("customer-1"),
+        json={
+            "tailor_id": "tailor-1",
+            "service_type": "Blouse Stitching",
+            "description": "Capture pickup measurements",
+            "pickup_address": "123 Marine Drive",
+            "payment_method": "cod",
+            "measurement_type": "expert",
+            "send_reference_cloth": True,
+            "reference_cloth_note": "Blue sample blouse",
+        },
+    )
+    assert create_order.status_code == 200
+    order_id = create_order.json()["id"]
+
+    accepted = client.put(f"/api/orders/{order_id}/accept", headers=auth_headers("tailor-1"))
+    assert accepted.status_code == 200
+    assert accepted.json()["delivery_partner_id"] == "delivery-1"
+
+    pickup_details = client.put(
+        f"/api/delivery/{order_id}/pickup-details",
+        headers=auth_headers("delivery-1"),
+        json={
+            "measurement_received": True,
+            "measurement_note": "Customer confirmed measurements.",
+            "measurements": {
+                "chest_cm": 92,
+                "waist_cm": 74.5,
+                "hip_cm": 98,
+            },
+            "reference_cloth_received": True,
+            "reference_cloth_note": "Received 1 reference cloth",
+        },
+    )
+    assert pickup_details.status_code == 200
+    payload = pickup_details.json()
+    assert payload["pickup_measurement_received"] is True
+    assert payload["pickup_measurements"]["chest_cm"] == 92.0
+    assert payload["pickup_reference_cloth_received"] is True
+    assert payload["pickup_reference_cloth_note"] == "Received 1 reference cloth"
+
+    tailor_view = client.get(f"/api/orders/{order_id}", headers=auth_headers("tailor-1"))
+    assert tailor_view.status_code == 200
+    tailor_payload = tailor_view.json()
+    assert tailor_payload["pickup_measurement_received"] is True
+    assert tailor_payload["pickup_measurements"]["waist_cm"] == 74.5
+    assert tailor_payload["pickup_reference_cloth_received"] is True

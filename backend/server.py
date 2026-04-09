@@ -92,6 +92,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 DELIVERY_SEARCH_RADIUS_METERS = 7000
+DELIVERY_EXTENDED_SEARCH_RADIUS_METERS = 12000
 PENDING_DELIVERY_RETRY_STATUSES = ["accepted", "ready"]
 ACTIVE_DELIVERY_ORDER_STATUSES = [
     "pickup_assigned",
@@ -545,7 +546,16 @@ async def get_assignment_reference_geo(order: dict, phase: str) -> Optional[dict
     if customer_geo_location:
         return customer_geo_location
     customer = await db.users.find_one({"id": order["customer_id"]}, {"_id": 0, "geo_location": 1})
-    return get_geo_location(customer)
+    customer_geo_location = get_geo_location(customer)
+    if customer_geo_location:
+        return customer_geo_location
+
+    # Fallback for legacy orders where customer pickup geo is unavailable.
+    tailor_geo_location = normalize_geo_location(order.get("tailor_geo_location"))
+    if tailor_geo_location:
+        return tailor_geo_location
+    tailor = await db.users.find_one({"id": order["tailor_id"]}, {"_id": 0, "geo_location": 1})
+    return get_geo_location(tailor)
 
 
 async def get_assignment_failure_reason(reference_geo_location: Optional[dict]) -> str:
@@ -569,6 +579,7 @@ async def find_candidate_delivery_partners(
     reference_geo_location: Optional[dict],
     exclude_ids: Optional[List[str]] = None,
     limit: int = 10,
+    max_distance: int = DELIVERY_SEARCH_RADIUS_METERS,
 ):
     if not reference_geo_location:
         return []
@@ -580,7 +591,7 @@ async def find_candidate_delivery_partners(
         "geo_location": {
             "$near": {
                 "$geometry": reference_geo_location,
-                "$maxDistance": DELIVERY_SEARCH_RADIUS_METERS,
+                "$maxDistance": max_distance,
             }
         },
     }
@@ -619,8 +630,31 @@ async def assign_delivery_partner_to_order(order: dict, phase: str, status: str,
         )
         return None
 
-    candidates = await find_candidate_delivery_partners(reference_geo_location, exclude_ids=exclude_ids)
-    if not candidates:
+    if phase == "pickup" and not normalize_geo_location(order.get("pickup_geo_location")):
+        now = datetime.now(timezone.utc).isoformat()
+        await db.orders.update_one(
+            {"id": order["id"]},
+            {"$set": {"pickup_geo_location": reference_geo_location, "updated_at": now}},
+        )
+        order = {**order, "pickup_geo_location": reference_geo_location, "updated_at": now}
+
+    attempted_ids = set(exclude_ids or [])
+    for search_radius in sorted({DELIVERY_SEARCH_RADIUS_METERS, DELIVERY_EXTENDED_SEARCH_RADIUS_METERS}):
+        candidates = await find_candidate_delivery_partners(
+            reference_geo_location,
+            exclude_ids=list(attempted_ids),
+            max_distance=search_radius,
+        )
+        if not candidates:
+            continue
+
+        for delivery_partner in candidates:
+            attempted_ids.add(delivery_partner["id"])
+            assigned = await assign_specific_delivery_partner_to_order(order, delivery_partner, phase, status)
+            if assigned:
+                return assigned
+
+    if len(attempted_ids) == len(exclude_ids or []):
         reason = await get_assignment_failure_reason(reference_geo_location)
         logger.info(
             "Assignment failed for order %s phase=%s: %s",
@@ -629,11 +663,6 @@ async def assign_delivery_partner_to_order(order: dict, phase: str, status: str,
             reason,
         )
         return None
-
-    for delivery_partner in candidates:
-        assigned = await assign_specific_delivery_partner_to_order(order, delivery_partner, phase, status)
-        if assigned:
-            return assigned
 
     logger.info(
         "Assignment failed for order %s phase=%s: all candidate drivers were taken concurrently",
@@ -655,12 +684,50 @@ async def find_pending_orders_near_driver(delivery_partner: dict, limit: int = 2
             "pickup_geo_location": {
                 "$near": {
                     "$geometry": geo_location,
-                    "$maxDistance": DELIVERY_SEARCH_RADIUS_METERS,
+                    "$maxDistance": DELIVERY_EXTENDED_SEARCH_RADIUS_METERS,
                 }
             },
         },
         {"_id": 0},
     ).limit(limit).to_list(limit)
+
+    legacy_pickup_orders = await db.orders.find(
+        {
+            "status": "accepted",
+            "delivery_partner_id": "",
+            "$or": [
+                {"pickup_geo_location": None},
+                {"pickup_geo_location": {"$exists": False}},
+            ],
+            "tailor_geo_location": {
+                "$near": {
+                    "$geometry": geo_location,
+                    "$maxDistance": DELIVERY_EXTENDED_SEARCH_RADIUS_METERS,
+                }
+            },
+        },
+        {"_id": 0},
+    ).limit(limit).to_list(limit)
+
+    hydrated_legacy_orders: List[dict] = []
+    for order in legacy_pickup_orders:
+        fallback_pickup_geo = await get_assignment_reference_geo(order, "pickup")
+        if fallback_pickup_geo:
+            await db.orders.update_one(
+                {"id": order["id"]},
+                {
+                    "$set": {
+                        "pickup_geo_location": fallback_pickup_geo,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                },
+            )
+            order = {**order, "pickup_geo_location": fallback_pickup_geo}
+        hydrated_legacy_orders.append(order)
+
+    pickup_order_map = {order["id"]: order for order in pickup_orders}
+    for order in hydrated_legacy_orders:
+        pickup_order_map.setdefault(order["id"], order)
 
     ready_orders = await db.orders.find(
         {
@@ -669,14 +736,14 @@ async def find_pending_orders_near_driver(delivery_partner: dict, limit: int = 2
             "tailor_geo_location": {
                 "$near": {
                     "$geometry": geo_location,
-                    "$maxDistance": DELIVERY_SEARCH_RADIUS_METERS,
+                    "$maxDistance": DELIVERY_EXTENDED_SEARCH_RADIUS_METERS,
                 }
             },
         },
         {"_id": 0},
     ).limit(limit).to_list(limit)
 
-    return sorted(pickup_orders + ready_orders, key=lambda order: order.get("created_at", ""))
+    return sorted(list(pickup_order_map.values()) + ready_orders, key=lambda order: order.get("created_at", ""))
 
 
 async def dispatch_orders_for_delivery_partner(delivery_partner_id: str) -> int:
@@ -805,6 +872,33 @@ class DeliveryAvailabilityUpdate(BaseModel):
 class DeliveryLocationUpdate(BaseModel):
     latitude: float
     longitude: float
+
+
+class DeliveryPickupDetailsUpdate(BaseModel):
+    measurement_received: Optional[bool] = None
+    measurement_note: Optional[str] = None
+    measurements: Optional[Dict[str, float]] = None
+    reference_cloth_received: Optional[bool] = None
+    reference_cloth_note: Optional[str] = None
+
+
+def normalize_pickup_measurements(measurements: Optional[Dict[str, float]]) -> Dict[str, float]:
+    if not measurements or not isinstance(measurements, dict):
+        return {}
+
+    normalized: Dict[str, float] = {}
+    for key, value in measurements.items():
+        normalized_key = str(key or "").strip().lower().replace(" ", "_")
+        if not normalized_key:
+            continue
+        try:
+            numeric_value = round(float(value), 2)
+        except (TypeError, ValueError):
+            continue
+        if numeric_value <= 0:
+            continue
+        normalized[normalized_key] = numeric_value
+    return normalized
 
 
 def normalize_service_payload(data: ServiceCreate) -> Dict[str, Any]:
@@ -1145,7 +1239,7 @@ async def create_order(data: OrderCreate, user=Depends(require_customer)):
 
     customer_geo_location = get_geo_location(user)
     tailor_geo_location = get_geo_location(tailor)
-    pickup_geo_location = customer_geo_location
+    pickup_geo_location = customer_geo_location or tailor_geo_location
 
     order = {
         "id": str(uuid.uuid4()),
@@ -1179,6 +1273,13 @@ async def create_order(data: OrderCreate, user=Depends(require_customer)):
         "measurement_fee": measurement_fee,
         "send_reference_cloth": bool(data.send_reference_cloth),
         "reference_cloth_note": (data.reference_cloth_note or "").strip(),
+        "pickup_measurement_received": False,
+        "pickup_measurement_note": "",
+        "pickup_measurements": {},
+        "pickup_reference_cloth_received": False,
+        "pickup_reference_cloth_note": "",
+        "pickup_details_updated_at": "",
+        "pickup_details_updated_by": "",
         "pickup_address": data.pickup_address,
         "delivery_address": data.delivery_address or data.pickup_address,
         "price": price,
@@ -1240,6 +1341,7 @@ async def accept_order(order_id: str, user=Depends(require_tailor)):
             "updated_at": now,
         }}
     )
+    await retry_pending_delivery_assignments()
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
     return await enrich_order_with_locations(updated)
 
@@ -1284,6 +1386,7 @@ async def update_order_status(order_id: str, status: str = Body(..., embed=True)
                 "updated_at": now,
             }},
         )
+        await retry_pending_delivery_assignments()
         updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
         return await enrich_order_with_locations(updated)
 
@@ -1585,6 +1688,47 @@ async def decline_delivery_assignment(order_id: str, user=Depends(require_delive
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }}
     )
+    updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    return await enrich_order_with_locations(updated)
+
+
+@api_router.put("/delivery/{order_id}/pickup-details")
+async def update_pickup_details(order_id: str, data: DeliveryPickupDetailsUpdate, user=Depends(require_delivery)):
+    order = await db.orders.find_one({"id": order_id, "delivery_partner_id": user["id"]}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    phase = order.get("delivery_phase") or ("return" if order["status"] == "delivery_assigned" else "pickup")
+    if phase != "pickup":
+        raise HTTPException(status_code=400, detail="Pickup details are only allowed for pickup assignments")
+
+    if order["status"] not in ["pickup_assigned", "delivery_accepted", "picked_up"]:
+        raise HTTPException(status_code=400, detail="Pickup details cannot be updated in current status")
+
+    update_data: Dict[str, Any] = {}
+    if data.measurement_received is not None:
+        update_data["pickup_measurement_received"] = bool(data.measurement_received)
+    if data.measurement_note is not None:
+        update_data["pickup_measurement_note"] = data.measurement_note.strip()
+    if data.measurements is not None:
+        normalized_measurements = normalize_pickup_measurements(data.measurements)
+        update_data["pickup_measurements"] = normalized_measurements
+        if normalized_measurements:
+            update_data["pickup_measurement_received"] = True
+    if data.reference_cloth_received is not None:
+        update_data["pickup_reference_cloth_received"] = bool(data.reference_cloth_received)
+    if data.reference_cloth_note is not None:
+        update_data["pickup_reference_cloth_note"] = data.reference_cloth_note.strip()
+
+    if not update_data:
+        return await enrich_order_with_locations(order)
+
+    now = datetime.now(timezone.utc).isoformat()
+    update_data["pickup_details_updated_at"] = now
+    update_data["pickup_details_updated_by"] = user["id"]
+    update_data["updated_at"] = now
+
+    await db.orders.update_one({"id": order_id}, {"$set": update_data})
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
     return await enrich_order_with_locations(updated)
 
@@ -2269,6 +2413,11 @@ async def startup():
     await db.users.create_index([("geo_location", "2dsphere")])
     await db.users.create_index([("role", 1), ("city", 1), ("status", 1)])
     await db.users.create_index([("role", 1), ("status", 1), ("is_available", 1)])
+    try:
+        assigned_count = await retry_pending_delivery_assignments()
+        logger.info("Startup dispatch retry completed: assigned=%s", assigned_count)
+    except Exception:
+        logger.exception("Startup dispatch retry failed")
     logger.info("Stitchly API started - indexes created")
 
 @app.on_event("shutdown")

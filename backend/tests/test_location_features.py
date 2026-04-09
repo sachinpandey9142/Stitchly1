@@ -93,6 +93,67 @@ def test_driver_availability_triggers_driver_centric_assignment(client, auth_hea
     assert refreshed.json()["delivery_partner_id"] == "delivery-1"
 
 
+def test_order_creation_falls_back_to_tailor_geo_when_customer_geo_missing(client, auth_headers, fake_db):
+    fake_db.users.documents[0]["geo_location"] = None
+
+    created = client.post(
+        "/api/orders",
+        headers=auth_headers("customer-1"),
+        json={
+            "tailor_id": "tailor-1",
+            "service_type": "Blouse Stitching",
+            "description": "Missing customer geo",
+            "pickup_address": "123 Marine Drive",
+            "payment_method": "cod",
+        },
+    )
+
+    assert created.status_code == 200
+    payload = created.json()
+    assert payload["customer_geo_location"] is None
+    assert payload["pickup_geo_location"] == fake_db.users.documents[2]["geo_location"]
+
+
+def test_legacy_null_pickup_geo_orders_still_auto_assign_on_driver_availability(client, auth_headers, fake_db):
+    fake_db.users.documents[0]["geo_location"] = None
+    fake_db.users.documents[3]["is_available"] = False
+
+    created = client.post(
+        "/api/orders",
+        headers=auth_headers("customer-1"),
+        json={
+            "tailor_id": "tailor-1",
+            "service_type": "Blouse Stitching",
+            "description": "Legacy null pickup geo",
+            "pickup_address": "123 Marine Drive",
+            "payment_method": "cod",
+        },
+    )
+    assert created.status_code == 200
+    order_id = created.json()["id"]
+
+    accepted = client.put(f"/api/orders/{order_id}/accept", headers=auth_headers("tailor-1"))
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "accepted"
+
+    # Simulate pre-fix legacy data where pickup geo was persisted as null.
+    stored = next(order for order in fake_db.orders.documents if order["id"] == order_id)
+    stored["pickup_geo_location"] = None
+
+    availability = client.put(
+        "/api/delivery/availability",
+        headers=auth_headers("delivery-1"),
+        json={"is_available": True},
+    )
+    assert availability.status_code == 200
+
+    refreshed = client.get(f"/api/orders/{order_id}", headers=auth_headers("tailor-1"))
+    assert refreshed.status_code == 200
+    assert refreshed.json()["status"] == "pickup_assigned"
+    assert refreshed.json()["delivery_partner_id"] == "delivery-1"
+    assert refreshed.json()["pickup_geo_location"] is not None
+
+
 def test_startup_creates_required_geospatial_indexes(client, fake_db):
     order_indexes = {str(index["keys"]) for index in fake_db.orders.indexes}
     user_indexes = {str(index["keys"]) for index in fake_db.users.indexes}

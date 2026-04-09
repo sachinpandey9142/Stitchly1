@@ -3,6 +3,7 @@ import {
   View,
   Text,
   TouchableOpacity,
+  TextInput,
   StyleSheet,
   FlatList,
   ActivityIndicator,
@@ -37,6 +38,14 @@ type DeliveryOrder = {
   customer_geo_location?: GeoPoint | null;
   tailor_geo_location?: GeoPoint | null;
   delivery_partner_geo_location?: GeoPoint | null;
+  measurement_type?: 'ai' | 'manual' | 'expert' | string;
+  send_reference_cloth?: boolean;
+  reference_cloth_note?: string;
+  pickup_measurement_received?: boolean;
+  pickup_measurement_note?: string;
+  pickup_measurements?: Record<string, number>;
+  pickup_reference_cloth_received?: boolean;
+  pickup_reference_cloth_note?: string;
 };
 
 type RouteSummary = {
@@ -47,6 +56,15 @@ type RouteSummary = {
 
 const REFRESH_INTERVAL_MS = 15000;
 const LOCATION_UPDATE_INTERVAL_MS = 30000;
+const EXPERT_MEASUREMENT_FIELDS: Array<{ key: string; label: string; placeholder: string }> = [
+  { key: 'shoulder_cm', label: 'Shoulder', placeholder: 'Shoulder in cm' },
+  { key: 'chest_cm', label: 'Chest/Bust', placeholder: 'Chest in cm' },
+  { key: 'waist_cm', label: 'Waist', placeholder: 'Waist in cm' },
+  { key: 'hip_cm', label: 'Hip', placeholder: 'Hip in cm' },
+  { key: 'sleeve_cm', label: 'Sleeve Length', placeholder: 'Sleeve in cm' },
+  { key: 'inseam_cm', label: 'Inseam/Leg', placeholder: 'Inseam in cm' },
+  { key: 'neck_cm', label: 'Neck', placeholder: 'Neck in cm' },
+];
 
 function getPoint(geoLocation?: GeoPoint | null): RoutePoint | null {
   if (!geoLocation || geoLocation.type !== 'Point' || geoLocation.coordinates.length !== 2) {
@@ -76,6 +94,33 @@ function getNextAction(order: DeliveryOrder) {
     return { label: 'Mark Delivered', type: 'advance' as const, nextStatus: 'delivered' };
   }
   return null;
+}
+
+function measurementTypeLabel(type?: string): string {
+  if (type === 'ai') return 'AI Measurement';
+  if (type === 'expert') return 'Expert Measurement';
+  return 'Self Measurement';
+}
+
+function getInitialExpertMeasurements(existing?: Record<string, number>): Record<string, string> {
+  const initial: Record<string, string> = {};
+  for (const field of EXPERT_MEASUREMENT_FIELDS) {
+    const value = existing?.[field.key];
+    initial[field.key] = Number.isFinite(value) ? String(value) : '';
+  }
+  return initial;
+}
+
+function buildExpertMeasurementPayload(values: Record<string, string>): Record<string, number> {
+  const payload: Record<string, number> = {};
+  for (const field of EXPERT_MEASUREMENT_FIELDS) {
+    const raw = String(values[field.key] || '').trim();
+    if (!raw) continue;
+    const numericValue = Number(raw);
+    if (!Number.isFinite(numericValue) || numericValue <= 0) continue;
+    payload[field.key] = Number(numericValue.toFixed(2));
+  }
+  return payload;
 }
 
 async function fetchRoute(order: DeliveryOrder): Promise<RouteSummary | null> {
@@ -181,6 +226,12 @@ export default function DeliveryDashboard() {
   const [routeSummary, setRouteSummary] = useState<RouteSummary | null>(null);
   const [routeLoading, setRouteLoading] = useState(false);
   const [reviewVisible, setReviewVisible] = useState(false);
+  const [savingPickupDetails, setSavingPickupDetails] = useState(false);
+  const [pickupMeasurementReceived, setPickupMeasurementReceived] = useState(false);
+  const [pickupMeasurementNote, setPickupMeasurementNote] = useState('');
+  const [pickupReferenceClothReceived, setPickupReferenceClothReceived] = useState(false);
+  const [pickupReferenceClothNote, setPickupReferenceClothNote] = useState('');
+  const [expertMeasurements, setExpertMeasurements] = useState<Record<string, string>>(() => getInitialExpertMeasurements());
   const mapRef = useRef<MapView | null>(null);
 
   const fetchOrders = useCallback(async () => {
@@ -276,6 +327,11 @@ export default function DeliveryDashboard() {
     setReviewVisible(true);
     setRouteLoading(true);
     setRouteSummary(null);
+    setPickupMeasurementReceived(Boolean(order.pickup_measurement_received));
+    setPickupMeasurementNote(order.pickup_measurement_note || '');
+    setPickupReferenceClothReceived(Boolean(order.pickup_reference_cloth_received));
+    setPickupReferenceClothNote(order.pickup_reference_cloth_note || '');
+    setExpertMeasurements(getInitialExpertMeasurements(order.pickup_measurements));
     try {
       const summary = await fetchRoute(order);
       setRouteSummary(summary);
@@ -304,13 +360,69 @@ export default function DeliveryDashboard() {
     setReviewVisible(false);
     setSelectedOrder(null);
     setRouteSummary(null);
+    setPickupMeasurementReceived(false);
+    setPickupMeasurementNote('');
+    setPickupReferenceClothReceived(false);
+    setPickupReferenceClothNote('');
+    setExpertMeasurements(getInitialExpertMeasurements());
   }, []);
+
+  const onExpertMeasurementChange = useCallback((key: string, value: string) => {
+    const sanitizedValue = value.replace(/[^0-9.]/g, '');
+    setExpertMeasurements((previous) => ({
+      ...previous,
+      [key]: sanitizedValue,
+    }));
+  }, []);
+
+  const savePickupDetails = useCallback(async (order: DeliveryOrder, silent = false) => {
+    if (order.delivery_phase === 'return') {
+      return true;
+    }
+
+    const payload: Record<string, any> = {
+      measurement_received: pickupMeasurementReceived,
+      measurement_note: pickupMeasurementNote.trim() || undefined,
+      reference_cloth_received: pickupReferenceClothReceived,
+      reference_cloth_note: pickupReferenceClothNote.trim() || undefined,
+    };
+
+    if (order.measurement_type === 'expert') {
+      const normalizedMeasurements = buildExpertMeasurementPayload(expertMeasurements);
+      payload.measurements = normalizedMeasurements;
+      payload.measurement_received = Object.keys(normalizedMeasurements).length > 0 || pickupMeasurementReceived;
+
+      if (!payload.measurement_received) {
+        Alert.alert('Measurement Required', 'Add expert measurements or mark that measurements were received.');
+        return false;
+      }
+    }
+
+    setSavingPickupDetails(true);
+    try {
+      await api.put(`/delivery/${order.id}/pickup-details`, payload);
+      await fetchOrders();
+      if (!silent) {
+        Alert.alert('Saved', 'Pickup details saved and shared with tailor.');
+      }
+      return true;
+    } catch (err: any) {
+      Alert.alert('Error', err.message || 'Unable to save pickup details');
+      return false;
+    } finally {
+      setSavingPickupDetails(false);
+    }
+  }, [expertMeasurements, fetchOrders, pickupMeasurementNote, pickupMeasurementReceived, pickupReferenceClothNote, pickupReferenceClothReceived]);
 
   const handleConfirmOrder = useCallback(async () => {
     if (!selectedOrder) {
       return;
     }
     try {
+      const saved = await savePickupDetails(selectedOrder, true);
+      if (!saved) {
+        return;
+      }
       await api.put(`/delivery/${selectedOrder.id}/accept`, {});
       closeReview();
       await fetchOrders();
@@ -318,7 +430,7 @@ export default function DeliveryDashboard() {
     } catch (err: any) {
       Alert.alert('Error', err.message || 'Unable to accept this order');
     }
-  }, [closeReview, fetchOrders, selectedOrder]);
+  }, [closeReview, fetchOrders, savePickupDetails, selectedOrder]);
 
   const handleRejectOrder = useCallback(async () => {
     if (!selectedOrder) {
@@ -348,6 +460,7 @@ export default function DeliveryDashboard() {
     const action = getNextAction(item);
     const fromAddress = item.delivery_phase === 'return' ? (item.tailor_address || item.tailor_name) : item.pickup_address;
     const toAddress = item.delivery_phase === 'return' ? item.delivery_address : (item.tailor_address || item.tailor_name);
+    const measurementLabel = measurementTypeLabel(item.measurement_type);
 
     return (
       <View style={styles.card}>
@@ -371,6 +484,16 @@ export default function DeliveryDashboard() {
             <Feather name="navigation" size={14} color={Colors.success} />
             <Text style={styles.addressText}>To: {toAddress}</Text>
           </View>
+          <View style={styles.addressRow}>
+            <Feather name="sliders" size={14} color={Colors.textMuted} />
+            <Text style={styles.addressText}>Measurement: {measurementLabel}</Text>
+          </View>
+          {item.send_reference_cloth ? (
+            <View style={styles.addressRow}>
+              <Feather name="archive" size={14} color={Colors.textMuted} />
+              <Text style={styles.addressText}>Reference cloth requested</Text>
+            </View>
+          ) : null}
         </View>
         {action && (
           <TouchableOpacity
@@ -390,6 +513,9 @@ export default function DeliveryDashboard() {
   const driverPoint = getPoint(selectedOrder?.delivery_partner_geo_location);
   const customerPoint = getPoint(selectedOrder?.customer_geo_location);
   const tailorPoint = getPoint(selectedOrder?.tailor_geo_location);
+  const shouldShowPickupChecklist = selectedOrder ? selectedOrder.delivery_phase !== 'return' : false;
+  const selectedMeasurementLabel = measurementTypeLabel(selectedOrder?.measurement_type);
+  const isExpertPickupMeasurement = selectedOrder?.measurement_type === 'expert';
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -480,11 +606,96 @@ export default function DeliveryDashboard() {
                 <Text style={styles.routeMetricValue}>{routeSummary ? `${Math.ceil(routeSummary.durationMinutes)} min` : 'Unavailable'}</Text>
               </View>
             </View>
+            {selectedOrder && shouldShowPickupChecklist ? (
+              <View style={styles.pickupDetailsSection}>
+                <Text style={styles.pickupSectionTitle}>Pickup Details</Text>
+                <Text style={styles.pickupSectionHint}>Measurement Type: {selectedMeasurementLabel}</Text>
+
+                {isExpertPickupMeasurement ? (
+                  <View style={styles.expertMeasurementGrid}>
+                    {EXPERT_MEASUREMENT_FIELDS.map((field) => (
+                      <View key={field.key} style={styles.expertInputGroup}>
+                        <Text style={styles.expertInputLabel}>{field.label}</Text>
+                        <TextInput
+                          style={styles.expertInput}
+                          placeholder={field.placeholder}
+                          keyboardType="decimal-pad"
+                          value={expertMeasurements[field.key] || ''}
+                          onChangeText={(value) => onExpertMeasurementChange(field.key, value)}
+                        />
+                      </View>
+                    ))}
+                  </View>
+                ) : (
+                  <>
+                    <TouchableOpacity
+                      style={styles.checkRow}
+                      onPress={() => setPickupMeasurementReceived((previous) => !previous)}
+                      activeOpacity={0.8}
+                    >
+                      <View style={[styles.checkbox, pickupMeasurementReceived && styles.checkboxActive]}>
+                        {pickupMeasurementReceived ? <Feather name="check" size={14} color={Colors.textInverted} /> : null}
+                      </View>
+                      <Text style={styles.checkLabel}>Customer provided AI/Self measurements</Text>
+                    </TouchableOpacity>
+                    <TextInput
+                      style={styles.noteInput}
+                      placeholder="Add notes about measurements shared by customer"
+                      value={pickupMeasurementNote}
+                      onChangeText={setPickupMeasurementNote}
+                      multiline
+                    />
+                  </>
+                )}
+
+                {selectedOrder.send_reference_cloth ? (
+                  <Text style={styles.referenceHint}>Customer asked to send reference cloth.</Text>
+                ) : null}
+                <TouchableOpacity
+                  style={styles.checkRow}
+                  onPress={() => setPickupReferenceClothReceived((previous) => !previous)}
+                  activeOpacity={0.8}
+                >
+                  <View style={[styles.checkbox, pickupReferenceClothReceived && styles.checkboxActive]}>
+                    {pickupReferenceClothReceived ? <Feather name="check" size={14} color={Colors.textInverted} /> : null}
+                  </View>
+                  <Text style={styles.checkLabel}>Reference cloth received</Text>
+                </TouchableOpacity>
+                {(selectedOrder.send_reference_cloth || pickupReferenceClothReceived) ? (
+                  <TextInput
+                    style={styles.noteInput}
+                    placeholder="Reference cloth notes (fabric details, count, etc.)"
+                    value={pickupReferenceClothNote}
+                    onChangeText={setPickupReferenceClothNote}
+                    multiline
+                  />
+                ) : null}
+
+                <TouchableOpacity
+                  style={[styles.savePickupBtn, savingPickupDetails && styles.savePickupBtnDisabled]}
+                  onPress={() => savePickupDetails(selectedOrder)}
+                  activeOpacity={0.8}
+                  disabled={savingPickupDetails}
+                >
+                  {savingPickupDetails ? (
+                    <ActivityIndicator size="small" color={Colors.textInverted} />
+                  ) : (
+                    <Feather name="save" size={16} color={Colors.textInverted} />
+                  )}
+                  <Text style={styles.savePickupText}>{savingPickupDetails ? 'Saving...' : 'Save Pickup Details'}</Text>
+                </TouchableOpacity>
+              </View>
+            ) : null}
             <View style={styles.modalActionRow}>
               <TouchableOpacity style={styles.modalRejectBtn} onPress={handleRejectOrder} activeOpacity={0.7}>
                 <Text style={styles.modalRejectText}>Reject</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.modalConfirmBtn} onPress={handleConfirmOrder} activeOpacity={0.7}>
+              <TouchableOpacity
+                style={[styles.modalConfirmBtn, savingPickupDetails && styles.modalConfirmBtnDisabled]}
+                onPress={handleConfirmOrder}
+                activeOpacity={0.7}
+                disabled={savingPickupDetails}
+              >
                 <Text style={styles.modalConfirmText}>Confirm Order</Text>
               </TouchableOpacity>
             </View>
@@ -528,9 +739,65 @@ const styles = StyleSheet.create({
   routeMetric: { flex: 1, backgroundColor: Colors.subtle, borderRadius: Radius.md, padding: 12 },
   routeMetricLabel: { fontFamily: Fonts.ui, fontSize: 12, color: Colors.textMuted },
   routeMetricValue: { fontFamily: Fonts.bodyBold, fontSize: 16, color: Colors.text, marginTop: 4 },
+  pickupDetailsSection: { paddingHorizontal: 16, paddingTop: 16, gap: 10 },
+  pickupSectionTitle: { fontFamily: Fonts.bodyBold, fontSize: 16, color: Colors.text },
+  pickupSectionHint: { fontFamily: Fonts.ui, fontSize: 12, color: Colors.textMuted },
+  expertMeasurementGrid: { gap: 10 },
+  expertInputGroup: { gap: 6 },
+  expertInputLabel: { fontFamily: Fonts.ui, fontSize: 12, color: Colors.textMuted },
+  expertInput: {
+    backgroundColor: Colors.subtle,
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontFamily: Fonts.ui,
+    fontSize: 14,
+    color: Colors.text,
+  },
+  checkRow: { flexDirection: 'row', alignItems: 'center' },
+  checkbox: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Colors.surface,
+  },
+  checkboxActive: { backgroundColor: Colors.primary, borderColor: Colors.primary },
+  checkLabel: { fontFamily: Fonts.ui, fontSize: 13, color: Colors.text, marginLeft: 10, flex: 1 },
+  noteInput: {
+    minHeight: 44,
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.subtle,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontFamily: Fonts.ui,
+    fontSize: 13,
+    color: Colors.text,
+    textAlignVertical: 'top',
+  },
+  referenceHint: { fontFamily: Fonts.ui, fontSize: 12, color: Colors.info },
+  savePickupBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: Radius.full,
+    backgroundColor: Colors.primary,
+    paddingVertical: 12,
+    marginTop: 4,
+  },
+  savePickupBtnDisabled: { opacity: 0.6 },
+  savePickupText: { fontFamily: Fonts.bodyBold, fontSize: 13, color: Colors.textInverted, marginLeft: 8 },
   modalActionRow: { flexDirection: 'row', padding: 16, gap: 12 },
   modalRejectBtn: { flex: 1, alignItems: 'center', justifyContent: 'center', borderRadius: Radius.full, paddingVertical: 14, borderWidth: 1, borderColor: Colors.error + '30', backgroundColor: Colors.error + '08' },
   modalRejectText: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.error },
   modalConfirmBtn: { flex: 1, alignItems: 'center', justifyContent: 'center', borderRadius: Radius.full, paddingVertical: 14, backgroundColor: Colors.primary },
+  modalConfirmBtnDisabled: { opacity: 0.6 },
   modalConfirmText: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.textInverted },
 });

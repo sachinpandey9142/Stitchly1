@@ -20,6 +20,32 @@ const NEXT_TAILOR_LABEL: Record<string, string> = {
   ready: 'Retry Delivery Assignment',
 };
 
+const PICKUP_MEASUREMENT_LABELS: Record<string, string> = {
+  shoulder_cm: 'Shoulder',
+  chest_cm: 'Chest/Bust',
+  waist_cm: 'Waist',
+  hip_cm: 'Hip',
+  sleeve_cm: 'Sleeve',
+  inseam_cm: 'Inseam',
+  neck_cm: 'Neck',
+};
+
+function measurementTypeLabel(type?: string) {
+  if (type === 'ai') return 'AI Measurement';
+  if (type === 'expert') return 'Expert Measurement';
+  return 'Self Measurement';
+}
+
+function formatPickupMeasurements(measurements?: Record<string, number>) {
+  if (!measurements || typeof measurements !== 'object') {
+    return '';
+  }
+  return Object.entries(measurements)
+    .filter(([, value]) => Number.isFinite(Number(value)) && Number(value) > 0)
+    .map(([key, value]) => `${PICKUP_MEASUREMENT_LABELS[key] || key}: ${value} cm`)
+    .join(' | ');
+}
+
 export default function TailorOrders() {
   const [orders, setOrders] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -94,6 +120,7 @@ export default function TailorOrders() {
           <Text style={styles.serviceType}>{item.service_type}</Text>
           <Text style={styles.customerName}>{item.customer_name}</Text>
           <Text style={styles.desc} numberOfLines={2}>{item.description}</Text>
+          <Text style={styles.measurementInfo}>Measurement: {measurementTypeLabel(item.measurement_type)}</Text>
         </View>
         <View>
           <Text style={styles.price}>{'\u20B9'}{item.price}</Text>
@@ -128,6 +155,24 @@ export default function TailorOrders() {
       {item.delivery_partner_name && ['pickup_assigned', 'delivery_assigned', 'delivery_accepted'].includes(item.status) && (
         <Text style={styles.infoText}>Delivery Partner: {item.delivery_partner_name}</Text>
       )}
+      {item.pickup_measurement_received ? (
+        <Text style={styles.detailText}>Pickup measurements received by delivery partner.</Text>
+      ) : null}
+      {item.pickup_measurement_note ? (
+        <Text style={styles.detailText}>Measurement Note: {item.pickup_measurement_note}</Text>
+      ) : null}
+      {formatPickupMeasurements(item.pickup_measurements) ? (
+        <Text style={styles.detailText}>Measurements: {formatPickupMeasurements(item.pickup_measurements)}</Text>
+      ) : null}
+      {item.send_reference_cloth ? (
+        <Text style={styles.detailText}>Reference cloth requested by customer.</Text>
+      ) : null}
+      {item.pickup_reference_cloth_received ? (
+        <Text style={styles.detailText}>Reference cloth received by delivery partner.</Text>
+      ) : null}
+      {item.pickup_reference_cloth_note ? (
+        <Text style={styles.detailText}>Reference Cloth Note: {item.pickup_reference_cloth_note}</Text>
+      ) : null}
     </View>
   );
 
@@ -160,6 +205,7 @@ const styles = StyleSheet.create({
   serviceType: { fontFamily: Fonts.bodyBold, fontSize: 16, color: Colors.text },
   customerName: { fontFamily: Fonts.ui, fontSize: 14, color: Colors.textMuted, marginTop: 2 },
   desc: { fontFamily: Fonts.ui, fontSize: 13, color: Colors.textMuted, marginTop: 6 },
+  measurementInfo: { fontFamily: Fonts.bodyBold, fontSize: 12, color: Colors.info, marginTop: 8 },
   price: { fontFamily: Fonts.bodyBold, fontSize: 18, color: Colors.primary, textAlign: 'right' },
   statusBadge: { borderRadius: Radius.full, paddingHorizontal: 10, paddingVertical: 4, marginTop: 6, alignSelf: 'flex-end' },
   statusText: { fontFamily: Fonts.bodyBold, fontSize: 12 },
@@ -171,6 +217,7 @@ const styles = StyleSheet.create({
   updateBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: Colors.primary + '10', borderRadius: Radius.full, paddingVertical: 12, marginTop: 14, borderWidth: 1, borderColor: Colors.primary + '30' },
   updateText: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.primary, marginLeft: 6 },
   infoText: { fontFamily: Fonts.ui, fontSize: 13, color: Colors.info, marginTop: 10 },
+  detailText: { fontFamily: Fonts.ui, fontSize: 12, color: Colors.textMuted, marginTop: 8, lineHeight: 18 },
   loader: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   empty: { alignItems: 'center', paddingTop: 80 },
   emptyText: { fontFamily: Fonts.bodyBold, fontSize: 18, color: Colors.text, marginTop: 16 },
