@@ -384,7 +384,12 @@ def _aggregate_measurement_candidates(candidates: List[dict]) -> dict:
     return merged
 
 
-def _estimate_position_feedback(view_name: str, view: dict) -> dict:
+def _estimate_position_feedback(
+    view_name: str,
+    view: dict,
+    pitch: Optional[float] = None,
+    roll: Optional[float] = None,
+) -> dict:
     landmarks = view.get("landmarks") or []
     if len(landmarks) < 29:
         return {
@@ -392,6 +397,14 @@ def _estimate_position_feedback(view_name: str, view: dict) -> dict:
             "ready_to_capture": False,
             "quality_score": 0.0,
         }
+
+    if pitch is not None and roll is not None:
+        if abs(float(pitch)) > 0.05 or abs(float(roll)) > 0.05:
+            return {
+                "instruction": "Tilt phone to align",
+                "ready_to_capture": False,
+                "quality_score": 0.2,
+            }
 
     left_shoulder = landmarks[11]
     right_shoulder = landmarks[12]
@@ -401,11 +414,15 @@ def _estimate_position_feedback(view_name: str, view: dict) -> dict:
 
     shoulder_mid_x = (float(left_shoulder.get("x", 0.0)) + float(right_shoulder.get("x", 0.0))) * 0.5
     body_height = max(float(left_ankle.get("y", 0.0)), float(right_ankle.get("y", 0.0))) - float(nose.get("y", 0.0))
+    image_height = float(view.get("image_height", 1.0) or 1.0)
+    body_height_px = body_height * image_height
     shoulder_tilt = abs(float(left_shoulder.get("y", 0.0)) - float(right_shoulder.get("y", 0.0)))
     shoulder_span = abs(float(left_shoulder.get("x", 0.0)) - float(right_shoulder.get("x", 0.0)))
     pose_confidence = float(view.get("pose_confidence", 0.0))
 
-    if body_height < 0.45:
+    if body_height_px < image_height * 0.55:
+        return {"instruction": "Move closer", "ready_to_capture": False, "quality_score": 0.15}
+    if body_height_px > image_height * 0.92:
         return {"instruction": "Move back", "ready_to_capture": False, "quality_score": 0.15}
 
     if shoulder_mid_x < 0.4:
@@ -2201,13 +2218,15 @@ async def check_position(
     image: UploadFile = File(...),
     height_cm: float = Form(...),
     view: str = Form("front"),
+    pitch: Optional[float] = Form(None),
+    roll: Optional[float] = Form(None),
 ):
     ensure_ai_dependencies()
 
     image_path = _save_upload_to_temp(image, f"position_{view}")
     pose_view = _detect_pose_view(image_path)
     overlay = _format_overlay(pose_view)
-    feedback = _estimate_position_feedback(view.lower(), pose_view)
+    feedback = _estimate_position_feedback(view.lower(), pose_view, pitch=pitch, roll=roll)
 
     return {
         "success": True,
@@ -2219,6 +2238,8 @@ async def check_position(
         "pose_confidence": overlay["pose_confidence"],
         "height_cm": height_cm,
         "view": view.lower(),
+        "pitch": pitch,
+        "roll": roll,
     }
 
 

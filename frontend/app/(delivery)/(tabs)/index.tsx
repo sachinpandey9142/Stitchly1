@@ -9,11 +9,13 @@ import {
   Alert,
   RefreshControl,
   Modal,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import { Feather } from '@expo/vector-icons';
-import MapView, { Marker, Polyline, UrlTile } from 'react-native-maps';
+import MapView, { Marker, Polyline, UrlTile, PROVIDER_DEFAULT } from 'react-native-maps';
+import { WebView } from 'react-native-webview';
 import * as Location from 'expo-location';
 import { api } from '../../../src/utils/api';
 import { useAuth } from '../../../src/context/AuthContext';
@@ -108,6 +110,66 @@ async function fetchRoute(order: DeliveryOrder): Promise<RouteSummary | null> {
     distanceKm: route.distance / 1000,
     durationMinutes: route.duration / 60,
   };
+}
+
+function buildRouteMapHtml(
+  driverPoint: RoutePoint | null,
+  customerPoint: RoutePoint | null,
+  tailorPoint: RoutePoint | null,
+  routeCoordinates: RoutePoint[]
+) {
+  const markers = [
+    driverPoint ? { label: 'Driver', color: '#0F766E', point: driverPoint } : null,
+    customerPoint ? { label: 'Customer', color: '#D97706', point: customerPoint } : null,
+    tailorPoint ? { label: 'Tailor', color: '#15803D', point: tailorPoint } : null,
+  ].filter(Boolean) as Array<{ label: string; color: string; point: RoutePoint }>;
+
+  const routeLatLng = routeCoordinates.map((point) => [point.latitude, point.longitude]);
+  const boundsLatLng = routeLatLng.length > 1
+    ? routeLatLng
+    : markers.map((marker) => [marker.point.latitude, marker.point.longitude]);
+
+  const markerScript = markers
+    .map(
+      (marker) =>
+        `L.circleMarker([${marker.point.latitude}, ${marker.point.longitude}], { radius: 7, color: '${marker.color}', fillColor: '${marker.color}', fillOpacity: 1 }).addTo(map).bindTooltip(${JSON.stringify(marker.label)});`
+    )
+    .join('\n');
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+      html, body, #map { margin: 0; padding: 0; width: 100%; height: 100%; }
+      .leaflet-control-attribution { font-size: 10px; }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+      (function () {
+        var map = L.map('map').setView([20.5937, 78.9629], 5);
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+        ${markerScript}
+
+        var routeCoords = ${JSON.stringify(routeLatLng)};
+        if (routeCoords.length > 1) {
+          L.polyline(routeCoords, { color: '#0F766E', weight: 4 }).addTo(map);
+        }
+
+        var boundsCoords = ${JSON.stringify(boundsLatLng)};
+        if (boundsCoords.length > 0) {
+          map.fitBounds(boundsCoords, { padding: [30, 30] });
+        }
+      })();
+    </script>
+  </body>
+</html>`;
 }
 
 export default function DeliveryDashboard() {
@@ -222,7 +284,7 @@ export default function DeliveryDashboard() {
         getPoint(order.customer_geo_location),
         getPoint(order.tailor_geo_location),
       ].filter(Boolean) as RoutePoint[];
-      if (points.length > 1 && mapRef.current) {
+      if (Platform.OS !== 'android' && points.length > 1 && mapRef.current) {
         setTimeout(() => {
           mapRef.current?.fitToCoordinates(points, {
             edgePadding: { top: 70, right: 50, bottom: 70, left: 50 },
@@ -374,19 +436,32 @@ export default function DeliveryDashboard() {
             </View>
             <View style={styles.mapContainer}>
               {selectedOrder ? (
-                <MapView
-                  ref={mapRef}
-                  style={styles.map}
-                  initialRegion={{ latitude: 20.5937, longitude: 78.9629, latitudeDelta: 8, longitudeDelta: 8 }}
-                >
-                  <UrlTile urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png" maximumZ={19} />
-                  {driverPoint ? <Marker coordinate={driverPoint} title="Driver" pinColor={Colors.primary} /> : null}
-                  {customerPoint ? <Marker coordinate={customerPoint} title="Customer" pinColor={Colors.secondary} /> : null}
-                  {tailorPoint ? <Marker coordinate={tailorPoint} title="Tailor" pinColor={Colors.success} /> : null}
-                  {routeSummary?.coordinates?.length ? (
-                    <Polyline coordinates={routeSummary.coordinates} strokeColor={Colors.primary} strokeWidth={4} />
-                  ) : null}
-                </MapView>
+                Platform.OS === 'android' ? (
+                  <WebView
+                    originWhitelist={['*']}
+                    source={{ html: buildRouteMapHtml(driverPoint, customerPoint, tailorPoint, routeSummary?.coordinates || []) }}
+                    javaScriptEnabled
+                    domStorageEnabled
+                    mixedContentMode="always"
+                    style={styles.map}
+                  />
+                ) : (
+                  <MapView
+                    ref={mapRef}
+                    provider={PROVIDER_DEFAULT}
+                    mapType="none"
+                    style={styles.map}
+                    initialRegion={{ latitude: 20.5937, longitude: 78.9629, latitudeDelta: 8, longitudeDelta: 8 }}
+                  >
+                    <UrlTile urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png" maximumZ={19} />
+                    {driverPoint ? <Marker coordinate={driverPoint} title="Driver" pinColor={Colors.primary} /> : null}
+                    {customerPoint ? <Marker coordinate={customerPoint} title="Customer" pinColor={Colors.secondary} /> : null}
+                    {tailorPoint ? <Marker coordinate={tailorPoint} title="Tailor" pinColor={Colors.success} /> : null}
+                    {routeSummary?.coordinates?.length ? (
+                      <Polyline coordinates={routeSummary.coordinates} strokeColor={Colors.primary} strokeWidth={4} />
+                    ) : null}
+                  </MapView>
+                )
               ) : null}
               {routeLoading ? (
                 <View style={styles.routeLoadingOverlay}>

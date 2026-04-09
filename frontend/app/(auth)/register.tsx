@@ -9,7 +9,8 @@ import { Colors, Fonts, Spacing, Radius } from '../../src/utils/theme';
 import * as Location from 'expo-location';
 import * as Haptics from 'expo-haptics';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import MapView, { Marker, Circle } from "react-native-maps";
+import MapView, { Circle, UrlTile, PROVIDER_DEFAULT } from "react-native-maps";
+import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import MaleSlim from '../../assets/body/male_slim.png';
 import MaleFit from '../../assets/body/male_fit.png';
 import MaleBulk from '../../assets/body/male_bulk.png';
@@ -40,6 +41,7 @@ export default function Register() {
   const [address, setAddress] = useState('');
   const scrollRef = useRef<ScrollView>(null);
   const addressInputRef = useRef<TextInput>(null);
+  const mapRef = useRef<MapView | null>(null);
   const [role, setRole] = useState('customer');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
@@ -55,9 +57,14 @@ export default function Register() {
   const glowAnim = useRef(new Animated.Value(0)).current;
   const [recentLocations, setRecentLocations] = useState<any[]>([]);
   const [mapModalVisible, setMapModalVisible] = useState(false);
+  const [mapRecenterLoading, setMapRecenterLoading] = useState(false);
+  const [androidMapSeed, setAndroidMapSeed] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [androidMapRevision, setAndroidMapRevision] = useState(0);
   const markerScale = useRef(new Animated.Value(0)).current;
   const DELIVERY_RADIUS = 3000; // meters (3km example)
   const [liveAddress, setLiveAddress] = useState("");
+  const [liveCity, setLiveCity] = useState('');
+  const [livePincode, setLivePincode] = useState('');
   const [isMoving, setIsMoving] = useState(false);
   const [height, setHeight] = useState('');
   const [weight, setWeight] = useState('');
@@ -393,50 +400,342 @@ useEffect(() => {
   }
 }, [suggestions]);
 
-const fetchCurrentLocation = async () => {
+useEffect(() => {
+  if (Platform.OS !== 'android') return;
+
+  if (!mapModalVisible) {
+    setAndroidMapSeed(null);
+    return;
+  }
+
+  if (!androidMapSeed && latitude != null && longitude != null) {
+    setAndroidMapSeed({ latitude, longitude });
+  }
+}, [androidMapSeed, latitude, longitude, mapModalVisible]);
+
+const getCurrentCoords = useCallback(async () => {
   try {
-    setLoadingLocation(true);
+    let permission = await Location.getForegroundPermissionsAsync();
+    if (permission.status !== 'granted') {
+      permission = await Location.requestForegroundPermissionsAsync();
+    }
 
-    const { status } =
-      await Location.requestForegroundPermissionsAsync();
+    if (permission.status !== 'granted') {
+      Alert.alert('Permission denied', 'Enable location access');
+      return null;
+    }
 
-    if (status !== "granted") {
-      Alert.alert("Permission denied");
-      setLoadingLocation(false);
+    const attempts: Array<() => Promise<Location.LocationObject | Location.LocationObject | null>> = [
+      () => Location.getLastKnownPositionAsync({ maxAge: 120000, requiredAccuracy: 500 }),
+      () =>
+        Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+          mayShowUserSettingsDialog: true,
+        }),
+      () =>
+        Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Low,
+          mayShowUserSettingsDialog: true,
+        }),
+    ];
+
+    for (const attempt of attempts) {
+      try {
+        const location = await attempt();
+        if (!location?.coords) continue;
+
+        const { latitude: nextLatitude, longitude: nextLongitude } = location.coords;
+        if (!Number.isFinite(nextLatitude) || !Number.isFinite(nextLongitude)) continue;
+
+        return { latitude: nextLatitude, longitude: nextLongitude };
+      } catch (error) {
+        console.log('Location attempt failed:', error);
+      }
+    }
+
+    Alert.alert('Error', 'Unable to fetch location');
+    return null;
+  } catch (error) {
+    console.log('Location permission/location error:', error);
+    Alert.alert('Error', 'Unable to fetch location');
+    return null;
+  }
+}, []);
+
+const handleMapMoveStart = useCallback(() => {
+  setIsMoving(true);
+
+  Animated.timing(liftAnim, {
+    toValue: 1,
+    duration: 150,
+    useNativeDriver: true,
+  }).start();
+
+  Animated.loop(
+    Animated.sequence([
+      Animated.timing(glowAnim, {
+        toValue: 1,
+        duration: 600,
+        useNativeDriver: true,
+      }),
+      Animated.timing(glowAnim, {
+        toValue: 0,
+        duration: 600,
+        useNativeDriver: true,
+      }),
+    ])
+  ).start();
+}, [glowAnim, liftAnim]);
+
+const handleMapMoveComplete = useCallback(async (nextLatitude: number, nextLongitude: number) => {
+  setLatitude(nextLatitude);
+  setLongitude(nextLongitude);
+  setIsMoving(false);
+
+  Animated.spring(liftAnim, {
+    toValue: 0,
+    friction: 4,
+    useNativeDriver: true,
+  }).start();
+
+  glowAnim.stopAnimation();
+  void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?lat=${nextLatitude}&lon=${nextLongitude}&format=json&addressdetails=1`,
+      { headers: { "User-Agent": "Stitchly-App" } }
+    );
+    const data = res.ok ? await res.json() : null;
+    const reverseAddress = data?.address || {};
+    const parsedDisplayName =
+      typeof data?.display_name === 'string'
+        ? data.display_name
+            .split(',')
+            .map((piece: string) => piece.trim())
+            .filter(Boolean)
+        : [];
+
+    const resolvedCity =
+      reverseAddress.city ||
+      reverseAddress.town ||
+      reverseAddress.village ||
+      reverseAddress.municipality ||
+      reverseAddress.county ||
+      reverseAddress.state ||
+      parsedDisplayName.find((piece: string) => /[A-Za-z]/.test(piece)) ||
+      '';
+    const pincodeMatch =
+      typeof data?.display_name === 'string' ? data.display_name.match(/\b\d{6}\b/) : null;
+    const resolvedPincode = reverseAddress.postcode || (pincodeMatch ? pincodeMatch[0] : '');
+    const resolvedAddress =
+      (typeof data?.display_name === 'string' && data.display_name.trim()) ||
+      `${nextLatitude.toFixed(4)}, ${nextLongitude.toFixed(4)}`;
+
+    setLiveCity((prev) => resolvedCity || prev || city);
+    setLivePincode((prev) => resolvedPincode || prev || pincode);
+    setLiveAddress(resolvedAddress);
+  } catch {
+    const fallbackAddress = `${nextLatitude.toFixed(4)}, ${nextLongitude.toFixed(4)}`;
+    setLiveAddress(fallbackAddress);
+    setLiveCity((prev) => prev || city);
+    setLivePincode((prev) => prev || pincode);
+  }
+}, [city, glowAnim, liftAnim, pincode]);
+
+const handleAndroidMapMessage = useCallback((event: WebViewMessageEvent) => {
+  try {
+    const payload = JSON.parse(event.nativeEvent.data || '{}');
+
+    if (payload?.type === 'moving') {
+      handleMapMoveStart();
       return;
     }
 
-    const loc = await Location.getCurrentPositionAsync({
-      accuracy: Location.Accuracy.Balanced,
-    });
+    if (
+      payload?.type === 'region' &&
+      Number.isFinite(payload.latitude) &&
+      Number.isFinite(payload.longitude)
+    ) {
+      void handleMapMoveComplete(Number(payload.latitude), Number(payload.longitude));
+    }
+  } catch {}
+}, [handleMapMoveComplete, handleMapMoveStart]);
 
-    const { latitude, longitude } = loc.coords;
+const buildPickerMapHtml = useCallback((lat: number, lon: number) => {
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+      html, body, #map { margin: 0; padding: 0; width: 100%; height: 100%; }
+      .leaflet-control-attribution { font-size: 10px; }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+      (function () {
+        var map = L.map('map', { zoomControl: true }).setView([${lat}, ${lon}], 16);
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+        var circle = L.circle([${lat}, ${lon}], {
+          radius: ${DELIVERY_RADIUS},
+          color: 'rgba(0,150,255,0.8)',
+          fillColor: 'rgba(0,150,255,0.15)',
+          fillOpacity: 0.5,
+          weight: 2
+        }).addTo(map);
+
+        function send(payload) {
+          if (window.ReactNativeWebView) {
+            window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+          }
+        }
+
+        map.on('movestart', function () {
+          send({ type: 'moving' });
+        });
+
+        map.on('moveend', function () {
+          var center = map.getCenter();
+          circle.setLatLng(center);
+          send({ type: 'region', latitude: center.lat, longitude: center.lng });
+        });
+      })();
+    </script>
+  </body>
+</html>`;
+}, [DELIVERY_RADIUS]);
+
+const recenterToCurrentLocation = useCallback(async () => {
+  try {
+    setMapRecenterLoading(true);
+
+    const coords = await getCurrentCoords();
+    if (!coords) return;
+
+    handleMapMoveStart();
+
+    if (Platform.OS === 'android') {
+      setAndroidMapSeed(coords);
+      setAndroidMapRevision((value) => value + 1);
+    } else {
+      requestAnimationFrame(() => {
+        mapRef.current?.animateToRegion(
+          {
+            latitude: coords.latitude,
+            longitude: coords.longitude,
+            latitudeDelta: 0.01,
+            longitudeDelta: 0.01,
+          },
+          350
+        );
+      });
+    }
+
+    await handleMapMoveComplete(coords.latitude, coords.longitude);
+  } catch (error) {
+    console.log('Recenter error:', error);
+    Alert.alert('Error', 'Unable to fetch location');
+  } finally {
+    setMapRecenterLoading(false);
+  }
+}, [getCurrentCoords, handleMapMoveComplete, handleMapMoveStart]);
+
+const fetchCurrentLocation = async () => {
+  const reverseGeocodeWithNominatim = async (lat: number, lon: number) => {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?format=json&lat=${encodeURIComponent(
+        String(lat)
+      )}&lon=${encodeURIComponent(String(lon))}&addressdetails=1`,
+      {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'Stitchly-App',
+        },
+      }
+    );
+
+    if (!res.ok) {
+      throw new Error(`Reverse geocode failed (${res.status})`);
+    }
+
+    return res.json();
+  };
+
+  try {
+    setLoadingLocation(true);
+
+    const coords = await getCurrentCoords();
+    if (!coords) {
+      return;
+    }
+
+    const { latitude, longitude } = coords;
 
     setLatitude(latitude);
     setLongitude(longitude);
 
-    const res = await fetch(
-      `https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json&addressdetails=1`,
-      {
-        headers: { "User-Agent": "Stitchly-App" },
-      }
-    );
+    let data: any = null;
+    try {
+      data = await reverseGeocodeWithNominatim(latitude, longitude);
+    } catch (reverseError) {
+      console.log('Reverse geocode error:', reverseError);
+    }
 
-    const data = await res.json();
-    const address = data.address || {};
+    const reverseAddress = data?.address || {};
+    const parsedDisplayName =
+      typeof data?.display_name === 'string'
+        ? data.display_name
+            .split(',')
+            .map((piece: string) => piece.trim())
+            .filter(Boolean)
+        : [];
+    const resolvedAddress =
+      (typeof data?.display_name === 'string' && data.display_name.trim()) ||
+      `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`;
 
-    setCity(
-      address.city ||
-      address.town ||
-      address.village ||
-      address.state ||
-      ""
-    );
+    const resolvedCity =
+      reverseAddress.city ||
+      reverseAddress.town ||
+      reverseAddress.village ||
+      reverseAddress.municipality ||
+      reverseAddress.county ||
+      reverseAddress.state ||
+      parsedDisplayName.find((piece: string) => /[A-Za-z]/.test(piece)) ||
+      "";
+    const pincodeMatch =
+      typeof data?.display_name === 'string' ? data.display_name.match(/\b\d{6}\b/) : null;
+    const resolvedPincode = reverseAddress.postcode || (pincodeMatch ? pincodeMatch[0] : "");
 
-    setPincode(address.postcode || "");
-    setAddress(data.display_name || "");
+    setCity((prev) => resolvedCity || prev);
+    setPincode((prev) => resolvedPincode || prev);
+    setLiveCity((prev) => resolvedCity || prev);
+    setLivePincode((prev) => resolvedPincode || prev);
+    setAddress(resolvedAddress);
+    setLiveAddress(resolvedAddress);
 
     setMapModalVisible(true);
+    if (Platform.OS === 'android') {
+      setAndroidMapSeed({ latitude, longitude });
+      setAndroidMapRevision((value) => value + 1);
+    } else {
+      requestAnimationFrame(() => {
+        mapRef.current?.animateToRegion(
+          {
+            latitude,
+            longitude,
+            latitudeDelta: 0.01,
+            longitudeDelta: 0.01,
+          },
+          350
+        );
+      });
+    }
 
     // 🔥 Success feedback
 setLocationSuccess(true);
@@ -456,10 +755,10 @@ setTimeout(() => {
   addressInputRef.current?.focus();
 }, 500);
 
-    setLoadingLocation(false);
-
   } catch (err) {
     console.log("Location error:", err);
+    Alert.alert('Error', 'Unable to fetch location');
+  } finally {
     setLoadingLocation(false);
   }
 };
@@ -910,70 +1209,69 @@ const getBodyImage = (type: 'slim' | 'fit' | 'bulk') => {
   <View style={{ flex: 1 }}>
     {latitude !== null && longitude !== null && (
       <>
-        <MapView
-          style={{ flex: 1 }}
-          initialRegion={{
-            latitude,
-            longitude,
-            latitudeDelta: 0.01,
-            longitudeDelta: 0.01,
+        {Platform.OS === 'android' && androidMapSeed ? (
+          <WebView
+            key={`picker-map-${androidMapRevision}`}
+            style={{ flex: 1 }}
+            originWhitelist={['*']}
+            source={{ html: buildPickerMapHtml(androidMapSeed.latitude, androidMapSeed.longitude) }}
+            onMessage={handleAndroidMapMessage}
+            javaScriptEnabled
+            domStorageEnabled
+            mixedContentMode="always"
+          />
+        ) : (
+          <MapView
+            ref={mapRef}
+            provider={PROVIDER_DEFAULT}
+            mapType="none"
+            style={{ flex: 1 }}
+            initialRegion={{
+              latitude,
+              longitude,
+              latitudeDelta: 0.01,
+              longitudeDelta: 0.01,
+            }}
+            onRegionChange={handleMapMoveStart}
+            onRegionChangeComplete={(region) => {
+              void handleMapMoveComplete(region.latitude, region.longitude);
+            }}
+          >
+            <UrlTile urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png" maximumZ={19} />
+            <Circle
+              center={{ latitude, longitude }}
+              radius={DELIVERY_RADIUS}
+              strokeColor="rgba(0,150,255,0.8)"
+              fillColor="rgba(0,150,255,0.15)"
+            />
+          </MapView>
+        )}
+
+        <TouchableOpacity
+          onPress={() => {
+            void recenterToCurrentLocation();
           }}
-          onRegionChange={() => {
-            setIsMoving(true);
-
-            Animated.timing(liftAnim, {
-              toValue: 1,
-              duration: 150,
-              useNativeDriver: true,
-            }).start();
-
-            Animated.loop(
-              Animated.sequence([
-                Animated.timing(glowAnim, {
-                  toValue: 1,
-                  duration: 600,
-                  useNativeDriver: true,
-                }),
-                Animated.timing(glowAnim, {
-                  toValue: 0,
-                  duration: 600,
-                  useNativeDriver: true,
-                }),
-              ])
-            ).start();
-          }}
-          onRegionChangeComplete={async (region) => {
-            setLatitude(region.latitude);
-            setLongitude(region.longitude);
-            setIsMoving(false);
-
-            Animated.spring(liftAnim, {
-              toValue: 0,
-              friction: 4,
-              useNativeDriver: true,
-            }).start();
-
-            glowAnim.stopAnimation();
-
-            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-
-            try {
-              const res = await fetch(
-                `https://nominatim.openstreetmap.org/reverse?lat=${region.latitude}&lon=${region.longitude}&format=json&addressdetails=1`,
-                { headers: { "User-Agent": "Stitchly-App" } }
-              );
-              const data = await res.json();
-              setLiveAddress(data.display_name || "");
-            } catch {}
+          disabled={mapRecenterLoading}
+          style={{
+            position: 'absolute',
+            top: 132,
+            right: 20,
+            width: 44,
+            height: 44,
+            borderRadius: 22,
+            backgroundColor: '#fff',
+            alignItems: 'center',
+            justifyContent: 'center',
+            elevation: 6,
+            opacity: mapRecenterLoading ? 0.7 : 1,
           }}
         >
-          <Circle
-            center={{ latitude, longitude }}
-            radius={DELIVERY_RADIUS}
-            strokeColor="rgba(0,150,255,0.8)"
-            fillColor="rgba(0,150,255,0.15)"
-          />
-        </MapView>
+          {mapRecenterLoading ? (
+            <ActivityIndicator size="small" color={Colors.primary} />
+          ) : (
+            <Feather name="crosshair" size={18} color={Colors.primary} />
+          )}
+        </TouchableOpacity>
 
         {/* Address Card */}
         <View
@@ -1065,7 +1363,9 @@ const getBodyImage = (type: 'slim' | 'fit' | 'bulk') => {
         {/* Confirm Button */}
         <TouchableOpacity
           onPress={() => {
-            setAddress(liveAddress);
+            setAddress((prev) => liveAddress || prev);
+            setCity((prev) => liveCity || prev);
+            setPincode((prev) => livePincode || prev);
             setMapModalVisible(false);
           }}
           style={{

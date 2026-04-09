@@ -3,6 +3,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 
 
 VISIBILITY_THRESHOLD = 0.55
@@ -12,6 +13,10 @@ LOW_QUALITY_WARNING_THRESHOLD = 0.60
 EXTREME_LOW_QUALITY_THRESHOLD = 0.30
 MAX_TILT_DELTA = 0.06
 SEGMENTATION_THRESHOLD = 0.35
+CONTOUR_TARGET_POINTS = 150
+CONTOUR_MIN_POINTS = 100
+PROFILE_LEVEL_COUNT = 20
+PROFILE_SMOOTH_SIGMA = 2.0
 
 DISTANCE_MIN_TORSO_RATIO = 0.15
 DISTANCE_MAX_TORSO_RATIO = 0.42
@@ -46,6 +51,23 @@ def _average(values: Iterable[float]) -> float:
 def _median(values: Iterable[float]) -> float:
     values = list(values)
     return float(np.median(values)) if values else 0.0
+
+
+def _sample_contour_points(
+    points: np.ndarray,
+    target_points: int = CONTOUR_TARGET_POINTS,
+    min_points: int = CONTOUR_MIN_POINTS,
+) -> np.ndarray:
+    if points is None or points.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    point_count = len(points)
+    if point_count <= target_points:
+        return points.astype(np.float32)
+
+    desired = min(point_count, max(min_points, target_points))
+    indices = np.linspace(0, point_count - 1, num=desired, dtype=np.int32)
+    return points[indices].astype(np.float32)
 
 
 def _get_xy(landmark: Any) -> Tuple[float, float]:
@@ -141,6 +163,11 @@ def _extract_primary_contour(mask: Optional[np.ndarray]) -> Dict[str, Any]:
     if area <= 20.0:
         return {"contour": None, "clarity": 0.0, "area_ratio": 0.0, "binary_mask": binary}
 
+    contour_points = contour.reshape(-1, 2).astype(np.float32)
+    sampled_points = _sample_contour_points(contour_points)
+    top_y = float(np.min(contour_points[:, 1]))
+    bottom_y = float(np.max(contour_points[:, 1]))
+
     image_area = float(binary.shape[0] * binary.shape[1])
     area_ratio = area / image_area if image_area > 0.0 else 0.0
     hull = cv2.convexHull(contour)
@@ -153,10 +180,90 @@ def _extract_primary_contour(mask: Optional[np.ndarray]) -> Dict[str, Any]:
         1.0,
     )
     return {
-        "contour": contour.reshape(-1, 2).astype(np.float32),
+        "contour": contour_points,
+        "sampled_contour": sampled_points,
+        "top_y": top_y,
+        "bottom_y": bottom_y,
+        "height_px": max(0.0, bottom_y - top_y),
         "clarity": clarity,
         "area_ratio": area_ratio,
         "binary_mask": binary,
+    }
+
+
+def _interpolate_missing_widths(widths: np.ndarray) -> np.ndarray:
+    if widths.size == 0:
+        return widths
+
+    valid_indices = np.where(widths > 0.0)[0]
+    if len(valid_indices) < 2:
+        return widths
+
+    missing_indices = np.where(widths <= 0.0)[0]
+    if len(missing_indices) == 0:
+        return widths
+
+    interpolated = widths.copy()
+    interpolated[missing_indices] = np.interp(missing_indices, valid_indices, widths[valid_indices])
+    return interpolated
+
+
+def _build_contour_profile(
+    contour_info: Dict[str, Any],
+    image_height: int,
+    level_count: int = PROFILE_LEVEL_COUNT,
+) -> Dict[str, Any]:
+    contour = contour_info.get("sampled_contour")
+    full_contour = contour_info.get("contour")
+    if contour is None and full_contour is None:
+        return {}
+
+    if contour is None:
+        contour = full_contour
+    if contour is None or contour.size == 0:
+        return {}
+
+    y_values = contour[:, 1]
+    top_y = float(contour_info.get("top_y", np.min(y_values)))
+    bottom_y = float(contour_info.get("bottom_y", np.max(y_values)))
+    if bottom_y - top_y <= 6.0:
+        return {}
+
+    levels_px = np.linspace(top_y, bottom_y, level_count)
+    widths_px: List[float] = []
+
+    for y_value in levels_px:
+        width = _contour_band_width(contour, float(y_value), tolerance=3.0)
+        if width <= 0.0:
+            width = _contour_intersection_width(contour, float(y_value))
+        if width <= 0.0 and full_contour is not None:
+            width = _contour_band_width(full_contour, float(y_value), tolerance=3.0)
+            if width <= 0.0:
+                width = _contour_intersection_width(full_contour, float(y_value))
+        widths_px.append(float(width))
+
+    width_array = np.asarray(widths_px, dtype=np.float32)
+    valid_count = int(np.sum(width_array > 0.0))
+    width_array = _interpolate_missing_widths(width_array)
+
+    if valid_count >= 3:
+        width_array = gaussian_filter1d(width_array, sigma=PROFILE_SMOOTH_SIGMA, mode="nearest")
+
+    width_array = np.maximum(width_array, 0.0)
+    y_scale = max(image_height - 1, 1)
+    levels_norm = np.clip(levels_px / y_scale, 0.0, 1.0)
+
+    profile_confidence = _clamp(
+        (0.65 * float(contour_info.get("clarity", 0.0))) + (0.35 * (valid_count / max(level_count, 1))),
+        0.0,
+        1.0,
+    )
+    return {
+        "levels_px": [float(value) for value in levels_px],
+        "levels_norm": [float(value) for value in levels_norm],
+        "widths_px": [float(value) for value in width_array],
+        "confidence": float(profile_confidence),
+        "point_count": int(len(contour)),
     }
 
 
@@ -187,6 +294,7 @@ def _coerce_view(view: Any) -> Dict[str, Any]:
         mask = np.asarray(mask)
 
     contour_info = _extract_primary_contour(mask)
+    contour_profile = _build_contour_profile(contour_info, image_height)
     return {
         "landmarks": landmarks,
         "raw_landmark_count": raw_landmark_count,
@@ -195,6 +303,7 @@ def _coerce_view(view: Any) -> Dict[str, Any]:
         "image_height": image_height,
         "pose_confidence": pose_confidence,
         "contour_info": contour_info,
+        "contour_profile": contour_profile,
     }
 
 
@@ -333,6 +442,26 @@ def _contour_band_width(contour: Optional[np.ndarray], y_value: float, tolerance
     return float(max(xs) - min(xs))
 
 
+def _profile_width_pixels(view: Dict[str, Any], y_norm: float) -> Tuple[float, float]:
+    profile = view.get("contour_profile") or {}
+    levels_norm = np.asarray(profile.get("levels_norm") or [], dtype=np.float32)
+    widths_px = np.asarray(profile.get("widths_px") or [], dtype=np.float32)
+
+    if levels_norm.size < 2 or widths_px.size < 2:
+        return 0.0, 0.0
+
+    y_target = float(_clamp(y_norm, 0.0, 1.0))
+    width = float(np.interp(y_target, levels_norm, widths_px))
+    if width <= 0.0:
+        return 0.0, 0.0
+
+    top_level = float(levels_norm[0])
+    bottom_level = float(levels_norm[-1])
+    range_factor = 1.0 if top_level <= y_target <= bottom_level else 0.65
+    confidence = _clamp(float(profile.get("confidence", 0.0)) * range_factor, 0.0, 1.0)
+    return width, confidence
+
+
 def _contour_width_pixels(view: Dict[str, Any], y_norm: float) -> Tuple[float, float]:
     contour_info = view.get("contour_info") or {}
     contour = contour_info.get("contour")
@@ -452,6 +581,20 @@ def _body_height_pixels(view: Dict[str, Any]) -> float:
     return max(0.0, (max(visible_foot_y) - min(visible_head_y)) * image_height)
 
 
+def _contour_height_pixels(view: Dict[str, Any]) -> float:
+    contour_info = view.get("contour_info") or {}
+    explicit_height = float(contour_info.get("height_px", 0.0) or 0.0)
+    if explicit_height > 0.0:
+        return explicit_height
+
+    contour = contour_info.get("contour")
+    if contour is None or contour.size == 0:
+        return 0.0
+
+    y_values = contour[:, 1]
+    return max(0.0, float(np.max(y_values) - np.min(y_values)))
+
+
 def _torso_ratio(view: Dict[str, Any]) -> float:
     landmarks = view["landmarks"]
     width = view["image_width"]
@@ -509,6 +652,18 @@ def _midpoint(point_a: Tuple[float, float], point_b: Tuple[float, float]) -> Tup
     return ((point_a[0] + point_b[0]) * 0.5, (point_a[1] + point_b[1]) * 0.5)
 
 
+def _interpolate_point(
+    point_a: Tuple[float, float],
+    point_b: Tuple[float, float],
+    ratio: float,
+) -> Tuple[float, float]:
+    r = _clamp(float(ratio), 0.0, 1.0)
+    return (
+        (point_a[0] * (1.0 - r)) + (point_b[0] * r),
+        (point_a[1] * (1.0 - r)) + (point_b[1] * r),
+    )
+
+
 def _interpolated_anchors(landmarks: List[Any]) -> Dict[str, Tuple[float, float]]:
     left_shoulder = _get_xy(landmarks[11])
     right_shoulder = _get_xy(landmarks[12])
@@ -522,8 +677,16 @@ def _interpolated_anchors(landmarks: List[Any]) -> Dict[str, Tuple[float, float]
     mid_torso = _midpoint(mid_shoulder, mid_hip)
     mid_knee = _midpoint(left_knee, right_knee)
     mid_thigh = _midpoint(mid_hip, mid_knee)
+    upper_torso = _interpolate_point(mid_shoulder, mid_hip, 0.3)
+    lower_torso = _interpolate_point(mid_shoulder, mid_hip, 0.7)
 
     return {
+        "shoulder_mid": mid_shoulder,
+        "torso_mid": mid_torso,
+        "hip_mid": mid_hip,
+        "thigh_mid": mid_thigh,
+        "upper_torso": upper_torso,
+        "lower_torso": lower_torso,
         "mid_shoulder": mid_shoulder,
         "mid_hip": mid_hip,
         "mid_torso": mid_torso,
@@ -556,6 +719,7 @@ def _view_width_estimate(
     y_norm: float,
     fallback_landmark_pair: Optional[Tuple[int, int]] = None,
 ) -> Tuple[float, float, float]:
+    profile_width, profile_conf = _profile_width_pixels(view, y_norm)
     contour_width, contour_conf = _contour_width_pixels(view, y_norm)
     mask_width, mask_conf = _mask_width_pixels(view.get("mask"), y_norm)
 
@@ -573,15 +737,17 @@ def _view_width_estimate(
 
     width_px, fusion_conf = _weighted_fusion(
         [
+            (profile_width, profile_conf * 1.45),
             (contour_width, contour_conf * 1.2),
-            (mask_width, mask_conf),
-            (landmark_width, landmark_conf),
+            (mask_width, mask_conf * 0.95),
+            (landmark_width, landmark_conf * 0.6),
         ],
-        fallback=landmark_width,
+        fallback=max(profile_width, contour_width, mask_width, landmark_width),
     )
 
     silhouette_clarity = _clamp(
         _average([
+            profile_conf,
             contour_conf,
             mask_conf,
             float((view.get("contour_info") or {}).get("clarity", 0.0)),
@@ -766,10 +932,31 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         front_height_px = _body_height_pixels(front)
         back_height_px = _body_height_pixels(back)
         side_height_px = _body_height_pixels(side)
-        pixel_height = max(front_height_px, back_height_px, side_height_px)
+
+        front_contour_height_px = _contour_height_pixels(front)
+        back_contour_height_px = _contour_height_pixels(back)
+        side_contour_height_px = _contour_height_pixels(side)
+
+        contour_height_px = max(front_contour_height_px, back_contour_height_px, side_contour_height_px)
+        landmark_height_px = max(front_height_px, back_height_px, side_height_px)
+        pixel_height = max(contour_height_px, landmark_height_px)
         if pixel_height <= 0.0:
             pixel_height = max(float(front["image_height"]) * 0.78, 1.0)
             warnings.append("Body height landmarks were incomplete; using approximate pixel height.")
+
+        min_height_threshold = float(front["image_height"]) * 0.55
+        max_height_threshold = float(front["image_height"]) * 0.92
+        if pixel_height < min_height_threshold:
+            warnings.append("Move closer to camera for higher accuracy.")
+            distance_score = min(distance_score, 0.45)
+        elif pixel_height > max_height_threshold:
+            warnings.append("Move back slightly for higher accuracy.")
+            distance_score = min(distance_score, 0.45)
+
+        if contour_height_px <= 0.0:
+            contour_height_px = landmark_height_px
+            if contour_height_px > 0.0:
+                warnings.append("Contour height was weak; used landmark height fallback.")
 
         front_landmarks_data = front["landmarks"]
         back_landmarks_data = back["landmarks"]
@@ -798,7 +985,12 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         )
 
         expected_shoulder_cm = height_cm * 0.25
-        height_scale = height_cm / max(pixel_height, 1.0)
+        contour_height_scale = height_cm / max(contour_height_px, 1.0)
+        landmark_height_scale = height_cm / max(landmark_height_px, 1.0) if landmark_height_px > 0.0 else 0.0
+        height_scale = contour_height_scale if contour_height_scale > 0.0 else landmark_height_scale
+        if landmark_height_scale > 0.0 and contour_height_scale > 0.0:
+            height_scale = (contour_height_scale * 0.8) + (landmark_height_scale * 0.2)
+
         shoulder_scale = expected_shoulder_cm / shoulder_anchor_px if shoulder_anchor_px > 0.0 else 0.0
         if shoulder_scale <= 0.0:
             shoulder_scale = height_scale
@@ -823,11 +1015,11 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         distance_norm = _clamp(TARGET_TORSO_RATIO / max(torso_ratio, 1e-6), 0.93, 1.07)
         pixel_to_cm *= distance_norm
 
-        shoulder_y = anchors["mid_shoulder"][1]
-        hip_y = anchors["mid_hip"][1]
-        torso_y = anchors["mid_torso"][1]
-        chest_y = shoulder_y + ((torso_y - shoulder_y) * 0.75)
-        waist_y = torso_y + ((hip_y - torso_y) * 0.55)
+        shoulder_y = anchors["shoulder_mid"][1]
+        hip_y = anchors["hip_mid"][1]
+        torso_y = anchors["torso_mid"][1]
+        chest_y = anchors["upper_torso"][1]
+        waist_y = anchors["lower_torso"][1]
         neck_y = _clamp(shoulder_y - ((hip_y - shoulder_y) * 0.16), 0.0, 1.0)
 
         front_shoulder_px, front_shoulder_conf, front_shoulder_sil = _view_width_estimate(front, shoulder_y, (11, 12))
@@ -843,36 +1035,54 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
 
         front_chest_px, front_chest_conf, front_chest_sil = _view_width_estimate(front, chest_y, (11, 12))
         back_chest_px, back_chest_conf, back_chest_sil = _view_width_estimate(back, chest_y, (11, 12))
-        chest_width_px, _ = _weighted_fusion(
+        front_chest_profile_px, front_chest_profile_conf = _profile_width_pixels(front, chest_y)
+        back_chest_profile_px, back_chest_profile_conf = _profile_width_pixels(back, chest_y)
+        chest_contour_px, _ = _weighted_fusion(
             [
-                (front_chest_px, front_chest_conf),
-                (back_chest_px, back_chest_conf),
-                (shoulder_width_px * 0.92, 0.2),
+                (front_chest_profile_px, front_chest_profile_conf * 1.2),
+                (back_chest_profile_px, back_chest_profile_conf),
+                (front_chest_px, front_chest_conf * 0.9),
+                (back_chest_px, back_chest_conf * 0.9),
             ],
-            fallback=max(shoulder_width_px * 0.9, shoulder_anchor_px * 0.9),
+            fallback=max(front_chest_px, back_chest_px),
         )
+
+        if chest_contour_px > 0.0 and shoulder_width_px > 0.0:
+            chest_width_px = (chest_contour_px * 0.7) + (shoulder_width_px * 0.3)
+        elif chest_contour_px > 0.0:
+            chest_width_px = chest_contour_px
+        else:
+            chest_width_px = max(shoulder_width_px * 0.9, shoulder_anchor_px * 0.9)
 
         front_waist_px, front_waist_conf, front_waist_sil = _view_width_estimate(front, waist_y, (23, 24))
         back_waist_px, back_waist_conf, back_waist_sil = _view_width_estimate(back, waist_y, (23, 24))
-        waist_width_px, _ = _weighted_fusion(
+        waist_contour_px, _ = _weighted_fusion(
             [
                 (front_waist_px, front_waist_conf),
                 (back_waist_px, back_waist_conf),
-                (chest_width_px * 0.85, 0.2),
             ],
-            fallback=max(chest_width_px * 0.84, hip_anchor_px * 0.9),
+            fallback=0.0,
         )
+
+        if waist_contour_px > 0.0 and chest_width_px > 0.0:
+            waist_width_px = (waist_contour_px * 0.75) + ((chest_width_px * 0.85) * 0.25)
+        else:
+            waist_width_px = max(waist_contour_px, chest_width_px * 0.84, hip_anchor_px * 0.9)
 
         front_hip_px, front_hip_conf, front_hip_sil = _view_width_estimate(front, hip_y, (23, 24))
         back_hip_px, back_hip_conf, back_hip_sil = _view_width_estimate(back, hip_y, (23, 24))
-        hip_width_px, _ = _weighted_fusion(
+        hip_contour_px, _ = _weighted_fusion(
             [
                 (front_hip_px, front_hip_conf),
                 (back_hip_px, back_hip_conf),
-                (hip_anchor_px, 0.25),
             ],
-            fallback=hip_anchor_px,
+            fallback=0.0,
         )
+
+        if hip_contour_px > 0.0 and hip_anchor_px > 0.0:
+            hip_width_px = (hip_contour_px * 0.75) + (hip_anchor_px * 0.25)
+        else:
+            hip_width_px = max(hip_contour_px, hip_anchor_px)
 
         side_torso_depth_px = _average(
             [
@@ -1010,9 +1220,9 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
 
         measurement_details = {
             "shoulder": _metric_detail(measurements["shoulder_width_cm"], shoulder_conf, "interpolated landmark + contour fusion", shoulder_landmark_conf, shoulder_silhouette, posture_score),
-            "chest": _metric_detail(measurements["chest_cm"], chest_conf, "front/side ellipse fusion", torso_landmark_conf, chest_silhouette, posture_score),
-            "waist": _metric_detail(measurements["waist_cm"], waist_conf, "front/side ellipse fusion", torso_landmark_conf, waist_silhouette, posture_score),
-            "hip": _metric_detail(measurements["hip_circumference_cm"], hip_conf, "front/side ellipse fusion", torso_landmark_conf, hip_silhouette, posture_score),
+            "chest": _metric_detail(measurements["chest_cm"], chest_conf, "dense contour + landmark fusion", torso_landmark_conf, chest_silhouette, posture_score),
+            "waist": _metric_detail(measurements["waist_cm"], waist_conf, "dense contour + landmark fusion", torso_landmark_conf, waist_silhouette, posture_score),
+            "hip": _metric_detail(measurements["hip_circumference_cm"], hip_conf, "dense contour + landmark fusion", torso_landmark_conf, hip_silhouette, posture_score),
             "arm": _metric_detail(measurements["arm_length_cm"], arm_conf, "landmark chain", limb_landmark_conf, limb_silhouette, posture_score),
             "leg": _metric_detail(measurements["leg_length_cm"], leg_conf, "landmark chain", limb_landmark_conf, limb_silhouette, posture_score),
             "neck": _metric_detail(measurements["neck_cm"], neck_conf, "contour + side depth fusion", torso_landmark_conf, neck_silhouette, posture_score),
@@ -1062,6 +1272,7 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
                 "height_scale": round(height_scale, 6),
                 "width_scale": round(shoulder_scale, 6),
                 "leg_scale": round(leg_scale, 6),
+                "contour_height_scale": round(contour_height_scale, 6),
                 "distance_normalization": round(distance_norm, 4),
             },
             "scan_artifacts": {

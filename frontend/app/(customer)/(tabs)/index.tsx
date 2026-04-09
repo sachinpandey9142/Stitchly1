@@ -1,562 +1,709 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, FlatList, ActivityIndicator, RefreshControl, Modal } from 'react-native';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  ActivityIndicator,
+  FlatList,
+  Image,
+  Modal,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useRouter } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
-import { api } from '../../../src/utils/api';
+import * as Location from 'expo-location';
+import { useRouter } from 'expo-router';
+
 import { useAuth } from '../../../src/context/AuthContext';
-import { Colors, Fonts, Spacing, Radius } from '../../../src/utils/theme';
-import { designCatalog } from "../../../src/data/designCatalog";
-import { Image } from "react-native";
-import { ScrollView } from "react-native";
+import { useCustomerDiscovery } from '../../../src/context/CustomerDiscoveryContext';
+import { api } from '../../../src/utils/api';
+import { Colors, Fonts, Radius, Spacing } from '../../../src/utils/theme';
+import {
+  CATEGORY_CAROUSEL,
+  getAllDesigns,
+  getCategoryPreviewImage,
+  getDesignImage,
+  getDesignsForCategory,
+  getTailorSpecialty,
+  sortTailorsByDistance,
+  TailorRecord,
+} from '../../../src/utils/customerDiscovery';
 
-const designImages: any = {
-  lehenga: {
-    "Bridal Lehenga": require("../../../src/assets/designs/lehenga/bridal.png"),
-    "A-Line Lehenga": require("../../../src/assets/designs/lehenga/a-line.png"),
-    "Circular Lehenga": require("../../../src/assets/designs/lehenga/circular.png"),
-    "Panelled Lehenga": require("../../../src/assets/designs/lehenga/panelled.png"),
-  },
+type CategoryFilterKey = 'all' | 'men' | 'women';
 
-  blouse: {
-    "Boat Neck Blouse": require("../../../src/assets/designs/blouse/boat-neck.png"),
-    "Backless Blouse": require("../../../src/assets/designs/blouse/backless.png"),
-    "Princess Cut Blouse": require("../../../src/assets/designs/blouse/princess-cut.png"),
-    "High Neck Blouse": require("../../../src/assets/designs/blouse/high-neck.png"),
-  },
+const CATEGORY_FILTER_OPTIONS: Array<{ key: CategoryFilterKey; label: string }> = [
+  { key: 'all', label: 'All' },
+  { key: 'men', label: 'Men' },
+  { key: 'women', label: 'Women' },
+];
 
-  suits: {
-    "Anarkali Suit": require("../../../src/assets/designs/suits/anarkali.png"),
-    "Straight Suit": require("../../../src/assets/designs/suits/straight.png"),
-    "Palazzo Suit": require("../../../src/assets/designs/suits/palazzo.png"),
-  }
+const CATEGORIES_BY_FILTER: Record<CategoryFilterKey, typeof CATEGORY_CAROUSEL> = {
+  all: CATEGORY_CAROUSEL,
+  men: CATEGORY_CAROUSEL.filter((item) => item.group === 'men'),
+  women: CATEGORY_CAROUSEL.filter((item) => item.group === 'women'),
 };
-const SPECIALITIES = ['All', 'Blouse', 'Lehenga', 'Men\'s Suit', 'Kurta', 'Alteration', 'Dress', 'Sherwani'];
 
 export default function CustomerHome() {
   const router = useRouter();
   const { user } = useAuth();
-  const [tailors, setTailors] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { selectedCategory, selectedDesign, setSelectedCategory, setSelectedDesign } = useCustomerDiscovery();
+
+  const [tailors, setTailors] = useState<TailorRecord[]>([]);
+  const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [search, setSearch] = useState('');
-  const [selectedSpecialty, setSelectedSpecialty] = useState('All');
-  const [selectedCity, setSelectedCity] = useState(user?.city || '');
   const [cities, setCities] = useState<string[]>([]);
+  const [selectedCity, setSelectedCity] = useState(user?.city || '');
   const [showCityPicker, setShowCityPicker] = useState(false);
-  const [selectedDesign, setSelectedDesign] = useState<string | null>(null);
-  // const [activeCategory, setActiveCategory] =
-  // useState<keyof typeof designCatalog.women>("lehenga");
-  // const [searchDesign, setSearchDesign] = useState("");
+  const [userCoords, setUserCoords] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [selectedCategoryFilter, setSelectedCategoryFilter] = useState<CategoryFilterKey>('all');
+
+  const displayedCategories = CATEGORIES_BY_FILTER[selectedCategoryFilter];
 
   useEffect(() => {
-    (async () => {
-      try { const c = await api.get('/cities'); setCities(c); }
-      catch {}
-    })();
+    const firstCategory = displayedCategories[0];
+    if (!firstCategory) return;
+
+    const isCurrentCategoryVisible = selectedCategory
+      ? displayedCategories.some((item) => item.key === selectedCategory)
+      : false;
+
+    if (!isCurrentCategoryVisible) {
+      setSelectedCategory(firstCategory.key);
+      setSelectedDesign(null);
+    }
+  }, [displayedCategories, selectedCategory, setSelectedCategory, setSelectedDesign]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const loadCities = async () => {
+      try {
+        const data = await api.get('/cities');
+        if (mounted && Array.isArray(data)) {
+          setCities(data);
+        }
+      } catch {}
+    };
+
+    void loadCities();
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   useEffect(() => {
-    if (user?.city && !selectedCity) setSelectedCity(user.city);
-  }, [user]);
+    if (user?.city && !selectedCity) {
+      setSelectedCity(user.city);
+    }
+  }, [user, selectedCity]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const getLocation = async () => {
+      try {
+        const permission = await Location.requestForegroundPermissionsAsync();
+        if (permission.status !== 'granted') return;
+
+        const current = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        if (!mounted) return;
+
+        setUserCoords({
+          latitude: current.coords.latitude,
+          longitude: current.coords.longitude,
+        });
+      } catch {}
+    };
+
+    void getLocation();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const categoryDesigns = useMemo(
+    () => {
+      if (selectedCategoryFilter === 'all') {
+        return getAllDesigns();
+      }
+
+      if (!selectedCategory) {
+        return [];
+      }
+
+      return getDesignsForCategory(selectedCategory).map((design) => ({
+        category: selectedCategory,
+        design,
+      }));
+    },
+    [selectedCategoryFilter, selectedCategory]
+  );
+
+  const specialty = useMemo(
+    () => getTailorSpecialty(selectedCategory, selectedDesign),
+    [selectedCategory, selectedDesign]
+  );
+
+  const selectedCategoryLabel = useMemo(
+    () => displayedCategories.find((item) => item.key === selectedCategory)?.label || selectedCategory || '',
+    [displayedCategories, selectedCategory]
+  );
 
   const fetchTailors = useCallback(async () => {
+    if (!selectedCategory && !selectedDesign) {
+      setTailors([]);
+      setLoading(false);
+      setRefreshing(false);
+      return;
+    }
+
+    setLoading(true);
     try {
       let endpoint = '/tailors?';
-      const specialty =
-        selectedDesign?.split(" ")[0] || selectedSpecialty;
-
-      if (specialty !== 'All') {
-      endpoint += `specialty=${encodeURIComponent(specialty)}&`;
+      if (specialty) {
+        endpoint += `specialty=${encodeURIComponent(specialty)}&`;
       }
-      if (selectedCity) endpoint += `city=${encodeURIComponent(selectedCity)}&`;
-      if (search.trim()) endpoint += `search=${encodeURIComponent(search.trim())}&`;
+      if (selectedCity) {
+        endpoint += `city=${encodeURIComponent(selectedCity)}&`;
+      }
+
+      const designKeyword = selectedDesign ? selectedDesign.split(' ')[0] : '';
+      if (designKeyword) {
+        endpoint += `search=${encodeURIComponent(designKeyword)}&`;
+      }
+
       const data = await api.get(endpoint);
-      setTailors(data);
-    } catch (err) {
-      console.error(err);
+      const sortedTailors = sortTailorsByDistance(Array.isArray(data) ? data : [], userCoords, 40);
+      setTailors(sortedTailors);
+    } catch {
+      setTailors([]);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [selectedSpecialty, selectedCity, search, selectedDesign]);
+  }, [selectedCategory, selectedDesign, specialty, selectedCity, userCoords]);
 
-  useEffect(() => { setLoading(true); fetchTailors(); }, [fetchTailors]);
+  useEffect(() => {
+    void fetchTailors();
+  }, [fetchTailors]);
 
-  const onRefresh = () => { setRefreshing(true); fetchTailors(); };
+  const onRefresh = () => {
+    setRefreshing(true);
+    void fetchTailors();
+  };
 
-  const selectedKey =
-  selectedSpecialty === "All"
-    ? null
-    : selectedSpecialty.toLowerCase() as keyof typeof designCatalog.women;
-
-  const renderTailor = ({ item }: { item: any }) => (
-    <TouchableOpacity testID={`tailor-card-${item.id}`} style={styles.card} activeOpacity={0.7} onPress={() => router.push(`/tailor/${item.id}`)}>
-      <View style={styles.cardHeader}>
-        <View style={styles.avatar}>
-          <Text style={styles.avatarText}>{item.name.charAt(0)}</Text>
+  const renderTailor = ({ item }: { item: TailorRecord }) => (
+    <TouchableOpacity
+      testID={`home-tailor-${item.id}`}
+      style={styles.tailorCard}
+      activeOpacity={0.85}
+      onPress={() => router.push(`/tailor/${item.id}`)}
+    >
+      <View style={styles.tailorCardHeader}>
+        <View style={styles.tailorAvatar}>
+          <Text style={styles.tailorAvatarText}>{item.name?.charAt(0) || 'T'}</Text>
         </View>
-        <View style={styles.cardInfo}>
+
+        <View style={styles.tailorInfo}>
           <Text style={styles.tailorName}>{item.name}</Text>
-          <View style={styles.ratingRow}>
-            <Feather name="star" size={14} color={Colors.secondary} />
-            <Text style={styles.ratingText}>{item.rating.toFixed(1)}</Text>
-            <Text style={styles.ratingCount}>({item.rating_count})</Text>
-          </View>
+          <Text style={styles.tailorMeta}>
+            {item.city || 'Unknown city'}
+            {item.distanceKm != null ? ` • ${item.distanceKm.toFixed(1)} km away` : ''}
+          </Text>
         </View>
-        <View style={styles.priceTag}>
-          <Text style={styles.priceFrom}>from</Text>
-          <Text style={styles.priceValue}>{'\u20B9'}{item.min_price}</Text>
+
+        <View style={styles.priceBadge}>
+          <Text style={styles.priceLabel}>from</Text>
+          <Text style={styles.priceValue}>{`\u20B9${item.min_price || 0}`}</Text>
         </View>
       </View>
-      <View style={styles.cardBody}>
-        <View style={styles.locationRow}>
-          <Feather name="map-pin" size={14} color={Colors.primary} />
-          <Text style={styles.locationText}>{item.city}{item.pincode ? `, ${item.pincode}` : ''}</Text>
-          {item.address ? <Text style={styles.addressText} numberOfLines={1}> - {item.address}</Text> : null}
-        </View>
-        <View style={styles.tagRow}>
-          {item.specialities?.slice(0, 3).map((s: string) => (
-            <View key={s} style={styles.tag}><Text style={styles.tagText}>{s}</Text></View>
-          ))}
-        </View>
-        <Text style={styles.expText}>{item.experience ? `${item.experience} experience` : ''}</Text>
+
+      <View style={styles.tagRow}>
+        {(item.specialities || []).slice(0, 3).map((tag) => (
+          <View key={`${item.id}-${tag}`} style={styles.tag}>
+            <Text style={styles.tagText}>{tag}</Text>
+          </View>
+        ))}
       </View>
     </TouchableOpacity>
   );
 
-  return (
-   <SafeAreaView style={{ flex: 1 }} edges={['top']}>
-  <ScrollView showsVerticalScrollIndicator={false}>
+  const header = (
+    <View>
       <View style={styles.headerSection}>
-        <View>
-          <Text style={styles.greeting}>Hello, {user?.name?.split(' ')[0]}</Text>
-          <Text style={styles.headerTitle}>Nearby Tailors</Text>
-        </View>
+        <Text style={styles.greeting}>Hello, {user?.name?.split(' ')[0] || 'Customer'}</Text>
+        <Text style={styles.headerTitle}>Discover Tailors & Designs</Text>
       </View>
 
-      {/* Location Bar */}
-      <TouchableOpacity testID="city-selector-btn" style={styles.locationBar} onPress={() => setShowCityPicker(true)} activeOpacity={0.7}>
-        <View style={styles.locationBarLeft}>
-          <Feather name="map-pin" size={20} color={Colors.primary} />
-          <View style={styles.locationBarText}>
-            <Text style={styles.locationBarLabel}>Your City</Text>
-            <Text style={styles.locationBarValue}>{selectedCity || 'All Cities'}</Text>
+      <TouchableOpacity
+        testID="home-city-selector"
+        style={styles.locationBar}
+        onPress={() => setShowCityPicker(true)}
+        activeOpacity={0.8}
+      >
+        <View style={styles.locationLeft}>
+          <Feather name="map-pin" size={18} color={Colors.primary} />
+          <View style={styles.locationTextWrap}>
+            <Text style={styles.locationLabel}>Selected City</Text>
+            <Text style={styles.locationValue}>{selectedCity || 'All Cities'}</Text>
           </View>
         </View>
-        <Feather name="chevron-down" size={20} color={Colors.textMuted} />
+        <Feather name="chevron-down" size={18} color={Colors.textMuted} />
       </TouchableOpacity>
 
-      {/* City Picker Modal */}
+      <TouchableOpacity
+        testID="home-ai-tryon-button"
+        style={styles.tryOnCard}
+        activeOpacity={0.85}
+        onPress={() => router.push('/ai-tryon')}
+      >
+        <View style={styles.tryOnCardLeft}>
+          <View style={styles.tryOnBadge}>
+            <Feather name="camera" size={18} color={Colors.textInverted} />
+          </View>
+          <View>
+            <Text style={styles.tryOnTitle}>✨ AI Try-On</Text>
+            <Text style={styles.tryOnSubtitle}>See outfits on you in real time</Text>
+          </View>
+        </View>
+        <Feather name="chevron-right" size={18} color={Colors.primary} />
+      </TouchableOpacity>
+
+      <View style={styles.sectionBlock}>
+        <Text style={styles.sectionTitle}>Categories</Text>
+        <View style={styles.categoryFilterRow}>
+          {CATEGORY_FILTER_OPTIONS.map((filter) => {
+            const isActive = selectedCategoryFilter === filter.key;
+
+            return (
+              <TouchableOpacity
+                key={filter.key}
+                testID={`home-category-filter-${filter.key}`}
+                style={[styles.categoryFilterButton, isActive && styles.categoryFilterButtonActive]}
+                activeOpacity={0.85}
+                onPress={() => setSelectedCategoryFilter(filter.key)}
+              >
+                <Text style={[styles.categoryFilterText, isActive && styles.categoryFilterTextActive]}>
+                  {filter.label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+        <FlatList
+          horizontal
+          data={displayedCategories}
+          keyExtractor={(item) => item.key}
+          contentContainerStyle={styles.categoryList}
+          showsHorizontalScrollIndicator={false}
+          renderItem={({ item }) => {
+            const previewImage = getCategoryPreviewImage(item.key);
+            const isActive = selectedCategory === item.key;
+
+            return (
+              <TouchableOpacity
+                testID={`home-category-${item.key}`}
+                style={[styles.categoryCard, isActive && styles.categoryCardActive]}
+                onPress={() => {
+                  setSelectedCategory(item.key);
+                  setSelectedDesign(null);
+                  router.push({
+                    pathname: '/(customer)/(tabs)/search',
+                    params: { category: item.key },
+                  });
+                }}
+                activeOpacity={0.85}
+              >
+                {previewImage ? (
+                  <Image source={previewImage} style={styles.categoryImage} resizeMode="contain" />
+                ) : (
+                  <View style={styles.categoryImageFallback}>
+                    <Feather name="image" size={18} color={Colors.textMuted} />
+                  </View>
+                )}
+                <Text style={[styles.categoryLabel, isActive && styles.categoryLabelActive]}>{item.label}</Text>
+              </TouchableOpacity>
+            );
+          }}
+        />
+      </View>
+
+      <View style={styles.sectionBlock}>
+        <Text style={styles.sectionTitle}>Design Gallery</Text>
+        <FlatList
+          horizontal
+          data={categoryDesigns}
+          keyExtractor={(item) => `${item.category}-${item.design}`}
+          contentContainerStyle={styles.designList}
+          showsHorizontalScrollIndicator={false}
+          renderItem={({ item }) => {
+            const designImage = getDesignImage(item.category, item.design);
+            const isActive = selectedDesign === item.design && selectedCategory === item.category;
+
+            return (
+              <TouchableOpacity
+                testID={`home-design-${item.category}-${item.design}`}
+                style={[styles.designCard, isActive && styles.designCardActive]}
+                activeOpacity={0.85}
+                onPress={() => {
+                  setSelectedCategory(item.category);
+                  setSelectedDesign(item.design);
+                }}
+              >
+                {designImage ? (
+                  <Image source={designImage} style={styles.designImage} resizeMode="contain" />
+                ) : (
+                  <View style={styles.designImageFallback}>
+                    <Feather name="image" size={18} color={Colors.textMuted} />
+                  </View>
+                )}
+                <Text style={styles.designLabel} numberOfLines={2}>
+                  {item.design}
+                </Text>
+              </TouchableOpacity>
+            );
+          }}
+        />
+      </View>
+
+      <View style={styles.tailorHeaderRow}>
+        <Text style={styles.sectionTitle}>
+          {selectedDesign
+            ? `Nearby Tailors for ${selectedDesign}`
+            : selectedCategory
+              ? `Nearby Tailors for ${selectedCategoryLabel}`
+              : 'Select a Category to See Nearby Tailors'}
+        </Text>
+        {selectedCategory ? (
+          <TouchableOpacity onPress={() => router.push('/(customer)/(tabs)/nearby-tailors')}>
+            <Text style={styles.viewAllLink}>View All</Text>
+          </TouchableOpacity>
+        ) : null}
+      </View>
+    </View>
+  );
+
+  return (
+    <SafeAreaView style={styles.container} edges={['top']}>
+      <FlatList
+        data={selectedCategory ? tailors : []}
+        keyExtractor={(item) => item.id}
+        renderItem={renderTailor}
+        contentContainerStyle={styles.listContent}
+        ListHeaderComponent={header}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={Colors.primary} />}
+        ListEmptyComponent={
+          loading ? (
+            <View style={styles.emptyState}>
+              <ActivityIndicator size="large" color={Colors.primary} />
+            </View>
+          ) : selectedCategory ? (
+            <View style={styles.emptyState}>
+              <Feather name="scissors" size={40} color={Colors.border} />
+              <Text style={styles.emptyTitle}>No matching tailors nearby</Text>
+              <Text style={styles.emptySub}>Try another category, design, or city.</Text>
+            </View>
+          ) : (
+            <View style={styles.emptyState}>
+              <Feather name="image" size={40} color={Colors.border} />
+              <Text style={styles.emptyTitle}>Pick a category to continue</Text>
+              <Text style={styles.emptySub}>We will show nearby specialist tailors instantly.</Text>
+            </View>
+          )
+        }
+        showsVerticalScrollIndicator={false}
+      />
+
       <Modal visible={showCityPicker} transparent animationType="slide">
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Select City</Text>
-              <TouchableOpacity onPress={() => setShowCityPicker(false)} testID="close-city-picker">
-                <Feather name="x" size={24} color={Colors.text} />
+              <Text style={styles.modalTitle}>Choose City</Text>
+              <TouchableOpacity onPress={() => setShowCityPicker(false)}>
+                <Feather name="x" size={22} color={Colors.text} />
               </TouchableOpacity>
             </View>
-            <TouchableOpacity testID="city-all" style={[styles.cityOption, !selectedCity && styles.cityOptionActive]} onPress={() => { setSelectedCity(''); setShowCityPicker(false); }} activeOpacity={0.7}>
-              <Feather name="globe" size={18} color={!selectedCity ? Colors.primary : Colors.textMuted} />
-              <Text style={[styles.cityOptionText, !selectedCity && styles.cityOptionTextActive]}>All Cities</Text>
-              {!selectedCity && <Feather name="check" size={18} color={Colors.primary} />}
+
+            <TouchableOpacity
+              style={[styles.cityOption, !selectedCity && styles.cityOptionActive]}
+              onPress={() => {
+                setSelectedCity('');
+                setShowCityPicker(false);
+              }}
+              activeOpacity={0.8}
+            >
+              <Text style={[styles.cityText, !selectedCity && styles.cityTextActive]}>All Cities</Text>
+              {!selectedCity ? <Feather name="check" size={16} color={Colors.primary} /> : null}
             </TouchableOpacity>
-            {cities.map((c) => (
-              <TouchableOpacity key={c} testID={`city-${c}`} style={[styles.cityOption, selectedCity === c && styles.cityOptionActive]} onPress={() => { setSelectedCity(c); setShowCityPicker(false); }} activeOpacity={0.7}>
-                <Feather name="map-pin" size={18} color={selectedCity === c ? Colors.primary : Colors.textMuted} />
-                <Text style={[styles.cityOptionText, selectedCity === c && styles.cityOptionTextActive]}>{c}</Text>
-                {selectedCity === c && <Feather name="check" size={18} color={Colors.primary} />}
+
+            {cities.map((city) => (
+              <TouchableOpacity
+                key={city}
+                style={[styles.cityOption, selectedCity === city && styles.cityOptionActive]}
+                onPress={() => {
+                  setSelectedCity(city);
+                  setShowCityPicker(false);
+                }}
+                activeOpacity={0.8}
+              >
+                <Text style={[styles.cityText, selectedCity === city && styles.cityTextActive]}>{city}</Text>
+                {selectedCity === city ? <Feather name="check" size={16} color={Colors.primary} /> : null}
               </TouchableOpacity>
             ))}
           </View>
         </View>
       </Modal>
-
-      {/* Design Browser */}
-
-
-
-{/* CATEGORY TABS */}
-
-
-
-
-
-      <View style={styles.searchContainer}>
-        <Feather name="search" size={20} color={Colors.textMuted} />
-        <TextInput
-          testID="search-input"
-          style={styles.searchInput}
-          placeholder="Search tailors..."
-          placeholderTextColor={Colors.textMuted}
-          value={search}
-          onChangeText={setSearch}
-          returnKeyType="search"
-        />
-        {search.length > 0 && (
-          <TouchableOpacity onPress={() => setSearch('')} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-            <Feather name="x" size={18} color={Colors.textMuted} />
-          </TouchableOpacity>
-        )}
-      </View>
-      
-
-      <FlatList
-        horizontal
-        data={SPECIALITIES}
-        keyExtractor={(i) => i}
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.filterList}
-        renderItem={({ item }) => (
-          <TouchableOpacity
-            testID={`filter-${item}`}
-            style={[styles.filterChip, selectedSpecialty === item && styles.filterChipActive]}
-            onPress={() => setSelectedSpecialty(item)}
-            activeOpacity={0.7}
-          >
-            <Text style={[styles.filterText, selectedSpecialty === item && styles.filterTextActive]}>{item}</Text>
-          </TouchableOpacity>
-        )}
-      />
-<FlatList
-  horizontal
-  data={
-    (selectedSpecialty === "All"
-      ? Object.values(designCatalog.women).flat()
-      : designCatalog.women[selectedKey!] || []
-    ).filter((design) =>
-      design.toLowerCase().includes(search.toLowerCase())
-    )
-  }
-  keyExtractor={(item, index) => item + index}
-  showsHorizontalScrollIndicator={false}
-  contentContainerStyle={styles.designCarousel}
-  renderItem={({ item: design, index }) => {
-
-    const category =
-      selectedSpecialty === "All"
-        ? (Object.keys(designCatalog.women).find(cat =>
-            designCatalog.women[cat as keyof typeof designCatalog.women].includes(design)
-          ) as keyof typeof designCatalog.women)
-        : selectedKey!;
-
-    return (
-      <TouchableOpacity
-        style={[
-          styles.designCardNew,
-          selectedDesign === design && styles.designCardActive
-        ]}
-        onPress={() => setSelectedDesign(design)}
-        activeOpacity={0.8}
-      >
-
-        {designImages[category]?.[design] ? (
-          <Image
-            source={designImages[category][design]}
-            style={styles.designCardImageNew}
-          />
-        ) : (
-          <View style={styles.designCardPlaceholderNew} />
-        )}
-
-        <Text style={styles.designCardTextNew}>
-          {design}
-        </Text>
-
-      </TouchableOpacity>
-    );
-  }}
-/>
-
-      {loading ? (
-        <View style={styles.loader}><ActivityIndicator size="large" color={Colors.primary} /></View>
-      ) : (
-        <FlatList
-          data={tailors}
-          keyExtractor={(item) => item.id}
-          renderItem={renderTailor}
-          contentContainerStyle={styles.list}
-          showsVerticalScrollIndicator={false}
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={Colors.primary} />}
-          ListEmptyComponent={
-            <View style={styles.empty}>
-              <Feather name="scissors" size={48} color={Colors.border} />
-              <Text style={styles.emptyText}>No tailors found{selectedCity ? ` in ${selectedCity}` : ''}</Text>
-              <Text style={styles.emptySubText}>Try changing city or adjusting filters</Text>
-              {selectedCity && (
-                <TouchableOpacity testID="show-all-cities-btn" style={styles.showAllBtn} onPress={() => setSelectedCity('')} activeOpacity={0.7}>
-                  <Text style={styles.showAllText}>Show All Cities</Text>
-                </TouchableOpacity>
-              )}
-            </View>
-          }
-        />
-      )}
-      </ScrollView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: Colors.background },
-  headerSection: { paddingHorizontal: Spacing.containerPadding, paddingTop: 16, paddingBottom: 4 },
+  listContent: { paddingBottom: 24 },
+  headerSection: {
+    paddingHorizontal: Spacing.containerPadding,
+    paddingTop: 16,
+    paddingBottom: 8,
+  },
   greeting: { fontFamily: Fonts.ui, fontSize: 15, color: Colors.textMuted },
   headerTitle: { fontFamily: Fonts.heading, fontSize: 28, color: Colors.text, marginTop: 2 },
   locationBar: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    marginHorizontal: Spacing.containerPadding, marginTop: 12,
-    backgroundColor: Colors.primary + '08', borderRadius: Radius.md,
-    borderWidth: 1, borderColor: Colors.primary + '25', paddingHorizontal: 16, paddingVertical: 12,
+    marginHorizontal: Spacing.containerPadding,
+    marginTop: 12,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    borderRadius: Radius.md,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
   },
-  locationBarLeft: { flexDirection: 'row', alignItems: 'center' },
-  locationBarText: { marginLeft: 12 },
-  locationBarLabel: { fontFamily: Fonts.ui, fontSize: 12, color: Colors.textMuted },
-  locationBarValue: { fontFamily: Fonts.bodyBold, fontSize: 16, color: Colors.primary },
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end' },
-  modalContent: { backgroundColor: Colors.surface, borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: Spacing.containerPadding, paddingBottom: 40 },
-  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 },
-  modalTitle: { fontFamily: Fonts.bodyBold, fontSize: 20, color: Colors.text },
-  cityOption: { flexDirection: 'row', alignItems: 'center', paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: Colors.subtle },
-  cityOptionActive: { backgroundColor: Colors.primary + '08' },
-  cityOptionText: { fontFamily: Fonts.body, fontSize: 16, color: Colors.text, flex: 1, marginLeft: 12 },
-  cityOptionTextActive: { fontFamily: Fonts.bodyBold, color: Colors.primary },
-  searchContainer: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.surface,
-    borderRadius: Radius.md, borderWidth: 1, borderColor: Colors.border,
-    marginHorizontal: Spacing.containerPadding, paddingHorizontal: 16, height: 48, marginTop: 12,
+  locationLeft: { flexDirection: 'row', alignItems: 'center' },
+  locationTextWrap: { marginLeft: 10 },
+  locationLabel: { fontFamily: Fonts.ui, fontSize: 12, color: Colors.textMuted },
+  locationValue: { fontFamily: Fonts.bodyBold, fontSize: 15, color: Colors.text },
+  tryOnCard: {
+    marginHorizontal: Spacing.containerPadding,
+    marginTop: 12,
+    borderRadius: Radius.lg,
+    borderWidth: 1,
+    borderColor: Colors.primary + '33',
+    backgroundColor: Colors.primary + '12',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
   },
-  searchInput: { flex: 1, fontFamily: Fonts.ui, fontSize: 16, color: Colors.text, marginLeft: 12 },
-  filterList: { paddingHorizontal: Spacing.containerPadding, paddingVertical: 14, gap: 8 },
- 
-  
-  filterText: { fontFamily: Fonts.body, fontSize: 14, color: Colors.textMuted },
-  filterTextActive: { color: Colors.textInverted },
-  list: { paddingHorizontal: Spacing.containerPadding, paddingBottom: 20 },
-  card: {
-    backgroundColor: Colors.surface, borderRadius: Radius.lg, borderWidth: 1,
-    borderColor: Colors.border, padding: 16, marginBottom: 14,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.04, shadowRadius: 4, elevation: 2,
+  tryOnCardLeft: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  tryOnBadge: {
+    width: 36,
+    height: 36,
+    borderRadius: Radius.full,
+    backgroundColor: Colors.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  cardHeader: { flexDirection: 'row', alignItems: 'center' },
-  avatar: {
-    width: 52, height: 52, borderRadius: 26, backgroundColor: Colors.primaryLight,
-    justifyContent: 'center', alignItems: 'center',
+  tryOnTitle: { fontFamily: Fonts.bodyBold, fontSize: 15, color: Colors.text },
+  tryOnSubtitle: { marginTop: 1, fontFamily: Fonts.ui, fontSize: 12, color: Colors.textMuted },
+  sectionBlock: { marginTop: 16 },
+  sectionTitle: {
+    marginHorizontal: Spacing.containerPadding,
+    fontFamily: Fonts.bodyBold,
+    fontSize: 18,
+    color: Colors.text,
   },
-  avatarText: { fontFamily: Fonts.bodyBold, fontSize: 22, color: Colors.textInverted },
-  cardInfo: { flex: 1, marginLeft: 14 },
-  tailorName: { fontFamily: Fonts.bodyBold, fontSize: 17, color: Colors.text },
-  ratingRow: { flexDirection: 'row', alignItems: 'center', marginTop: 4 },
-  ratingText: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.text, marginLeft: 4 },
-  ratingCount: { fontFamily: Fonts.ui, fontSize: 13, color: Colors.textMuted, marginLeft: 2 },
-  priceTag: { alignItems: 'flex-end' },
-  priceFrom: { fontFamily: Fonts.ui, fontSize: 12, color: Colors.textMuted },
-  priceValue: { fontFamily: Fonts.bodyBold, fontSize: 18, color: Colors.primary },
-  cardBody: { marginTop: 14 },
-  locationRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
-  locationText: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.primary, marginLeft: 6 },
-  addressText: { fontFamily: Fonts.ui, fontSize: 13, color: Colors.textMuted, flex: 1 },
-  tagRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 6 },
-  tag: { backgroundColor: Colors.subtle, borderRadius: Radius.full, paddingHorizontal: 10, paddingVertical: 4 },
-  tagText: { fontFamily: Fonts.body, fontSize: 12, color: Colors.text },
-  expText: { fontFamily: Fonts.ui, fontSize: 13, color: Colors.textMuted, marginTop: 4 },
-  loader: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  empty: { alignItems: 'center', paddingTop: 60 },
-  emptyText: { fontFamily: Fonts.bodyBold, fontSize: 18, color: Colors.text, marginTop: 16 },
-  emptySubText: { fontFamily: Fonts.ui, fontSize: 14, color: Colors.textMuted, marginTop: 4 },
-  showAllBtn: { marginTop: 16, backgroundColor: Colors.primary, borderRadius: Radius.full, paddingHorizontal: 24, paddingVertical: 12 },
-  showAllText: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.textInverted },
-  designSection:{
-  paddingHorizontal:Spacing.containerPadding,
-  marginTop:16
-},
-
-designTitle:{
-  fontFamily:Fonts.bodyBold,
-  fontSize:18,
-  marginBottom:10,
-  color:Colors.text
-},
-
-designCategory:{
-  marginBottom:12
-},
-
-designCategoryTitle:{
-  fontFamily:Fonts.ui,
-  fontSize:13,
-  color:Colors.textMuted,
-  marginBottom:6
-},
-
-designRow:{
-  flexDirection:"row",
-  flexWrap:"wrap",
-  gap:8
-},
-designText:{
-  fontFamily:Fonts.body,
-  fontSize:13,
-  color:Colors.text
-},
-
-designTextActive:{
-  color:Colors.textInverted
-},
-designSearchContainer:{
-  marginHorizontal:Spacing.containerPadding,
-  marginTop:12
-},
-
-designSearchInput:{
-  borderWidth:1,
-  borderColor:Colors.border,
-  borderRadius:Radius.md,
-  padding:10
-},
-
-categoryTabs:{
-  paddingHorizontal:Spacing.containerPadding,
-  marginTop:10
-},
-
-categoryTab:{
-  paddingHorizontal:14,
-  paddingVertical:6,
-  borderRadius:Radius.full,
-  borderWidth:1,
-  borderColor:Colors.border,
-  marginRight:8
-},
-
-categoryTabActive:{
-  backgroundColor:Colors.primary,
-  borderColor:Colors.primary
-},
-
-categoryTabText:{
-  fontSize:13,
-  color:Colors.textMuted
-},
-
-categoryTabTextActive:{
-  color:Colors.textInverted
-},
-
-designList:{
-  paddingHorizontal:Spacing.containerPadding,
-  marginTop:16
-},
-
-designItem:{
-  marginBottom:20,
-  alignItems:"center"
-},
-
-imagePlaceholder:{
-  width:"100%",
-  height:120,
-  borderRadius:Radius.md,
-  borderWidth:1,
-  borderColor:Colors.border,
-  backgroundColor:"#f5f5f5"
-},
-
-designName:{
-  marginTop:6,
-  fontSize:14,
-  fontFamily:Fonts.body,
-  textAlign:"center"
-},
-designImage:{
-  width:"100%",
-  height:120
-},
-designCarousel:{
-  paddingHorizontal:Spacing.containerPadding,
-  marginTop:10,
-  gap:12   // 🔥 spacing between cards (nice UI)
-},
-
-designCard:{
-  width:100,
-  marginRight:12,
-  alignItems:"center"
-},
-
-designCardImage:{
-  width:90,
-  height:120,
-  borderRadius:20
-},
-
-designCardPlaceholder:{
-  width:90,
-  height:120,
-  borderRadius:20,
-  backgroundColor:"#eee"
-},
-
-designCardText:{
-  marginTop:6,
-  fontSize:12,
-  fontFamily:Fonts.body,
-  color:Colors.textMuted
-},
-designCardNew:{
-  width:140,
-  marginRight:12,
-  marginTop:12,
-  borderRadius:20,
-  backgroundColor:Colors.surface,
-  padding:10,
-  alignItems:"center",
-  shadowColor:"#000",
-  shadowOpacity:0.08,
-  shadowRadius:6,
-  elevation:3,
-  opacity:0.6
-},
-
-designCardImageNew:{
-  width:120,
-  height:150,
-  borderRadius:16
-},
-
-designCardPlaceholderNew:{
-  width:120,
-  height:150,
-  borderRadius:16,
-  backgroundColor:"#eee"
-},
-
-designCardTextNew:{
-  marginTop:8,
-  fontSize:13,
-  fontFamily:Fonts.body,
-  textAlign:"center"
-},
-filterChipActive: {
-  backgroundColor: Colors.primary,
-  borderColor: Colors.primary,
-},
-filterChip:{
-  paddingHorizontal: 16,
-  paddingVertical: 8,
-  borderRadius: Radius.full,
-  backgroundColor: Colors.surface,
-  borderWidth: 1,
-  borderColor: Colors.border,
-  minWidth: 80,          // 🔥 FIX WIDTH STABLE
-  alignItems: "center"
-},
-designCardActive: {
-  transform: [{ scale: 1.08 }],
-  borderColor: Colors.primary,
-  borderWidth: 2,
-  opacity: 1   // 🔥 IMPORTANT
-},
-
+  categoryFilterRow: {
+    marginTop: 10,
+    marginHorizontal: Spacing.containerPadding,
+    flexDirection: 'row',
+    gap: 8,
+  },
+  categoryFilterButton: {
+    borderRadius: Radius.full,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.surface,
+    paddingHorizontal: 14,
+    height: 34,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  categoryFilterButtonActive: {
+    borderColor: Colors.primary,
+    backgroundColor: Colors.primary,
+  },
+  categoryFilterText: {
+    fontFamily: Fonts.body,
+    color: Colors.textMuted,
+    fontSize: 13,
+  },
+  categoryFilterTextActive: {
+    fontFamily: Fonts.bodyBold,
+    color: Colors.textInverted,
+  },
+  categoryList: {
+    paddingHorizontal: Spacing.containerPadding,
+    paddingVertical: 12,
+    gap: 10,
+  },
+  categoryCard: {
+    width: 138,
+    borderRadius: Radius.lg,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.surface,
+    padding: 10,
+  },
+  categoryCardActive: {
+    borderColor: Colors.primary,
+    backgroundColor: Colors.surface,
+  },
+  categoryImage: {
+    width: '100%',
+    height: 98,
+    borderRadius: Radius.md,
+    backgroundColor: Colors.surface,
+  },
+  categoryImageFallback: {
+    width: '100%',
+    height: 98,
+    borderRadius: Radius.md,
+    backgroundColor: Colors.surface,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  categoryLabel: {
+    marginTop: 8,
+    fontFamily: Fonts.body,
+    color: Colors.textMuted,
+    fontSize: 13,
+    width: '100%',
+    textAlign: 'center',
+  },
+  categoryLabelActive: {
+    color: Colors.primary,
+    fontFamily: Fonts.bodyBold,
+  },
+  designList: {
+    paddingHorizontal: Spacing.containerPadding,
+    paddingVertical: 12,
+    gap: 10,
+  },
+  designCard: {
+    width: 158,
+    borderRadius: Radius.lg,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.surface,
+    padding: 10,
+  },
+  designCardActive: {
+    borderColor: Colors.primary,
+    backgroundColor: Colors.surface,
+  },
+  designImage: {
+    width: '100%',
+    height: 132,
+    borderRadius: Radius.md,
+    backgroundColor: Colors.surface,
+  },
+  designImageFallback: {
+    width: '100%',
+    height: 132,
+    borderRadius: Radius.md,
+    backgroundColor: Colors.surface,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  designLabel: {
+    marginTop: 8,
+    fontFamily: Fonts.body,
+    color: Colors.text,
+    fontSize: 13,
+    width: '100%',
+    textAlign: 'center',
+  },
+  tailorHeaderRow: {
+    marginTop: 8,
+    marginBottom: 6,
+    paddingHorizontal: Spacing.containerPadding,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  viewAllLink: {
+    fontFamily: Fonts.bodyBold,
+    color: Colors.primary,
+    fontSize: 13,
+  },
+  tailorCard: {
+    marginHorizontal: Spacing.containerPadding,
+    marginBottom: 12,
+    borderRadius: Radius.lg,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    backgroundColor: Colors.surface,
+    padding: 14,
+  },
+  tailorCardHeader: { flexDirection: 'row', alignItems: 'center' },
+  tailorAvatar: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: Colors.primaryLight,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  tailorAvatarText: { color: Colors.textInverted, fontFamily: Fonts.bodyBold, fontSize: 18 },
+  tailorInfo: { flex: 1, marginLeft: 10 },
+  tailorName: { fontFamily: Fonts.bodyBold, color: Colors.text, fontSize: 16 },
+  tailorMeta: { fontFamily: Fonts.ui, color: Colors.textMuted, fontSize: 13, marginTop: 2 },
+  priceBadge: { alignItems: 'flex-end' },
+  priceLabel: { fontFamily: Fonts.ui, fontSize: 11, color: Colors.textMuted },
+  priceValue: { fontFamily: Fonts.bodyBold, fontSize: 16, color: Colors.primary },
+  tagRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 10 },
+  tag: {
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: Radius.full,
+    backgroundColor: Colors.subtle,
+  },
+  tagText: { fontFamily: Fonts.body, color: Colors.text, fontSize: 12 },
+  emptyState: {
+    marginTop: 18,
+    marginHorizontal: Spacing.containerPadding,
+    borderRadius: Radius.lg,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: 24,
+    alignItems: 'center',
+  },
+  emptyTitle: { marginTop: 12, fontFamily: Fonts.bodyBold, fontSize: 17, color: Colors.text },
+  emptySub: { marginTop: 4, fontFamily: Fonts.ui, fontSize: 13, color: Colors.textMuted, textAlign: 'center' },
+  modalOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.4)' },
+  modalContent: {
+    backgroundColor: Colors.surface,
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    padding: Spacing.containerPadding,
+    paddingBottom: 36,
+  },
+  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  modalTitle: { fontFamily: Fonts.bodyBold, fontSize: 19, color: Colors.text },
+  cityOption: {
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.subtle,
+    paddingVertical: 14,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  cityOptionActive: { backgroundColor: Colors.primary + '10' },
+  cityText: { fontFamily: Fonts.body, fontSize: 16, color: Colors.text },
+  cityTextActive: { fontFamily: Fonts.bodyBold, color: Colors.primary },
 });

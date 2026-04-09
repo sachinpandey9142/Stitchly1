@@ -1,231 +1,263 @@
-import React, { useState } from "react";
-import { View, Text, TouchableOpacity, ScrollView, StyleSheet, Alert } from "react-native";
+import React, { useEffect, useMemo, useState } from "react";
+import { View, Text, TouchableOpacity, ScrollView, StyleSheet, Alert, Image, ActivityIndicator } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
+import { Feather } from "@expo/vector-icons";
 
 import { Colors, Fonts, Spacing, Radius } from "../../src/utils/theme";
-import { designCatalog } from "../../src/data/designCatalog";
+import {
+  CATEGORY_CAROUSEL,
+  CATEGORY_SPECIALITY_MAP,
+  getCategoryPreviewImage,
+} from "../../src/utils/customerDiscovery";
 import { api } from "../../src/utils/api";
+import { useAuth } from "../../src/context/AuthContext";
 
 export default function SelectSpecializations() {
-
   const router = useRouter();
+  const { user, refreshUser } = useAuth();
 
-  const [selected, setSelected] = useState<string[]>([]);
+  const [selectedCategoryKeys, setSelectedCategoryKeys] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
 
-  const toggle = (item: string) => {
+  const womenCategories = useMemo(
+    () => CATEGORY_CAROUSEL.filter((item) => item.group === "women"),
+    []
+  );
+  const menCategories = useMemo(
+    () => CATEGORY_CAROUSEL.filter((item) => item.group === "men"),
+    []
+  );
 
-    if (selected.includes(item)) {
-      setSelected(selected.filter(i => i !== item));
-    } else {
-      setSelected([...selected, item]);
+  useEffect(() => {
+    const savedSpecialities = user?.specialities || [];
+    if (savedSpecialities.length === 0) {
+      setSelectedCategoryKeys([]);
+      return;
     }
 
+    const normalized = new Set(savedSpecialities.map((item) => item.toLowerCase()));
+
+    const matched = CATEGORY_CAROUSEL.filter((category) => {
+      const mapped = CATEGORY_SPECIALITY_MAP[category.key] || "";
+      return (
+        normalized.has(category.key.toLowerCase()) ||
+        normalized.has(category.label.toLowerCase()) ||
+        (mapped ? normalized.has(mapped.toLowerCase()) : false)
+      );
+    }).map((category) => category.key);
+
+    setSelectedCategoryKeys(matched);
+  }, [user?.specialities]);
+
+  const toggleCategory = (categoryKey: string) => {
+    if (selectedCategoryKeys.includes(categoryKey)) {
+      setSelectedCategoryKeys((prev) => prev.filter((item) => item !== categoryKey));
+      return;
+    }
+
+    setSelectedCategoryKeys((prev) => [...prev, categoryKey]);
   };
 
   const handleSave = async () => {
+    if (selectedCategoryKeys.length === 0) {
+      Alert.alert("Select at least one category", "Choose the categories you stitch.");
+      return;
+    }
 
-    if (selected.length === 0) {
-      Alert.alert("Please select at least one design");
+    const specialities = Array.from(
+      new Set(
+        selectedCategoryKeys
+          .map((categoryKey) => CATEGORY_SPECIALITY_MAP[categoryKey])
+          .filter(Boolean)
+      )
+    );
+
+    if (specialities.length === 0) {
+      Alert.alert("Error", "Could not map selected categories to specialities.");
       return;
     }
 
     try {
+      setSaving(true);
+      await api.put("/tailor/specialities", { specialities });
+      await refreshUser();
 
-      await api.put("/auth/profile", {
-        specialities: selected
-      });
-
-      Alert.alert(
-        "Saved",
-        "Your design specializations have been saved."
-      );
-
+      Alert.alert("Saved", "Your category specializations are updated.");
       router.back();
-
-    } catch (err) {
-
-      Alert.alert(
-        "Error",
-        "Could not save specializations"
-      );
-
+    } catch {
+      Alert.alert("Error", "Could not save specializations");
+    } finally {
+      setSaving(false);
     }
-
   };
 
-  const renderCategory = (title: string, designs: string[]) => {
+  const renderCategoryCard = (category: (typeof CATEGORY_CAROUSEL)[number]) => {
+    const isSelected = selectedCategoryKeys.includes(category.key);
+    const previewImage = getCategoryPreviewImage(category.key);
 
     return (
+      <TouchableOpacity
+        key={category.key}
+        style={[styles.categoryCard, isSelected && styles.categoryCardSelected]}
+        onPress={() => toggleCategory(category.key)}
+        activeOpacity={0.85}
+      >
+        {previewImage ? (
+          <Image source={previewImage} style={styles.categoryImage} resizeMode="contain" />
+        ) : (
+          <View style={styles.imageFallback}>
+            <Feather name="image" size={18} color={Colors.textMuted} />
+          </View>
+        )}
 
-      <View style={styles.categorySection}>
-
-        <Text style={styles.categoryTitle}>{title}</Text>
-
-        <View style={styles.cardContainer}>
-
-          {designs.map((item) => (
-
-            <TouchableOpacity
-              key={item}
-              onPress={() => toggle(item)}
-              style={[
-                styles.card,
-                selected.includes(item) && styles.cardSelected
-              ]}
-            >
-
-              <Text
-                style={[
-                  styles.cardText,
-                  selected.includes(item) && styles.cardTextSelected
-                ]}
-              >
-                {item}
-              </Text>
-
-            </TouchableOpacity>
-
-          ))}
-
+        <View style={styles.cardFooter}>
+          <Text style={[styles.cardLabel, isSelected && styles.cardLabelSelected]}>{category.label}</Text>
+          {isSelected ? <Feather name="check-circle" size={16} color={Colors.primary} /> : null}
         </View>
-
-      </View>
-
+      </TouchableOpacity>
     );
-
   };
 
   return (
-
     <SafeAreaView style={styles.container} edges={["top"]}>
-
-      <ScrollView
-        contentContainerStyle={styles.scroll}
-        showsVerticalScrollIndicator={false}
-      >
-
-        <Text style={styles.title}>Select Design Specializations</Text>
-
+      <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
+        <Text style={styles.title}>Select Category Specializations</Text>
         <Text style={styles.subtitle}>
-          Choose the stitching styles you offer
+          These categories decide where customers can discover your profile.
         </Text>
 
-        <Text style={styles.genderTitle}>Women</Text>
+        <Text style={styles.sectionTitle}>Women</Text>
+        <View style={styles.categoryGrid}>{womenCategories.map(renderCategoryCard)}</View>
 
-        {Object.entries(designCatalog.women).map(([key, designs]) =>
-          renderCategory(key.toUpperCase(), designs)
-        )}
-
-        <Text style={styles.genderTitle}>Men</Text>
-
-        {Object.entries(designCatalog.men).map(([key, designs]) =>
-          renderCategory(key.toUpperCase(), designs)
-        )}
+        <Text style={styles.sectionTitle}>Men</Text>
+        <View style={styles.categoryGrid}>{menCategories.map(renderCategoryCard)}</View>
 
         <TouchableOpacity
-          style={styles.saveButton}
+          style={[styles.saveButton, saving && styles.saveButtonDisabled]}
           onPress={handleSave}
+          disabled={saving}
         >
-          <Text style={styles.saveText}>Save Specializations</Text>
+          {saving ? <ActivityIndicator color="#fff" size="small" style={styles.saveLoader} /> : null}
+          <Text style={styles.saveText}>{saving ? "Saving..." : "Save Specializations"}</Text>
         </TouchableOpacity>
-
       </ScrollView>
-
     </SafeAreaView>
-
   );
-
 }
 
 const styles = StyleSheet.create({
-
   container: {
     flex: 1,
-    backgroundColor: Colors.background
+    backgroundColor: Colors.background,
   },
 
   scroll: {
     paddingHorizontal: Spacing.containerPadding,
     paddingTop: 16,
-    paddingBottom: 40
+    paddingBottom: 40,
   },
 
   title: {
     fontFamily: Fonts.heading,
     fontSize: 24,
     color: Colors.text,
-    marginBottom: 6
+    marginBottom: 6,
   },
 
   subtitle: {
     fontFamily: Fonts.ui,
     fontSize: 14,
     color: Colors.textMuted,
-    marginBottom: 20
+    marginBottom: 18,
   },
 
-  genderTitle: {
+  sectionTitle: {
     fontFamily: Fonts.bodyBold,
-    fontSize: 20,
+    fontSize: 18,
     color: Colors.text,
-    marginTop: 16
+    marginTop: 12,
+    marginBottom: 10,
   },
 
-  categorySection: {
-    marginTop: 10
-  },
-
-  categoryTitle: {
-    fontFamily: Fonts.bodyBold,
-    fontSize: 16,
-    color: Colors.textMuted,
-    marginBottom: 8
-  },
-
-  cardContainer: {
+  categoryGrid: {
     flexDirection: "row",
-    flexWrap: "wrap"
+    flexWrap: "wrap",
+    justifyContent: "space-between",
+    gap: 10,
   },
 
-  card: {
+  categoryCard: {
+    width: "48%",
+    borderRadius: Radius.lg,
     borderWidth: 1,
     borderColor: Colors.border,
+    backgroundColor: Colors.surface,
+    padding: 10,
+  },
+
+  categoryCardSelected: {
+    borderColor: Colors.primary,
+    backgroundColor: Colors.primary + "10",
+  },
+
+  categoryImage: {
+    width: "100%",
+    height: 88,
     borderRadius: Radius.md,
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    marginRight: 8,
-    marginBottom: 8,
-    backgroundColor: Colors.surface
+    backgroundColor: Colors.surface,
   },
 
-  cardSelected: {
-    backgroundColor: "#6C4CF1",
-    borderColor: "#6C4CF1"
+  imageFallback: {
+    width: "100%",
+    height: 88,
+    borderRadius: Radius.md,
+    backgroundColor: Colors.surface,
+    alignItems: "center",
+    justifyContent: "center",
   },
 
-  cardText: {
+  cardFooter: {
+    marginTop: 8,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 8,
+  },
+
+  cardLabel: {
+    flex: 1,
     fontFamily: Fonts.body,
-    fontSize: 14,
-    color: Colors.text
+    fontSize: 13,
+    color: Colors.text,
   },
 
-  cardTextSelected: {
-    color: "white"
+  cardLabelSelected: {
+    fontFamily: Fonts.bodyBold,
+    color: Colors.primary,
   },
 
   saveButton: {
-    marginTop: 30,
-    backgroundColor: "#6C4CF1",
+    marginTop: 24,
+    backgroundColor: Colors.primary,
     paddingVertical: 14,
     borderRadius: Radius.md,
-    alignItems: "center"
+    alignItems: "center",
+    justifyContent: "center",
+    flexDirection: "row",
+  },
+
+  saveButtonDisabled: {
+    opacity: 0.75,
+  },
+
+  saveLoader: {
+    marginRight: 8,
   },
 
   saveText: {
     fontFamily: Fonts.bodyBold,
     color: "white",
-    fontSize: 16
-  }
-
+    fontSize: 16,
+  },
 });

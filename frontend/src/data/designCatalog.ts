@@ -32,6 +32,18 @@ export const designCatalog = {
       "Half Sleeve Shirt"
     ],
 
+    pants: [
+      "Formal Pants",
+      "Chino Pants",
+      "Pleated Trousers"
+    ],
+
+    kurta: [
+      "Straight Kurta",
+      "Pathani Kurta",
+      "Short Kurta"
+    ],
+
     blazers: [
       "Single Breasted Blazer",
       "Double Breasted Blazer"

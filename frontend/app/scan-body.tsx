@@ -13,6 +13,7 @@ import {
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Camera, useCameraDevice } from "react-native-vision-camera";
+import { DeviceMotion } from "expo-sensors";
 import { useRouter } from "expo-router";
 import Svg, { Circle, Line, Path as SvgPath } from "react-native-svg";
 
@@ -21,6 +22,7 @@ import { Colors, Fonts, Radius, Spacing } from "../src/utils/theme";
 const BACKEND =
   process.env.EXPO_PUBLIC_BACKEND_URL || "http://10.136.221.15:8000";
 const SCAN_RESULT_STORAGE_KEY = "stitchly_latest_scan_measurements";
+const LEVEL_BAR_TRAVEL = 80;
 
 const { width: screenWidth, height: screenHeight } = Dimensions.get("window");
 
@@ -125,12 +127,20 @@ export default function ScanBody() {
   const router = useRouter();
   const cameraRef = useRef<Camera>(null);
   const checkingRef = useRef(false);
+  const isDeviceLevelRef = useRef(false);
+  const gravityXRef = useRef(0);
+  const gravityYRef = useRef(0);
+  const gravityZRef = useRef(0);
+  const autoCaptureTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const device = useCameraDevice("back");
 
   const [hasPermission, setHasPermission] = useState(false);
   const [heightCm, setHeightCm] = useState("");
   const [phase, setPhase] = useState<"height" | "capture" | "processing" | "done">("height");
+  const [isDeviceLevel, setIsDeviceLevel] = useState(false);
+  const [indicatorX, setIndicatorX] = useState(0);
+  const [captureTriggered, setCaptureTriggered] = useState(false);
   const [stepIndex, setStepIndex] = useState(0);
   const [stabilityFrames, setStabilityFrames] = useState(0);
   const [countdown, setCountdown] = useState<number | null>(null);
@@ -149,6 +159,7 @@ export default function ScanBody() {
 
   const progressAnim = useRef(new Animated.Value(0)).current;
   const pulseAnim = useRef(new Animated.Value(0)).current;
+  const levelIndicatorAnim = useRef(new Animated.Value(0)).current;
 
   const currentStep = CAPTURE_STEPS[stepIndex];
 
@@ -165,6 +176,48 @@ export default function ScanBody() {
 
     requestPermission();
   }, []);
+
+  useEffect(() => {
+    DeviceMotion.setUpdateInterval(150);
+    const subscription = DeviceMotion.addListener((data: any) => {
+      const gravity = (data.accelerationIncludingGravity ?? {}) as Record<string, number | undefined>;
+      const gx = Number(gravity.x ?? 0);
+      const gy = Number(gravity.y ?? 0);
+      const gz = Number(gravity.z ?? 0);
+
+      gravityXRef.current = Number.isFinite(gx) ? gx : 0;
+      gravityYRef.current = Number.isFinite(gy) ? gy : 0;
+      gravityZRef.current = Number.isFinite(gz) ? gz : 0;
+
+      const tolerance = 0.35;
+      const isVertical = Math.abs(gravityZRef.current) < tolerance;
+      const isStraight = Math.abs(gravityYRef.current) < tolerance;
+      const level = isVertical && isStraight;
+
+      const normalized = Math.max(-1, Math.min(1, gravityXRef.current));
+      setIndicatorX(normalized * LEVEL_BAR_TRAVEL);
+
+      isDeviceLevelRef.current = level;
+      setIsDeviceLevel(level);
+
+      if (!level) {
+        setCaptureTriggered(false);
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    Animated.timing(levelIndicatorAnim, {
+      toValue: indicatorX,
+      duration: 120,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: true,
+    }).start();
+  }, [indicatorX, levelIndicatorAnim]);
 
   useEffect(() => {
     Animated.timing(progressAnim, {
@@ -208,7 +261,50 @@ export default function ScanBody() {
     }, 1600);
 
     return () => clearInterval(interval);
-  }, [phase, countdown, stepIndex, heightCm, stabilityFrames]);
+  }, [phase, countdown, stepIndex, heightCm, stabilityFrames, isDeviceLevel]);
+
+  useEffect(() => {
+    const canAutoCapture =
+      phase === "capture" &&
+      countdown === null &&
+      isDeviceLevel &&
+      overlay.readyToCapture &&
+      overlay.qualityScore >= 0.8 &&
+      stabilityFrames >= 2;
+
+    if (canAutoCapture && !captureTriggered) {
+      setCaptureTriggered(true);
+
+      if (autoCaptureTimeoutRef.current) {
+        clearTimeout(autoCaptureTimeoutRef.current);
+      }
+
+      autoCaptureTimeoutRef.current = setTimeout(() => {
+        autoCaptureTimeoutRef.current = null;
+        void captureCurrentStep();
+      }, 800);
+      return;
+    }
+
+    if (!canAutoCapture) {
+      if (autoCaptureTimeoutRef.current) {
+        clearTimeout(autoCaptureTimeoutRef.current);
+        autoCaptureTimeoutRef.current = null;
+      }
+      if (!isDeviceLevel || !overlay.readyToCapture) {
+        setCaptureTriggered(false);
+      }
+    }
+  }, [phase, countdown, isDeviceLevel, overlay.readyToCapture, overlay.qualityScore, stabilityFrames, captureTriggered]);
+
+  useEffect(() => {
+    return () => {
+      if (autoCaptureTimeoutRef.current) {
+        clearTimeout(autoCaptureTimeoutRef.current);
+        autoCaptureTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   const silhouettePath = useMemo(() => {
     if (!overlay.silhouette || overlay.silhouette.length < 3) return "";
@@ -226,6 +322,19 @@ export default function ScanBody() {
     if (!cameraRef.current) return;
     if (checkingRef.current) return;
     if (!currentStep) return;
+    if (!isDeviceLevelRef.current) {
+      const upDownTilted = Math.abs(gravityZRef.current) > 0.7;
+      setOverlay((current) => ({
+        ...current,
+        instruction: upDownTilted ? "Do not point camera up/down" : "Tilt phone to align",
+        readyToCapture: false,
+        qualityScore: Math.min(Number(current.qualityScore || 0), 0.25),
+      }));
+      setErrorMessage(null);
+      setStabilityFrames(0);
+      setCaptureTriggered(false);
+      return;
+    }
 
     checkingRef.current = true;
 
@@ -255,54 +364,52 @@ export default function ScanBody() {
       if (!response.ok || data?.error) {
         setErrorMessage(data?.error || "Unable to detect body");
         setStabilityFrames(0);
+        setCaptureTriggered(false);
         return;
       }
+
+      const readyToCapture = Boolean(data.ready_to_capture) && isDeviceLevelRef.current;
 
       setErrorMessage(null);
       setOverlay({
         landmarks: data.landmarks || [],
         silhouette: data.silhouette || [],
-        instruction: data.instruction || "Adjust position",
-        readyToCapture: Boolean(data.ready_to_capture),
-        qualityScore: Number(data.quality_score || 0),
+        instruction: readyToCapture ? data.instruction || "Adjust position" : data.instruction || "Adjust position",
+        readyToCapture,
+        qualityScore: readyToCapture
+          ? Number(data.quality_score || 0)
+          : Math.min(Number(data.quality_score || 0), 0.25),
       });
 
-      if (data.ready_to_capture) {
+      if (readyToCapture) {
         const nextStable = stabilityFrames + 1;
         setStabilityFrames(nextStable);
-        if (nextStable >= 2) {
-          startCountdown();
-        }
       } else {
         setStabilityFrames(0);
+        setCaptureTriggered(false);
       }
     } catch (error) {
       setErrorMessage("Camera check failed. Try again.");
       setStabilityFrames(0);
+      setCaptureTriggered(false);
     } finally {
       checkingRef.current = false;
     }
   };
 
-  const startCountdown = () => {
-    if (countdown !== null) return;
-
-    setCountdown(3);
-    const timer = setInterval(() => {
-      setCountdown((previous) => {
-        if (previous === null) return null;
-        if (previous <= 1) {
-          clearInterval(timer);
-          void captureCurrentStep();
-          return null;
-        }
-        return previous - 1;
-      });
-    }, 1000);
-  };
-
   const captureCurrentStep = async () => {
     if (!cameraRef.current || !currentStep) return;
+    if (!isDeviceLevelRef.current) {
+      setErrorMessage(null);
+      setStabilityFrames(0);
+      setCaptureTriggered(false);
+      return;
+    }
+
+    if (autoCaptureTimeoutRef.current) {
+      clearTimeout(autoCaptureTimeoutRef.current);
+      autoCaptureTimeoutRef.current = null;
+    }
 
     try {
       const burstUris: string[] = [];
@@ -317,6 +424,8 @@ export default function ScanBody() {
       };
       setCaptures(nextCaptures);
       setStabilityFrames(0);
+      setCaptureTriggered(false);
+      setCountdown(null);
 
       if (currentStep.key !== "back") {
         setStepIndex((prev) => prev + 1);
@@ -334,6 +443,7 @@ export default function ScanBody() {
       await sendForMeasurement(nextCaptures);
     } catch (error) {
       setErrorMessage("Unable to capture image. Try again.");
+      setCaptureTriggered(false);
     }
   };
 
@@ -341,6 +451,7 @@ export default function ScanBody() {
     if (!captured.front?.length || !captured.side?.length || !captured.back?.length) {
       setErrorMessage("Missing one or more captures. Please rescan.");
       setPhase("capture");
+      setCaptureTriggered(false);
       return;
     }
 
@@ -400,6 +511,7 @@ export default function ScanBody() {
         setErrorMessage(message);
         Alert.alert("Scan Failed", message);
         setPhase("capture");
+        setCaptureTriggered(false);
         return;
       }
 
@@ -407,6 +519,7 @@ export default function ScanBody() {
         setErrorMessage("Scan completed but measurements were missing in response.");
         Alert.alert("Scan Failed", "Measurements were missing in response.");
         setPhase("capture");
+        setCaptureTriggered(false);
         return;
       }
 
@@ -472,12 +585,18 @@ export default function ScanBody() {
         Alert.alert("Scan Failed", "Network error while measuring. Please try again.");
       }
       setPhase("capture");
+      setCaptureTriggered(false);
     } finally {
       clearTimeout(timeoutId);
     }
   };
 
   const resetScan = () => {
+    if (autoCaptureTimeoutRef.current) {
+      clearTimeout(autoCaptureTimeoutRef.current);
+      autoCaptureTimeoutRef.current = null;
+    }
+
     setPhase("capture");
     setStepIndex(0);
     setCaptures({});
@@ -486,6 +605,8 @@ export default function ScanBody() {
     setErrorMessage(null);
     setCountdown(null);
     setStabilityFrames(0);
+    setCaptureTriggered(false);
+    setIndicatorX(0);
     setOverlay({
       landmarks: [],
       silhouette: [],
@@ -541,6 +662,21 @@ export default function ScanBody() {
 
     router.back();
   };
+
+  const upDownTilted = Math.abs(gravityZRef.current) > 0.7;
+  const levelStatusText = upDownTilted
+    ? "Do not point camera up/down"
+    : isDeviceLevel
+      ? "Perfect! Hold still..."
+      : "Tilt phone to align";
+  const captureGuidanceText =
+    upDownTilted
+      ? "Do not point camera up/down"
+      : !isDeviceLevel
+        ? "Tilt phone to align"
+      : overlay.readyToCapture && overlay.qualityScore >= 0.8
+        ? "Perfect! Hold still..."
+        : overlay.instruction;
 
   if (!hasPermission) {
     return (
@@ -663,6 +799,35 @@ export default function ScanBody() {
         </View>
       </View>
 
+      {phase === "capture" ? (
+        <View pointerEvents="none" style={styles.levelOverlay}>
+          <View style={[styles.levelBar, isDeviceLevel ? styles.levelBarAligned : styles.levelBarTilted]}>
+            <Animated.View
+              style={[
+                styles.levelDot,
+                isDeviceLevel ? styles.levelDotAligned : styles.levelDotTilted,
+                {
+                  transform: [
+                    { translateX: levelIndicatorAnim },
+                    {
+                      scale: isDeviceLevel
+                        ? pulseAnim.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: [1, 1.14],
+                          })
+                        : 1,
+                    },
+                  ],
+                },
+              ]}
+            />
+          </View>
+          <Text style={[styles.levelText, isDeviceLevel ? styles.levelTextAligned : styles.levelTextTilted]}>
+            {levelStatusText}
+          </Text>
+        </View>
+      ) : null}
+
       <View style={styles.bottomHUD}>
         {phase === "processing" ? (
           <View style={styles.statusCard}>
@@ -687,7 +852,18 @@ export default function ScanBody() {
               },
             ]}
           >
-            <Text style={styles.statusText}>{overlay.instruction}</Text>
+            <Text
+              style={[
+                styles.statusText,
+                !isDeviceLevel
+                  ? styles.statusTextTilted
+                  : overlay.readyToCapture && overlay.qualityScore >= 0.8
+                    ? styles.statusTextAligned
+                    : null,
+              ]}
+            >
+              {captureGuidanceText}
+            </Text>
             <Text style={styles.qualityText}>Quality {(overlay.qualityScore * 100).toFixed(0)}%</Text>
             {countdown !== null ? <Text style={styles.countdownText}>{countdown}</Text> : null}
           </Animated.View>
@@ -853,6 +1029,53 @@ const styles = StyleSheet.create({
     borderRadius: Radius.full,
     backgroundColor: Colors.primaryLight,
   },
+  levelOverlay: {
+    position: "absolute",
+    top: 126,
+    left: 0,
+    right: 0,
+    alignItems: "center",
+  },
+  levelBar: {
+    width: 200,
+    height: 20,
+    borderRadius: 10,
+    overflow: "hidden",
+    borderWidth: 1,
+  },
+  levelBarTilted: {
+    backgroundColor: "rgba(31, 41, 55, 0.9)",
+    borderColor: "rgba(248, 113, 113, 0.55)",
+  },
+  levelBarAligned: {
+    backgroundColor: "rgba(20, 83, 45, 0.9)",
+    borderColor: "rgba(74, 222, 128, 0.7)",
+  },
+  levelDot: {
+    position: "absolute",
+    top: 1,
+    left: 90,
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+  },
+  levelDotTilted: {
+    backgroundColor: "#EF4444",
+  },
+  levelDotAligned: {
+    backgroundColor: "#22C55E",
+  },
+  levelText: {
+    marginTop: 6,
+    fontFamily: Fonts.bodyBold,
+    fontSize: 12,
+  },
+  levelTextTilted: {
+    color: "#FCA5A5",
+  },
+  levelTextAligned: {
+    color: "#86EFAC",
+  },
   bottomHUD: {
     position: "absolute",
     left: 0,
@@ -876,6 +1099,12 @@ const styles = StyleSheet.create({
     color: Colors.textInverted,
     fontSize: 16,
     textAlign: "center",
+  },
+  statusTextTilted: {
+    color: "#FCA5A5",
+  },
+  statusTextAligned: {
+    color: "#86EFAC",
   },
   qualityText: {
     marginTop: 4,

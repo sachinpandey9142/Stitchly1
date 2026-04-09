@@ -172,7 +172,7 @@ export default function TailorProfile() {
               onPress={() => router.push("/(tailor)/select-specializations")}
             >
               <Text style={styles.specializationText}>
-                Select Stitching Designs
+                Select Specializations
               </Text>
             </TouchableOpacity>
 
@@ -400,14 +400,16 @@ const styles = StyleSheet.create({
   },
 
   specializationBtn: {
-    backgroundColor: "#6C4CF1",
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.primary,
     paddingHorizontal: 10,
     paddingVertical: 6,
-    borderRadius: 6,
+    borderRadius: Radius.md,
   },
 
   specializationText: {
-    color: "white",
+    color: Colors.primary,
     fontWeight: "600",
     fontSize: 12,
   },
