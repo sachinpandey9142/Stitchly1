@@ -12,7 +12,7 @@ MIN_METRIC_CONFIDENCE = 0.42
 LOW_QUALITY_WARNING_THRESHOLD = 0.60
 EXTREME_LOW_QUALITY_THRESHOLD = 0.30
 MAX_TILT_DELTA = 0.06
-SEGMENTATION_THRESHOLD = 0.35
+SEGMENTATION_THRESHOLD = 0.42
 CONTOUR_TARGET_POINTS = 150
 CONTOUR_MIN_POINTS = 100
 PROFILE_LEVEL_COUNT = 20
@@ -359,6 +359,50 @@ def _fallback_measurements_from_height(height_cm: float) -> Dict[str, float]:
         "neck_cm": neck_cm,
         "torso_depth_cm": torso_depth_cm,
     }
+
+
+def _height_based_measurement_ranges(height_cm: float) -> Dict[str, Tuple[float, float]]:
+    h = max(float(height_cm), 120.0)
+    return {
+        "shoulder_width_cm": (h * 0.17, h * 0.30),
+        "chest_cm": (h * 0.40, h * 0.68),
+        "waist_cm": (h * 0.34, h * 0.63),
+        "hip_width_cm": (h * 0.16, h * 0.33),
+        "hip_circumference_cm": (h * 0.43, h * 0.73),
+        "arm_length_cm": (h * 0.22, h * 0.43),
+        "leg_length_cm": (h * 0.40, h * 0.60),
+        "neck_cm": (h * 0.16, h * 0.28),
+        "torso_depth_cm": (h * 0.08, h * 0.20),
+    }
+
+
+def _stabilize_measurements_with_priors(
+    measurements: Dict[str, float],
+    height_cm: float,
+    quality_score: float,
+    warnings: List[str],
+) -> None:
+    if quality_score >= 0.82:
+        return
+
+    fallback = _fallback_measurements_from_height(height_cm)
+    ranges = _height_based_measurement_ranges(height_cm)
+    blend = _clamp((0.82 - quality_score) / 0.52, 0.0, 0.55)
+
+    for key in RAW_METRIC_KEYS:
+        current = float(measurements.get(key, fallback[key]) or fallback[key])
+        target = float(fallback[key])
+        blended = (current * (1.0 - blend)) + (target * blend)
+        minimum, maximum = ranges[key]
+        measurements[key] = _clamp(blended, minimum, maximum)
+
+    # Keep torso relationships physically plausible.
+    measurements["waist_cm"] = min(measurements["waist_cm"], measurements["chest_cm"] * 0.98)
+    measurements["hip_circumference_cm"] = max(measurements["hip_circumference_cm"], measurements["waist_cm"] * 1.02)
+    measurements["neck_cm"] = _clamp(measurements["neck_cm"], measurements["chest_cm"] * 0.27, measurements["chest_cm"] * 0.45)
+
+    if blend > 0.01:
+        warnings.append("Low-confidence geometry was stabilized with body-proportion priors.")
 
 
 def _fill_missing_measurements(measurements: Dict[str, float], height_cm: float, warnings: List[str]) -> None:
@@ -1100,6 +1144,13 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         waist_depth_px = side_waist_depth_px if side_waist_depth_px > 0.0 else max(side_torso_depth_px * 0.92, waist_width_px * 0.55)
         hip_depth_px = side_hip_depth_px if side_hip_depth_px > 0.0 else max(side_torso_depth_px * 1.06, hip_width_px * 0.58)
 
+        if chest_width_px > 0.0:
+            chest_depth_px = _clamp(chest_depth_px, chest_width_px * 0.45, chest_width_px * 0.85)
+        if waist_width_px > 0.0:
+            waist_depth_px = _clamp(waist_depth_px, waist_width_px * 0.45, waist_width_px * 0.82)
+        if hip_width_px > 0.0:
+            hip_depth_px = _clamp(hip_depth_px, hip_width_px * 0.50, hip_width_px * 0.90)
+
         front_neck_width_px, front_neck_conf, front_neck_sil = _view_width_estimate(front, neck_y, (7, 8))
         back_neck_width_px, back_neck_conf, back_neck_sil = _view_width_estimate(back, neck_y, (7, 8))
         neck_width_px, _ = _weighted_fusion(
@@ -1211,6 +1262,8 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         }
         quality_score = _clamp(_average(confidences.values()), 0.0, 1.0)
         confidences["overall"] = quality_score
+
+        _stabilize_measurements_with_priors(measurements, height_cm, quality_score, warnings)
 
         min_metric_conf = min(value for key, value in confidences.items() if key != "overall")
         if quality_score < LOW_QUALITY_WARNING_THRESHOLD or min_metric_conf < MIN_METRIC_CONFIDENCE:

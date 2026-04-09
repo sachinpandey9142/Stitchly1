@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -6,6 +6,7 @@ import {
   TextInput,
   StyleSheet,
   FlatList,
+  ScrollView,
   ActivityIndicator,
   Alert,
   RefreshControl,
@@ -35,6 +36,7 @@ type DeliveryOrder = {
   delivery_address: string;
   customer_address?: string;
   tailor_address?: string;
+  pickup_geo_location?: GeoPoint | null;
   customer_geo_location?: GeoPoint | null;
   tailor_geo_location?: GeoPoint | null;
   delivery_partner_geo_location?: GeoPoint | null;
@@ -54,9 +56,22 @@ type RouteSummary = {
   durationMinutes: number;
 };
 
+type DeliveryAction =
+  | { label: string; type: 'review' }
+  | { label: string; type: 'navigate' }
+  | { label: string; type: 'advance'; nextStatus: string };
+
+type NavigationTarget = {
+  point: RoutePoint | null;
+  label: string;
+  nextStatus: string;
+  buttonLabel: string;
+  nearThresholdMeters: number;
+};
+
 const REFRESH_INTERVAL_MS = 15000;
 const LOCATION_UPDATE_INTERVAL_MS = 30000;
-const EXPERT_MEASUREMENT_FIELDS: Array<{ key: string; label: string; placeholder: string }> = [
+const EXPERT_MEASUREMENT_FIELDS: { key: string; label: string; placeholder: string }[] = [
   { key: 'shoulder_cm', label: 'Shoulder', placeholder: 'Shoulder in cm' },
   { key: 'chest_cm', label: 'Chest/Bust', placeholder: 'Chest in cm' },
   { key: 'waist_cm', label: 'Waist', placeholder: 'Waist in cm' },
@@ -76,24 +91,146 @@ function getPoint(geoLocation?: GeoPoint | null): RoutePoint | null {
   };
 }
 
-function getNextAction(order: DeliveryOrder) {
+function getPickupPoint(order: DeliveryOrder): RoutePoint | null {
+  return getPoint(order.pickup_geo_location) || getPoint(order.customer_geo_location);
+}
+
+function getNextAction(order: DeliveryOrder): DeliveryAction | null {
   if (order.status === 'pickup_assigned' || order.status === 'delivery_assigned') {
-    return { label: 'Review Assignment', type: 'review' as const };
+    return { label: 'Review Assignment', type: 'review' };
   }
   if (order.status === 'delivery_accepted') {
-    return {
-      label: order.delivery_phase === 'return' ? 'Out for Delivery' : 'Mark Picked Up',
-      type: 'advance' as const,
-      nextStatus: order.delivery_phase === 'return' ? 'out_for_delivery' : 'picked_up',
-    };
+    return { label: 'Open Navigation', type: 'navigate' };
   }
   if (order.status === 'picked_up') {
-    return { label: 'Delivered to Tailor', type: 'advance' as const, nextStatus: 'delivered_to_tailor' };
+    return { label: 'Navigate to Tailor', type: 'navigate' };
   }
   if (order.status === 'out_for_delivery') {
-    return { label: 'Mark Delivered', type: 'advance' as const, nextStatus: 'delivered' };
+    return { label: 'Navigate to Customer', type: 'navigate' };
   }
   return null;
+}
+
+function getNavigationTarget(order: DeliveryOrder): NavigationTarget | null {
+  const pickupPoint = getPickupPoint(order);
+  const customerPoint = getPoint(order.customer_geo_location);
+  const tailorPoint = getPoint(order.tailor_geo_location);
+
+  if (order.status === 'delivery_accepted' && order.delivery_phase === 'pickup') {
+    return {
+      point: pickupPoint,
+      label: 'Customer Pickup Point',
+      nextStatus: 'picked_up',
+      buttonLabel: 'Mark as Received',
+      nearThresholdMeters: 120,
+    };
+  }
+
+  if (order.status === 'delivery_accepted' && order.delivery_phase === 'return') {
+    return {
+      point: tailorPoint,
+      label: 'Tailor Pickup Point',
+      nextStatus: 'out_for_delivery',
+      buttonLabel: 'Mark Picked from Tailor',
+      nearThresholdMeters: 120,
+    };
+  }
+
+  if (order.status === 'out_for_delivery') {
+    return {
+      point: customerPoint,
+      label: 'Customer Drop Point',
+      nextStatus: 'delivered',
+      buttonLabel: 'Mark Delivered',
+      nearThresholdMeters: 120,
+    };
+  }
+
+  if (order.status === 'picked_up') {
+    return {
+      point: tailorPoint,
+      label: 'Tailor Drop Point',
+      nextStatus: 'delivered_to_tailor',
+      buttonLabel: 'Mark Received at Tailor',
+      nearThresholdMeters: 120,
+    };
+  }
+
+  return null;
+}
+
+function haversineDistanceMeters(first: RoutePoint, second: RoutePoint): number {
+  const toRadians = (degrees: number) => degrees * (Math.PI / 180);
+  const earthRadius = 6371000;
+  const latitudeDelta = toRadians(second.latitude - first.latitude);
+  const longitudeDelta = toRadians(second.longitude - first.longitude);
+  const latitudeFirst = toRadians(first.latitude);
+  const latitudeSecond = toRadians(second.latitude);
+
+  const a =
+    Math.sin(latitudeDelta / 2) * Math.sin(latitudeDelta / 2) +
+    Math.cos(latitudeFirst) * Math.cos(latitudeSecond) * Math.sin(longitudeDelta / 2) * Math.sin(longitudeDelta / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadius * c;
+}
+
+async function fetchRouteSummary(waypoints: RoutePoint[]): Promise<RouteSummary | null> {
+  if (waypoints.length < 2) {
+    return null;
+  }
+
+  const coordinatesParam = waypoints
+    .map((point) => `${point.longitude},${point.latitude}`)
+    .join(';');
+
+  const response = await fetch(
+    `https://router.project-osrm.org/route/v1/driving/${coordinatesParam}?overview=full&geometries=geojson`
+  );
+  const data = await response.json();
+  const route = data?.routes?.[0];
+  if (!route) {
+    return null;
+  }
+
+  return {
+    coordinates: route.geometry.coordinates.map((coordinate: [number, number]) => ({
+      latitude: coordinate[1],
+      longitude: coordinate[0],
+    })),
+    distanceKm: route.distance / 1000,
+    durationMinutes: route.duration / 60,
+  };
+}
+
+async function fetchReviewRoute(order: DeliveryOrder, driverOverride?: RoutePoint | null): Promise<RouteSummary | null> {
+  const driverPoint = driverOverride || getPoint(order.delivery_partner_geo_location);
+  if (!driverPoint) {
+    return null;
+  }
+
+  if (order.delivery_phase === 'pickup') {
+    const pickupPoint = getPickupPoint(order);
+    if (!pickupPoint) {
+      return null;
+    }
+    return fetchRouteSummary([driverPoint, pickupPoint]);
+  }
+
+  const tailorPoint = getPoint(order.tailor_geo_location);
+  if (!tailorPoint) {
+    return null;
+  }
+
+  return fetchRouteSummary([driverPoint, tailorPoint]);
+}
+
+async function fetchNavigationRoute(order: DeliveryOrder, driverOverride?: RoutePoint | null): Promise<RouteSummary | null> {
+  const target = getNavigationTarget(order);
+  const driverPoint = driverOverride || getPoint(order.delivery_partner_geo_location);
+  if (!target?.point || !driverPoint) {
+    return null;
+  }
+  return fetchRouteSummary([driverPoint, target.point]);
 }
 
 function measurementTypeLabel(type?: string): string {
@@ -123,40 +260,6 @@ function buildExpertMeasurementPayload(values: Record<string, string>): Record<s
   return payload;
 }
 
-async function fetchRoute(order: DeliveryOrder): Promise<RouteSummary | null> {
-  const driverPoint = getPoint(order.delivery_partner_geo_location);
-  const customerPoint = getPoint(order.customer_geo_location);
-  const tailorPoint = getPoint(order.tailor_geo_location);
-  if (!driverPoint || !customerPoint || !tailorPoint) {
-    return null;
-  }
-
-  const waypoints = order.delivery_phase === 'return'
-    ? [driverPoint, tailorPoint, customerPoint]
-    : [driverPoint, customerPoint, tailorPoint];
-
-  const coordinatesParam = waypoints
-    .map((point) => `${point.longitude},${point.latitude}`)
-    .join(';');
-  const response = await fetch(
-    `https://router.project-osrm.org/route/v1/driving/${coordinatesParam}?overview=full&geometries=geojson`
-  );
-  const data = await response.json();
-  const route = data?.routes?.[0];
-  if (!route) {
-    return null;
-  }
-
-  return {
-    coordinates: route.geometry.coordinates.map((coordinate: [number, number]) => ({
-      latitude: coordinate[1],
-      longitude: coordinate[0],
-    })),
-    distanceKm: route.distance / 1000,
-    durationMinutes: route.duration / 60,
-  };
-}
-
 function buildRouteMapHtml(
   driverPoint: RoutePoint | null,
   customerPoint: RoutePoint | null,
@@ -167,7 +270,7 @@ function buildRouteMapHtml(
     driverPoint ? { label: 'Driver', color: '#0F766E', point: driverPoint } : null,
     customerPoint ? { label: 'Customer', color: '#D97706', point: customerPoint } : null,
     tailorPoint ? { label: 'Tailor', color: '#15803D', point: tailorPoint } : null,
-  ].filter(Boolean) as Array<{ label: string; color: string; point: RoutePoint }>;
+  ].filter(Boolean) as { label: string; color: string; point: RoutePoint }[];
 
   const routeLatLng = routeCoordinates.map((point) => [point.latitude, point.longitude]);
   const boundsLatLng = routeLatLng.length > 1
@@ -218,21 +321,27 @@ function buildRouteMapHtml(
 }
 
 export default function DeliveryDashboard() {
-  const { user, refreshUser } = useAuth();
+  const { user } = useAuth();
   const [orders, setOrders] = useState<DeliveryOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [driverLocation, setDriverLocation] = useState<RoutePoint | null>(null);
   const [selectedOrder, setSelectedOrder] = useState<DeliveryOrder | null>(null);
   const [routeSummary, setRouteSummary] = useState<RouteSummary | null>(null);
   const [routeLoading, setRouteLoading] = useState(false);
   const [reviewVisible, setReviewVisible] = useState(false);
+  const [navigationVisible, setNavigationVisible] = useState(false);
+  const [navigationOrder, setNavigationOrder] = useState<DeliveryOrder | null>(null);
+  const [navigationRouteSummary, setNavigationRouteSummary] = useState<RouteSummary | null>(null);
+  const [navigationRouteLoading, setNavigationRouteLoading] = useState(false);
   const [savingPickupDetails, setSavingPickupDetails] = useState(false);
   const [pickupMeasurementReceived, setPickupMeasurementReceived] = useState(false);
   const [pickupMeasurementNote, setPickupMeasurementNote] = useState('');
   const [pickupReferenceClothReceived, setPickupReferenceClothReceived] = useState(false);
   const [pickupReferenceClothNote, setPickupReferenceClothNote] = useState('');
   const [expertMeasurements, setExpertMeasurements] = useState<Record<string, string>>(() => getInitialExpertMeasurements());
-  const mapRef = useRef<MapView | null>(null);
+  const reviewMapRef = useRef<MapView | null>(null);
+  const navigationMapRef = useRef<MapView | null>(null);
 
   const fetchOrders = useCallback(async () => {
     try {
@@ -275,6 +384,11 @@ export default function DeliveryDashboard() {
       console.log("No location available yet");
       return;
     }
+
+    setDriverLocation({
+      latitude: location.coords.latitude,
+      longitude: location.coords.longitude,
+    });
 
     await api.put("/delivery/location", {
       latitude: location.coords.latitude,
@@ -333,16 +447,20 @@ export default function DeliveryDashboard() {
     setPickupReferenceClothNote(order.pickup_reference_cloth_note || '');
     setExpertMeasurements(getInitialExpertMeasurements(order.pickup_measurements));
     try {
-      const summary = await fetchRoute(order);
+      const summary = await fetchReviewRoute(order, driverLocation);
       setRouteSummary(summary);
+
+      const driverPoint = driverLocation || getPoint(order.delivery_partner_geo_location);
+      const destinationPoint = order.delivery_phase === 'pickup'
+        ? getPickupPoint(order)
+        : getPoint(order.tailor_geo_location);
       const points = [
-        getPoint(order.delivery_partner_geo_location),
-        getPoint(order.customer_geo_location),
-        getPoint(order.tailor_geo_location),
+        driverPoint,
+        destinationPoint,
       ].filter(Boolean) as RoutePoint[];
-      if (Platform.OS !== 'android' && points.length > 1 && mapRef.current) {
+      if (Platform.OS !== 'android' && points.length > 1 && reviewMapRef.current) {
         setTimeout(() => {
-          mapRef.current?.fitToCoordinates(points, {
+          reviewMapRef.current?.fitToCoordinates(points, {
             edgePadding: { top: 70, right: 50, bottom: 70, left: 50 },
             animated: true,
           });
@@ -354,7 +472,7 @@ export default function DeliveryDashboard() {
     } finally {
       setRouteLoading(false);
     }
-  }, []);
+  }, [driverLocation]);
 
   const closeReview = useCallback(() => {
     setReviewVisible(false);
@@ -366,6 +484,95 @@ export default function DeliveryDashboard() {
     setPickupReferenceClothNote('');
     setExpertMeasurements(getInitialExpertMeasurements());
   }, []);
+
+  const closeNavigation = useCallback(() => {
+    setNavigationVisible(false);
+    setNavigationOrder(null);
+    setNavigationRouteSummary(null);
+    setNavigationRouteLoading(false);
+  }, []);
+
+  const openNavigation = useCallback(async (order: DeliveryOrder) => {
+    const normalizedOrder: DeliveryOrder = driverLocation
+      ? {
+          ...order,
+          delivery_partner_geo_location: {
+            type: 'Point',
+            coordinates: [driverLocation.longitude, driverLocation.latitude],
+          },
+        }
+      : order;
+
+    const target = getNavigationTarget(normalizedOrder);
+    if (!target?.point) {
+      Alert.alert('Navigation unavailable', 'No destination is available for this delivery status.');
+      return;
+    }
+
+    setNavigationOrder(normalizedOrder);
+    setNavigationVisible(true);
+    setNavigationRouteLoading(true);
+    setNavigationRouteSummary(null);
+
+    try {
+      const summary = await fetchNavigationRoute(normalizedOrder, driverLocation);
+      setNavigationRouteSummary(summary);
+
+      const liveDriverPoint = driverLocation || getPoint(normalizedOrder.delivery_partner_geo_location);
+      if (
+        Platform.OS !== 'android' &&
+        navigationMapRef.current &&
+        liveDriverPoint &&
+        target.point
+      ) {
+        setTimeout(() => {
+          navigationMapRef.current?.fitToCoordinates([liveDriverPoint, target.point as RoutePoint], {
+            edgePadding: { top: 80, right: 60, bottom: 80, left: 60 },
+            animated: true,
+          });
+        }, 250);
+      }
+    } catch (err) {
+      console.error(err);
+      Alert.alert('Route Error', 'Unable to load live navigation right now.');
+    } finally {
+      setNavigationRouteLoading(false);
+    }
+  }, [driverLocation]);
+
+  useEffect(() => {
+    if (!navigationVisible || !navigationOrder) {
+      return;
+    }
+
+    let isCancelled = false;
+
+    const refreshNavigationRoute = async () => {
+      try {
+        setNavigationRouteLoading(true);
+        const summary = await fetchNavigationRoute(navigationOrder, driverLocation);
+        if (!isCancelled) {
+          setNavigationRouteSummary(summary);
+        }
+      } catch (err) {
+        if (!isCancelled) {
+          console.error(err);
+        }
+      } finally {
+        if (!isCancelled) {
+          setNavigationRouteLoading(false);
+        }
+      }
+    };
+
+    refreshNavigationRoute();
+    const timer = setInterval(refreshNavigationRoute, 12000);
+
+    return () => {
+      isCancelled = true;
+      clearInterval(timer);
+    };
+  }, [driverLocation, navigationOrder, navigationVisible]);
 
   const onExpertMeasurementChange = useCallback((key: string, value: string) => {
     const sanitizedValue = value.replace(/[^0-9.]/g, '');
@@ -424,13 +631,18 @@ export default function DeliveryDashboard() {
         return;
       }
       await api.put(`/delivery/${selectedOrder.id}/accept`, {});
+      const acceptedOrder: DeliveryOrder = {
+        ...selectedOrder,
+        status: 'delivery_accepted',
+      };
       closeReview();
       await fetchOrders();
-      Alert.alert('Success', 'Delivery assigned successfully');
+      openNavigation(acceptedOrder);
+      Alert.alert('Success', 'Delivery assigned. Live navigation is ready.');
     } catch (err: any) {
       Alert.alert('Error', err.message || 'Unable to accept this order');
     }
-  }, [closeReview, fetchOrders, savePickupDetails, selectedOrder]);
+  }, [closeReview, fetchOrders, openNavigation, savePickupDetails, selectedOrder]);
 
   const handleRejectOrder = useCallback(async () => {
     if (!selectedOrder) {
@@ -446,15 +658,55 @@ export default function DeliveryDashboard() {
     }
   }, [closeReview, fetchOrders, selectedOrder]);
 
-  const handleAdvance = useCallback(async (order: DeliveryOrder, nextStatus: string) => {
+  const handleAdvance = useCallback(async (
+    order: DeliveryOrder,
+    nextStatus: string,
+    options?: { suppressSuccessAlert?: boolean }
+  ) => {
     try {
       await api.put(`/delivery/${order.id}/update`, { status: nextStatus });
       await fetchOrders();
-      Alert.alert('Success', `Status updated to ${STATUS_LABELS[nextStatus] || nextStatus}`);
+      if (!options?.suppressSuccessAlert) {
+        Alert.alert('Success', `Status updated to ${STATUS_LABELS[nextStatus] || nextStatus}`);
+      }
+      return true;
     } catch (err: any) {
       Alert.alert('Error', err.message || 'Unable to update delivery status');
+      return false;
     }
   }, [fetchOrders]);
+
+  const handleNavigationStatusUpdate = useCallback(async () => {
+    if (!navigationOrder) {
+      return;
+    }
+
+    const target = getNavigationTarget(navigationOrder);
+    if (!target) {
+      Alert.alert('Navigation unavailable', 'No next delivery step is available.');
+      return;
+    }
+
+    const updated = await handleAdvance(navigationOrder, target.nextStatus, { suppressSuccessAlert: true });
+    if (!updated) {
+      return;
+    }
+
+    const progressedOrder: DeliveryOrder = {
+      ...navigationOrder,
+      status: target.nextStatus,
+    };
+    const nextTarget = getNavigationTarget(progressedOrder);
+
+    if (nextTarget) {
+      setNavigationOrder(progressedOrder);
+      Alert.alert('Status Updated', `Continue to ${nextTarget.label}.`);
+      return;
+    }
+
+    closeNavigation();
+    Alert.alert('Success', `Status updated to ${STATUS_LABELS[target.nextStatus] || target.nextStatus}`);
+  }, [closeNavigation, handleAdvance, navigationOrder]);
 
   const renderOrder = ({ item }: { item: DeliveryOrder }) => {
     const action = getNextAction(item);
@@ -499,10 +751,24 @@ export default function DeliveryDashboard() {
           <TouchableOpacity
             testID={`delivery-action-${item.id}`}
             style={styles.updateBtn}
-            onPress={() => action.type === 'review' ? openAssignmentReview(item) : handleAdvance(item, action.nextStatus)}
+            onPress={() => {
+              if (action.type === 'review') {
+                openAssignmentReview(item);
+                return;
+              }
+              if (action.type === 'navigate') {
+                openNavigation(item);
+                return;
+              }
+              handleAdvance(item, action.nextStatus);
+            }}
             activeOpacity={0.7}
           >
-            <Feather name={action.type === 'review' ? 'map' : 'arrow-right-circle'} size={18} color={Colors.textInverted} />
+            <Feather
+              name={action.type === 'review' ? 'map' : action.type === 'navigate' ? 'navigation' : 'arrow-right-circle'}
+              size={18}
+              color={Colors.textInverted}
+            />
             <Text style={styles.updateText}>{action.label}</Text>
           </TouchableOpacity>
         )}
@@ -510,12 +776,28 @@ export default function DeliveryDashboard() {
     );
   };
 
-  const driverPoint = getPoint(selectedOrder?.delivery_partner_geo_location);
-  const customerPoint = getPoint(selectedOrder?.customer_geo_location);
+  const driverPoint = driverLocation || getPoint(selectedOrder?.delivery_partner_geo_location);
+  const customerPoint = selectedOrder ? getPickupPoint(selectedOrder) : null;
   const tailorPoint = getPoint(selectedOrder?.tailor_geo_location);
   const shouldShowPickupChecklist = selectedOrder ? selectedOrder.delivery_phase !== 'return' : false;
   const selectedMeasurementLabel = measurementTypeLabel(selectedOrder?.measurement_type);
   const isExpertPickupMeasurement = selectedOrder?.measurement_type === 'expert';
+
+  const navigationTarget = navigationOrder ? getNavigationTarget(navigationOrder) : null;
+  const navigationTargetLabelLower = (navigationTarget?.label || '').toLowerCase();
+  const navigationDriverPoint = driverLocation || getPoint(navigationOrder?.delivery_partner_geo_location);
+  const navigationDestinationPoint = navigationTarget?.point || null;
+  const navigationFallbackDistanceMeters = navigationDriverPoint && navigationDestinationPoint
+    ? haversineDistanceMeters(navigationDriverPoint, navigationDestinationPoint)
+    : null;
+  const navigationDistanceMeters = navigationRouteSummary
+    ? navigationRouteSummary.distanceKm * 1000
+    : navigationFallbackDistanceMeters;
+  const canCompleteNavigation = Boolean(
+    navigationTarget &&
+    navigationDistanceMeters !== null &&
+    navigationDistanceMeters <= navigationTarget.nearThresholdMeters
+  );
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -565,7 +847,14 @@ export default function DeliveryDashboard() {
                 Platform.OS === 'android' ? (
                   <WebView
                     originWhitelist={['*']}
-                    source={{ html: buildRouteMapHtml(driverPoint, customerPoint, tailorPoint, routeSummary?.coordinates || []) }}
+                    source={{
+                      html: buildRouteMapHtml(
+                        driverPoint,
+                        selectedOrder.delivery_phase === 'pickup' ? customerPoint : null,
+                        selectedOrder.delivery_phase === 'return' ? tailorPoint : null,
+                        routeSummary?.coordinates || []
+                      ),
+                    }}
                     javaScriptEnabled
                     domStorageEnabled
                     mixedContentMode="always"
@@ -573,7 +862,7 @@ export default function DeliveryDashboard() {
                   />
                 ) : (
                   <MapView
-                    ref={mapRef}
+                    ref={reviewMapRef}
                     provider={PROVIDER_DEFAULT}
                     mapType="none"
                     style={styles.map}
@@ -581,8 +870,12 @@ export default function DeliveryDashboard() {
                   >
                     <UrlTile urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png" maximumZ={19} />
                     {driverPoint ? <Marker coordinate={driverPoint} title="Driver" pinColor={Colors.primary} /> : null}
-                    {customerPoint ? <Marker coordinate={customerPoint} title="Customer" pinColor={Colors.secondary} /> : null}
-                    {tailorPoint ? <Marker coordinate={tailorPoint} title="Tailor" pinColor={Colors.success} /> : null}
+                    {selectedOrder.delivery_phase === 'pickup' && customerPoint ? (
+                      <Marker coordinate={customerPoint} title="Pickup Point" pinColor={Colors.secondary} />
+                    ) : null}
+                    {selectedOrder.delivery_phase === 'return' && tailorPoint ? (
+                      <Marker coordinate={tailorPoint} title="Tailor Pickup" pinColor={Colors.success} />
+                    ) : null}
                     {routeSummary?.coordinates?.length ? (
                       <Polyline coordinates={routeSummary.coordinates} strokeColor={Colors.primary} strokeWidth={4} />
                     ) : null}
@@ -596,107 +889,206 @@ export default function DeliveryDashboard() {
                 </View>
               ) : null}
             </View>
-            <View style={styles.routeSummaryRow}>
-              <View style={styles.routeMetric}>
-                <Text style={styles.routeMetricLabel}>Distance</Text>
-                <Text style={styles.routeMetricValue}>{routeSummary ? `${routeSummary.distanceKm.toFixed(1)} km` : 'Unavailable'}</Text>
+            <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalScrollContent} showsVerticalScrollIndicator={false}>
+              <View style={styles.routeSummaryRow}>
+                <View style={styles.routeMetric}>
+                  <Text style={styles.routeMetricLabel}>Distance</Text>
+                  <Text style={styles.routeMetricValue}>{routeSummary ? `${routeSummary.distanceKm.toFixed(1)} km` : 'Unavailable'}</Text>
+                </View>
+                <View style={styles.routeMetric}>
+                  <Text style={styles.routeMetricLabel}>ETA</Text>
+                  <Text style={styles.routeMetricValue}>{routeSummary ? `${Math.ceil(routeSummary.durationMinutes)} min` : 'Unavailable'}</Text>
+                </View>
               </View>
-              <View style={styles.routeMetric}>
-                <Text style={styles.routeMetricLabel}>ETA</Text>
-                <Text style={styles.routeMetricValue}>{routeSummary ? `${Math.ceil(routeSummary.durationMinutes)} min` : 'Unavailable'}</Text>
-              </View>
-            </View>
-            {selectedOrder && shouldShowPickupChecklist ? (
-              <View style={styles.pickupDetailsSection}>
-                <Text style={styles.pickupSectionTitle}>Pickup Details</Text>
-                <Text style={styles.pickupSectionHint}>Measurement Type: {selectedMeasurementLabel}</Text>
+              {selectedOrder && shouldShowPickupChecklist ? (
+                <View style={styles.pickupDetailsSection}>
+                  <Text style={styles.pickupSectionTitle}>Pickup Details</Text>
+                  <Text style={styles.pickupSectionHint}>Measurement Type: {selectedMeasurementLabel}</Text>
 
-                {isExpertPickupMeasurement ? (
-                  <View style={styles.expertMeasurementGrid}>
-                    {EXPERT_MEASUREMENT_FIELDS.map((field) => (
-                      <View key={field.key} style={styles.expertInputGroup}>
-                        <Text style={styles.expertInputLabel}>{field.label}</Text>
-                        <TextInput
-                          style={styles.expertInput}
-                          placeholder={field.placeholder}
-                          keyboardType="decimal-pad"
-                          value={expertMeasurements[field.key] || ''}
-                          onChangeText={(value) => onExpertMeasurementChange(field.key, value)}
-                        />
-                      </View>
-                    ))}
-                  </View>
-                ) : (
-                  <>
-                    <TouchableOpacity
-                      style={styles.checkRow}
-                      onPress={() => setPickupMeasurementReceived((previous) => !previous)}
-                      activeOpacity={0.8}
-                    >
-                      <View style={[styles.checkbox, pickupMeasurementReceived && styles.checkboxActive]}>
-                        {pickupMeasurementReceived ? <Feather name="check" size={14} color={Colors.textInverted} /> : null}
-                      </View>
-                      <Text style={styles.checkLabel}>Customer provided AI/Self measurements</Text>
-                    </TouchableOpacity>
+                  {isExpertPickupMeasurement ? (
+                    <View style={styles.expertMeasurementGrid}>
+                      {EXPERT_MEASUREMENT_FIELDS.map((field) => (
+                        <View key={field.key} style={styles.expertInputGroup}>
+                          <Text style={styles.expertInputLabel}>{field.label}</Text>
+                          <TextInput
+                            style={styles.expertInput}
+                            placeholder={field.placeholder}
+                            keyboardType="decimal-pad"
+                            value={expertMeasurements[field.key] || ''}
+                            onChangeText={(value) => onExpertMeasurementChange(field.key, value)}
+                          />
+                        </View>
+                      ))}
+                    </View>
+                  ) : (
+                    <>
+                      <TouchableOpacity
+                        style={styles.checkRow}
+                        onPress={() => setPickupMeasurementReceived((previous) => !previous)}
+                        activeOpacity={0.8}
+                      >
+                        <View style={[styles.checkbox, pickupMeasurementReceived && styles.checkboxActive]}>
+                          {pickupMeasurementReceived ? <Feather name="check" size={14} color={Colors.textInverted} /> : null}
+                        </View>
+                        <Text style={styles.checkLabel}>Customer provided AI/Self measurements</Text>
+                      </TouchableOpacity>
+                      <TextInput
+                        style={styles.noteInput}
+                        placeholder="Add notes about measurements shared by customer"
+                        value={pickupMeasurementNote}
+                        onChangeText={setPickupMeasurementNote}
+                        multiline
+                      />
+                    </>
+                  )}
+
+                  {selectedOrder.send_reference_cloth ? (
+                    <Text style={styles.referenceHint}>Customer asked to send reference cloth.</Text>
+                  ) : null}
+                  <TouchableOpacity
+                    style={styles.checkRow}
+                    onPress={() => setPickupReferenceClothReceived((previous) => !previous)}
+                    activeOpacity={0.8}
+                  >
+                    <View style={[styles.checkbox, pickupReferenceClothReceived && styles.checkboxActive]}>
+                      {pickupReferenceClothReceived ? <Feather name="check" size={14} color={Colors.textInverted} /> : null}
+                    </View>
+                    <Text style={styles.checkLabel}>Reference cloth received</Text>
+                  </TouchableOpacity>
+                  {(selectedOrder.send_reference_cloth || pickupReferenceClothReceived) ? (
                     <TextInput
                       style={styles.noteInput}
-                      placeholder="Add notes about measurements shared by customer"
-                      value={pickupMeasurementNote}
-                      onChangeText={setPickupMeasurementNote}
+                      placeholder="Reference cloth notes (fabric details, count, etc.)"
+                      value={pickupReferenceClothNote}
+                      onChangeText={setPickupReferenceClothNote}
                       multiline
                     />
-                  </>
-                )}
+                  ) : null}
 
-                {selectedOrder.send_reference_cloth ? (
-                  <Text style={styles.referenceHint}>Customer asked to send reference cloth.</Text>
-                ) : null}
-                <TouchableOpacity
-                  style={styles.checkRow}
-                  onPress={() => setPickupReferenceClothReceived((previous) => !previous)}
-                  activeOpacity={0.8}
-                >
-                  <View style={[styles.checkbox, pickupReferenceClothReceived && styles.checkboxActive]}>
-                    {pickupReferenceClothReceived ? <Feather name="check" size={14} color={Colors.textInverted} /> : null}
-                  </View>
-                  <Text style={styles.checkLabel}>Reference cloth received</Text>
+                  <TouchableOpacity
+                    style={[styles.savePickupBtn, savingPickupDetails && styles.savePickupBtnDisabled]}
+                    onPress={() => savePickupDetails(selectedOrder)}
+                    activeOpacity={0.8}
+                    disabled={savingPickupDetails}
+                  >
+                    {savingPickupDetails ? (
+                      <ActivityIndicator size="small" color={Colors.textInverted} />
+                    ) : (
+                      <Feather name="save" size={16} color={Colors.textInverted} />
+                    )}
+                    <Text style={styles.savePickupText}>{savingPickupDetails ? 'Saving...' : 'Save Pickup Details'}</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : null}
+              <View style={styles.modalActionRow}>
+                <TouchableOpacity style={styles.modalRejectBtn} onPress={handleRejectOrder} activeOpacity={0.7}>
+                  <Text style={styles.modalRejectText}>Reject</Text>
                 </TouchableOpacity>
-                {(selectedOrder.send_reference_cloth || pickupReferenceClothReceived) ? (
-                  <TextInput
-                    style={styles.noteInput}
-                    placeholder="Reference cloth notes (fabric details, count, etc.)"
-                    value={pickupReferenceClothNote}
-                    onChangeText={setPickupReferenceClothNote}
-                    multiline
-                  />
-                ) : null}
-
                 <TouchableOpacity
-                  style={[styles.savePickupBtn, savingPickupDetails && styles.savePickupBtnDisabled]}
-                  onPress={() => savePickupDetails(selectedOrder)}
-                  activeOpacity={0.8}
+                  style={[styles.modalConfirmBtn, savingPickupDetails && styles.modalConfirmBtnDisabled]}
+                  onPress={handleConfirmOrder}
+                  activeOpacity={0.7}
                   disabled={savingPickupDetails}
                 >
-                  {savingPickupDetails ? (
-                    <ActivityIndicator size="small" color={Colors.textInverted} />
-                  ) : (
-                    <Feather name="save" size={16} color={Colors.textInverted} />
-                  )}
-                  <Text style={styles.savePickupText}>{savingPickupDetails ? 'Saving...' : 'Save Pickup Details'}</Text>
+                  <Text style={styles.modalConfirmText}>Confirm Order</Text>
                 </TouchableOpacity>
               </View>
-            ) : null}
-            <View style={styles.modalActionRow}>
-              <TouchableOpacity style={styles.modalRejectBtn} onPress={handleRejectOrder} activeOpacity={0.7}>
-                <Text style={styles.modalRejectText}>Reject</Text>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={navigationVisible} animationType="slide" transparent onRequestClose={closeNavigation}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Live Navigation</Text>
+              <TouchableOpacity onPress={closeNavigation} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                <Feather name="x" size={20} color={Colors.textMuted} />
               </TouchableOpacity>
+            </View>
+            <View style={styles.mapContainer}>
+              {navigationOrder ? (
+                Platform.OS === 'android' ? (
+                  <WebView
+                    originWhitelist={['*']}
+                    source={{
+                      html: buildRouteMapHtml(
+                        navigationDriverPoint,
+                        navigationTargetLabelLower.includes('customer') ? navigationDestinationPoint : null,
+                        navigationTargetLabelLower.includes('tailor') ? navigationDestinationPoint : null,
+                        navigationRouteSummary?.coordinates || []
+                      ),
+                    }}
+                    javaScriptEnabled
+                    domStorageEnabled
+                    mixedContentMode="always"
+                    style={styles.map}
+                  />
+                ) : (
+                  <MapView
+                    ref={navigationMapRef}
+                    provider={PROVIDER_DEFAULT}
+                    mapType="none"
+                    style={styles.map}
+                    initialRegion={{ latitude: 20.5937, longitude: 78.9629, latitudeDelta: 8, longitudeDelta: 8 }}
+                  >
+                    <UrlTile urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png" maximumZ={19} />
+                    {navigationDriverPoint ? (
+                      <Marker coordinate={navigationDriverPoint} title="Your Location" pinColor={Colors.primary} />
+                    ) : null}
+                    {navigationDestinationPoint ? (
+                      <Marker
+                        coordinate={navigationDestinationPoint}
+                        title={navigationTarget?.label || 'Destination'}
+                        pinColor={Colors.secondary}
+                      />
+                    ) : null}
+                    {navigationRouteSummary?.coordinates?.length ? (
+                      <Polyline coordinates={navigationRouteSummary.coordinates} strokeColor={Colors.primary} strokeWidth={4} />
+                    ) : null}
+                  </MapView>
+                )
+              ) : null}
+              {navigationRouteLoading ? (
+                <View style={styles.routeLoadingOverlay}>
+                  <ActivityIndicator color={Colors.primary} />
+                  <Text style={styles.routeLoadingText}>Updating live route...</Text>
+                </View>
+              ) : null}
+            </View>
+            <View style={styles.navigationSection}>
+              <Text style={styles.navigationTargetLabel}>{navigationTarget?.label || 'Destination unavailable'}</Text>
+              <View style={styles.routeSummaryRow}>
+                <View style={styles.routeMetric}>
+                  <Text style={styles.routeMetricLabel}>Remaining</Text>
+                  <Text style={styles.routeMetricValue}>
+                    {navigationDistanceMeters !== null ? `${(navigationDistanceMeters / 1000).toFixed(2)} km` : 'Unavailable'}
+                  </Text>
+                </View>
+                <View style={styles.routeMetric}>
+                  <Text style={styles.routeMetricLabel}>ETA</Text>
+                  <Text style={styles.routeMetricValue}>
+                    {navigationRouteSummary ? `${Math.ceil(navigationRouteSummary.durationMinutes)} min` : 'Unavailable'}
+                  </Text>
+                </View>
+              </View>
+              <Text style={styles.navigationHint}>Route and distance refresh automatically while navigation is open.</Text>
+              {!canCompleteNavigation && navigationTarget ? (
+                <Text style={styles.navigationWaitText}>
+                  Move within {navigationTarget.nearThresholdMeters} m to enable {navigationTarget.buttonLabel}.
+                </Text>
+              ) : null}
               <TouchableOpacity
-                style={[styles.modalConfirmBtn, savingPickupDetails && styles.modalConfirmBtnDisabled]}
-                onPress={handleConfirmOrder}
+                style={[
+                  styles.navigationConfirmBtn,
+                  (!canCompleteNavigation || navigationRouteLoading || !navigationTarget) && styles.modalConfirmBtnDisabled,
+                ]}
+                onPress={handleNavigationStatusUpdate}
                 activeOpacity={0.7}
-                disabled={savingPickupDetails}
+                disabled={!canCompleteNavigation || navigationRouteLoading || !navigationTarget}
               >
-                <Text style={styles.modalConfirmText}>Confirm Order</Text>
+                <Text style={styles.modalConfirmText}>{navigationTarget?.buttonLabel || 'Update Status'}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -728,11 +1120,13 @@ const styles = StyleSheet.create({
   empty: { alignItems: 'center', paddingTop: 80 },
   emptyText: { fontFamily: Fonts.bodyBold, fontSize: 18, color: Colors.text, marginTop: 16 },
   modalBackdrop: { flex: 1, backgroundColor: 'rgba(28, 25, 23, 0.45)', justifyContent: 'center', padding: 20 },
-  modalCard: { backgroundColor: Colors.surface, borderRadius: Radius.lg, overflow: 'hidden' },
+  modalCard: { backgroundColor: Colors.surface, borderRadius: Radius.lg, overflow: 'hidden', maxHeight: '92%' },
   modalHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: Colors.border },
   modalTitle: { fontFamily: Fonts.bodyBold, fontSize: 18, color: Colors.text },
   mapContainer: { height: 260, backgroundColor: Colors.subtle },
   map: { flex: 1 },
+  modalScroll: { flex: 1 },
+  modalScrollContent: { paddingBottom: 8 },
   routeLoadingOverlay: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.85)' },
   routeLoadingText: { fontFamily: Fonts.ui, fontSize: 13, color: Colors.textMuted, marginTop: 8 },
   routeSummaryRow: { flexDirection: 'row', paddingHorizontal: 16, paddingTop: 16, gap: 12 },
@@ -800,4 +1194,9 @@ const styles = StyleSheet.create({
   modalConfirmBtn: { flex: 1, alignItems: 'center', justifyContent: 'center', borderRadius: Radius.full, paddingVertical: 14, backgroundColor: Colors.primary },
   modalConfirmBtnDisabled: { opacity: 0.6 },
   modalConfirmText: { fontFamily: Fonts.bodyBold, fontSize: 14, color: Colors.textInverted },
+  navigationSection: { paddingHorizontal: 16, paddingVertical: 16, gap: 10 },
+  navigationConfirmBtn: { alignItems: 'center', justifyContent: 'center', borderRadius: Radius.full, paddingVertical: 14, backgroundColor: Colors.primary, marginTop: 4 },
+  navigationTargetLabel: { fontFamily: Fonts.bodyBold, fontSize: 16, color: Colors.text },
+  navigationHint: { fontFamily: Fonts.ui, fontSize: 12, color: Colors.textMuted },
+  navigationWaitText: { fontFamily: Fonts.ui, fontSize: 12, color: Colors.info },
 });

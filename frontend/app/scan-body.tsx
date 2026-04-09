@@ -23,6 +23,9 @@ const BACKEND =
   process.env.EXPO_PUBLIC_BACKEND_URL || "http://10.136.221.15:8000";
 const SCAN_RESULT_STORAGE_KEY = "stitchly_latest_scan_measurements";
 const LEVEL_BAR_TRAVEL = 80;
+const AUTO_CAPTURE_MIN_QUALITY = 0.62;
+const MIN_VISIBLE_LANDMARK_CONFIDENCE = 0.2;
+const OVERLAY_SMOOTHING_ALPHA = 0.62;
 
 const { width: screenWidth, height: screenHeight } = Dimensions.get("window");
 
@@ -46,6 +49,8 @@ type OverlayState = {
   instruction: string;
   readyToCapture: boolean;
   qualityScore: number;
+  imageWidth: number;
+  imageHeight: number;
 };
 
 type MeasurementKey = "shoulder" | "chest" | "waist" | "hip" | "arm" | "leg" | "neck";
@@ -79,6 +84,89 @@ type ScanResult = {
   quality_score?: number;
   warnings?: string[];
 };
+
+function clampUnit(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function smoothLandmarks(previous: Landmark[], incoming: Landmark[], alpha: number): Landmark[] {
+  if (!previous.length || previous.length !== incoming.length) {
+    return incoming;
+  }
+
+  return incoming.map((point, index) => {
+    const current = previous[index];
+    if (!current) {
+      return point;
+    }
+    return {
+      x: (current.x * (1 - alpha)) + (point.x * alpha),
+      y: (current.y * (1 - alpha)) + (point.y * alpha),
+      z: point.z,
+      visibility: point.visibility,
+    };
+  });
+}
+
+function smoothSilhouette(previous: SilhouettePoint[], incoming: SilhouettePoint[], alpha: number): SilhouettePoint[] {
+  if (!previous.length || previous.length !== incoming.length) {
+    return incoming;
+  }
+
+  return incoming.map((point, index) => {
+    const current = previous[index];
+    if (!current) {
+      return point;
+    }
+    return {
+      x: (current.x * (1 - alpha)) + (point.x * alpha),
+      y: (current.y * (1 - alpha)) + (point.y * alpha),
+    };
+  });
+}
+
+function projectNormalizedPoint(
+  point: { x: number; y: number },
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number
+) {
+  const srcW = Math.max(sourceWidth, 1);
+  const srcH = Math.max(sourceHeight, 1);
+  const dstW = Math.max(targetWidth, 1);
+  const dstH = Math.max(targetHeight, 1);
+
+  const scale = Math.max(dstW / srcW, dstH / srcH);
+  const scaledW = srcW * scale;
+  const scaledH = srcH * scale;
+  const offsetX = (scaledW - dstW) * 0.5;
+  const offsetY = (scaledH - dstH) * 0.5;
+
+  return {
+    x: (clampUnit(point.x) * scaledW) - offsetX,
+    y: (clampUnit(point.y) * scaledH) - offsetY,
+  };
+}
+
+function buildProjectedSilhouettePath(
+  points: SilhouettePoint[],
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number
+) {
+  if (!points || points.length < 3) {
+    return "";
+  }
+
+  let path = "";
+  points.forEach((point, index) => {
+    const projected = projectNormalizedPoint(point, sourceWidth, sourceHeight, targetWidth, targetHeight);
+    path += `${index === 0 ? "M" : "L"} ${projected.x} ${projected.y} `;
+  });
+  return `${path} Z`;
+}
 
 const MEASUREMENT_FIELDS: Array<{ key: MeasurementKey; label: string }> = [
   { key: "shoulder", label: "Shoulder" },
@@ -127,10 +215,13 @@ export default function ScanBody() {
   const router = useRouter();
   const cameraRef = useRef<Camera>(null);
   const checkingRef = useRef(false);
+  const capturingStepRef = useRef(false);
   const isDeviceLevelRef = useRef(false);
   const gravityXRef = useRef(0);
   const gravityYRef = useRef(0);
   const gravityZRef = useRef(0);
+  const tiltPitchRef = useRef(0);
+  const tiltRollRef = useRef(0);
   const autoCaptureTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const device = useCameraDevice("back");
@@ -138,13 +229,16 @@ export default function ScanBody() {
   const [hasPermission, setHasPermission] = useState(false);
   const [heightCm, setHeightCm] = useState("");
   const [phase, setPhase] = useState<"height" | "capture" | "processing" | "done">("height");
+  const [previewSize, setPreviewSize] = useState({ width: screenWidth, height: screenHeight });
   const [isDeviceLevel, setIsDeviceLevel] = useState(false);
   const [indicatorX, setIndicatorX] = useState(0);
   const [captureTriggered, setCaptureTriggered] = useState(false);
+  const [gyroAssistEnabled, setGyroAssistEnabled] = useState(true);
   const [stepIndex, setStepIndex] = useState(0);
   const [stabilityFrames, setStabilityFrames] = useState(0);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isCapturingStep, setIsCapturingStep] = useState(false);
   const [result, setResult] = useState<ScanResult | null>(null);
   const [editableInputs, setEditableInputs] = useState<Record<MeasurementKey, string> | null>(null);
 
@@ -155,6 +249,8 @@ export default function ScanBody() {
     instruction: "Align your body in frame",
     readyToCapture: false,
     qualityScore: 0,
+    imageWidth: screenWidth,
+    imageHeight: screenHeight,
   });
 
   const progressAnim = useRef(new Animated.Value(0)).current;
@@ -185,22 +281,31 @@ export default function ScanBody() {
       const gy = Number(gravity.y ?? 0);
       const gz = Number(gravity.z ?? 0);
 
-      gravityXRef.current = Number.isFinite(gx) ? gx : 0;
-      gravityYRef.current = Number.isFinite(gy) ? gy : 0;
-      gravityZRef.current = Number.isFinite(gz) ? gz : 0;
+      const magnitude = Math.sqrt((gx * gx) + (gy * gy) + (gz * gz));
+      const safeMagnitude = Number.isFinite(magnitude) && magnitude > 0.001 ? magnitude : 9.81;
 
-      const tolerance = 0.35;
-      const isVertical = Math.abs(gravityZRef.current) < tolerance;
-      const isStraight = Math.abs(gravityYRef.current) < tolerance;
-      const level = isVertical && isStraight;
+      const normalizedX = Number.isFinite(gx) ? gx / safeMagnitude : 0;
+      const normalizedY = Number.isFinite(gy) ? gy / safeMagnitude : 0;
+      const normalizedZ = Number.isFinite(gz) ? gz / safeMagnitude : 0;
 
-      const normalized = Math.max(-1, Math.min(1, gravityXRef.current));
+      gravityXRef.current = normalizedX;
+      gravityYRef.current = normalizedY;
+      gravityZRef.current = normalizedZ;
+      tiltPitchRef.current = normalizedZ;
+      tiltRollRef.current = normalizedX;
+
+      const lateralTilt = Math.abs(normalizedX);
+      const forwardTilt = Math.abs(normalizedZ);
+      const level = lateralTilt <= 0.65 && forwardTilt <= 0.62;
+
+      const normalized = Math.max(-1, Math.min(1, normalizedX));
       setIndicatorX(normalized * LEVEL_BAR_TRAVEL);
 
-      isDeviceLevelRef.current = level;
-      setIsDeviceLevel(level);
+      const effectiveLevel = gyroAssistEnabled ? level : true;
+      isDeviceLevelRef.current = effectiveLevel;
+      setIsDeviceLevel(effectiveLevel);
 
-      if (!level) {
+      if (gyroAssistEnabled && !level) {
         setCaptureTriggered(false);
       }
     });
@@ -208,7 +313,7 @@ export default function ScanBody() {
     return () => {
       subscription.remove();
     };
-  }, []);
+  }, [gyroAssistEnabled]);
 
   useEffect(() => {
     Animated.timing(levelIndicatorAnim, {
@@ -258,7 +363,7 @@ export default function ScanBody() {
 
     const interval = setInterval(() => {
       void checkPosition();
-    }, 1600);
+    }, 900);
 
     return () => clearInterval(interval);
   }, [phase, countdown, stepIndex, heightCm, stabilityFrames, isDeviceLevel]);
@@ -267,9 +372,8 @@ export default function ScanBody() {
     const canAutoCapture =
       phase === "capture" &&
       countdown === null &&
-      isDeviceLevel &&
       overlay.readyToCapture &&
-      overlay.qualityScore >= 0.8 &&
+      overlay.qualityScore >= AUTO_CAPTURE_MIN_QUALITY &&
       stabilityFrames >= 2;
 
     if (canAutoCapture && !captureTriggered) {
@@ -291,11 +395,11 @@ export default function ScanBody() {
         clearTimeout(autoCaptureTimeoutRef.current);
         autoCaptureTimeoutRef.current = null;
       }
-      if (!isDeviceLevel || !overlay.readyToCapture) {
+      if (!overlay.readyToCapture || (gyroAssistEnabled && !isDeviceLevel)) {
         setCaptureTriggered(false);
       }
     }
-  }, [phase, countdown, isDeviceLevel, overlay.readyToCapture, overlay.qualityScore, stabilityFrames, captureTriggered]);
+  }, [phase, countdown, isDeviceLevel, overlay.readyToCapture, overlay.qualityScore, stabilityFrames, captureTriggered, gyroAssistEnabled]);
 
   useEffect(() => {
     return () => {
@@ -307,34 +411,20 @@ export default function ScanBody() {
   }, []);
 
   const silhouettePath = useMemo(() => {
-    if (!overlay.silhouette || overlay.silhouette.length < 3) return "";
-
-    let path = "";
-    overlay.silhouette.forEach((point, index) => {
-      const x = point.x * screenWidth;
-      const y = point.y * screenHeight;
-      path += `${index === 0 ? "M" : "L"} ${x} ${y} `;
-    });
-    return `${path} Z`;
-  }, [overlay.silhouette]);
+    return buildProjectedSilhouettePath(
+      overlay.silhouette,
+      overlay.imageWidth,
+      overlay.imageHeight,
+      previewSize.width,
+      previewSize.height
+    );
+  }, [overlay.silhouette, overlay.imageWidth, overlay.imageHeight, previewSize.width, previewSize.height]);
 
   const checkPosition = async () => {
     if (!cameraRef.current) return;
     if (checkingRef.current) return;
+    if (capturingStepRef.current) return;
     if (!currentStep) return;
-    if (!isDeviceLevelRef.current) {
-      const upDownTilted = Math.abs(gravityZRef.current) > 0.7;
-      setOverlay((current) => ({
-        ...current,
-        instruction: upDownTilted ? "Do not point camera up/down" : "Tilt phone to align",
-        readyToCapture: false,
-        qualityScore: Math.min(Number(current.qualityScore || 0), 0.25),
-      }));
-      setErrorMessage(null);
-      setStabilityFrames(0);
-      setCaptureTriggered(false);
-      return;
-    }
 
     checkingRef.current = true;
 
@@ -354,6 +444,8 @@ export default function ScanBody() {
       );
       formData.append("height_cm", heightCm);
       formData.append("view", currentStep.key);
+      formData.append("pitch", String(tiltPitchRef.current));
+      formData.append("roll", String(tiltRollRef.current));
 
       const response = await fetch(`${BACKEND}/ai/check-position`, {
         method: "POST",
@@ -368,18 +460,36 @@ export default function ScanBody() {
         return;
       }
 
-      const readyToCapture = Boolean(data.ready_to_capture) && isDeviceLevelRef.current;
+      const backendReady = Boolean(data.ready_to_capture);
+      const readyToCapture = backendReady && (!gyroAssistEnabled || isDeviceLevelRef.current);
+      const qualityFromBackend = Number(data.quality_score || 0);
+      const qualityPenalty = gyroAssistEnabled && !isDeviceLevelRef.current ? 0.04 : 0.0;
+      const stabilizedQuality = clampUnit(qualityFromBackend - qualityPenalty);
+      const uiQuality = readyToCapture
+        ? clampUnit(Math.max(stabilizedQuality, AUTO_CAPTURE_MIN_QUALITY))
+        : clampUnit((stabilizedQuality * 0.9) + 0.05);
+
+      const landmarks = Array.isArray(data.landmarks) ? data.landmarks : [];
+      const silhouette = Array.isArray(data.silhouette) ? data.silhouette : [];
+      const sourceWidth = Number(data.image_width);
+      const sourceHeight = Number(data.image_height);
+      const normalizedSourceWidth = Number.isFinite(sourceWidth) && sourceWidth > 0 ? sourceWidth : currentStep ? previewSize.width : screenWidth;
+      const normalizedSourceHeight = Number.isFinite(sourceHeight) && sourceHeight > 0 ? sourceHeight : currentStep ? previewSize.height : screenHeight;
 
       setErrorMessage(null);
-      setOverlay({
-        landmarks: data.landmarks || [],
-        silhouette: data.silhouette || [],
-        instruction: readyToCapture ? data.instruction || "Adjust position" : data.instruction || "Adjust position",
+      setOverlay((current) => ({
+        landmarks: smoothLandmarks(current.landmarks, landmarks, OVERLAY_SMOOTHING_ALPHA),
+        silhouette: smoothSilhouette(current.silhouette, silhouette, OVERLAY_SMOOTHING_ALPHA),
+        instruction: readyToCapture
+          ? "Good position"
+          : (!gyroAssistEnabled || isDeviceLevelRef.current)
+            ? data.instruction || "Adjust position"
+            : "Slightly level phone for cleaner silhouette",
         readyToCapture,
-        qualityScore: readyToCapture
-          ? Number(data.quality_score || 0)
-          : Math.min(Number(data.quality_score || 0), 0.25),
-      });
+        qualityScore: clampUnit((current.qualityScore * 0.35) + (uiQuality * 0.65)),
+        imageWidth: normalizedSourceWidth,
+        imageHeight: normalizedSourceHeight,
+      }));
 
       if (readyToCapture) {
         const nextStable = stabilityFrames + 1;
@@ -399,12 +509,14 @@ export default function ScanBody() {
 
   const captureCurrentStep = async () => {
     if (!cameraRef.current || !currentStep) return;
-    if (!isDeviceLevelRef.current) {
-      setErrorMessage(null);
-      setStabilityFrames(0);
-      setCaptureTriggered(false);
+    if (capturingStepRef.current) return;
+    if (checkingRef.current) {
+      setErrorMessage("Preparing frame. Tap capture again in a moment.");
       return;
     }
+
+    capturingStepRef.current = true;
+    setIsCapturingStep(true);
 
     if (autoCaptureTimeoutRef.current) {
       clearTimeout(autoCaptureTimeoutRef.current);
@@ -435,6 +547,8 @@ export default function ScanBody() {
           instruction: "Reposition for next view",
           readyToCapture: false,
           qualityScore: 0,
+          imageWidth: previewSize.width,
+          imageHeight: previewSize.height,
         });
         return;
       }
@@ -444,6 +558,9 @@ export default function ScanBody() {
     } catch (error) {
       setErrorMessage("Unable to capture image. Try again.");
       setCaptureTriggered(false);
+    } finally {
+      capturingStepRef.current = false;
+      setIsCapturingStep(false);
     }
   };
 
@@ -606,6 +723,8 @@ export default function ScanBody() {
     setCountdown(null);
     setStabilityFrames(0);
     setCaptureTriggered(false);
+    capturingStepRef.current = false;
+    setIsCapturingStep(false);
     setIndicatorX(0);
     setOverlay({
       landmarks: [],
@@ -613,6 +732,8 @@ export default function ScanBody() {
       instruction: "Align your body in frame",
       readyToCapture: false,
       qualityScore: 0,
+      imageWidth: previewSize.width,
+      imageHeight: previewSize.height,
     });
   };
 
@@ -664,19 +785,21 @@ export default function ScanBody() {
   };
 
   const upDownTilted = Math.abs(gravityZRef.current) > 0.7;
-  const levelStatusText = upDownTilted
-    ? "Do not point camera up/down"
-    : isDeviceLevel
-      ? "Perfect! Hold still..."
-      : "Tilt phone to align";
+  const levelStatusText = !gyroAssistEnabled
+    ? "Tilt assist disabled"
+    : upDownTilted
+      ? "Reduce forward/back tilt"
+      : isDeviceLevel
+        ? "Tilt assist: aligned"
+        : "Tilt assist: adjust slightly";
   const captureGuidanceText =
-    upDownTilted
-      ? "Do not point camera up/down"
-      : !isDeviceLevel
-        ? "Tilt phone to align"
-      : overlay.readyToCapture && overlay.qualityScore >= 0.8
-        ? "Perfect! Hold still..."
+    overlay.readyToCapture && overlay.qualityScore >= AUTO_CAPTURE_MIN_QUALITY
+      ? "Great framing. Capturing soon..."
+      : (gyroAssistEnabled && !isDeviceLevel)
+        ? "Body detected. Level phone slightly for best edges."
         : overlay.instruction;
+  const overlaySourceWidth = overlay.imageWidth > 0 ? overlay.imageWidth : previewSize.width;
+  const overlaySourceHeight = overlay.imageHeight > 0 ? overlay.imageHeight : previewSize.height;
 
   if (!hasPermission) {
     return (
@@ -726,22 +849,31 @@ export default function ScanBody() {
 
   return (
     <View style={styles.container}>
-      {device ? (
-        <Camera
-          ref={cameraRef}
-          style={StyleSheet.absoluteFill}
-          device={device}
-          isActive={phase !== "done"}
-          photo
-          enableZoomGesture
-        />
-      ) : (
-        <View style={styles.centered}>
-          <Text style={styles.permissionText}>No camera device found.</Text>
-        </View>
-      )}
+      <View
+        style={styles.previewLayer}
+        onLayout={(event) => {
+          const { width, height } = event.nativeEvent.layout;
+          if (width > 0 && height > 0) {
+            setPreviewSize({ width, height });
+          }
+        }}
+      >
+        {device ? (
+          <Camera
+            ref={cameraRef}
+            style={StyleSheet.absoluteFill}
+            device={device}
+            isActive={phase !== "done"}
+            photo
+            enableZoomGesture
+          />
+        ) : (
+          <View style={styles.centered}>
+            <Text style={styles.permissionText}>No camera device found.</Text>
+          </View>
+        )}
 
-      <Svg style={StyleSheet.absoluteFill}>
+        <Svg style={StyleSheet.absoluteFill}>
         {silhouettePath ? (
           <SvgPath
             d={silhouettePath}
@@ -755,13 +887,30 @@ export default function ScanBody() {
           const first = overlay.landmarks[from];
           const second = overlay.landmarks[to];
           if (!first || !second) return null;
+          if ((first.visibility ?? 0) < MIN_VISIBLE_LANDMARK_CONFIDENCE) return null;
+          if ((second.visibility ?? 0) < MIN_VISIBLE_LANDMARK_CONFIDENCE) return null;
+
+          const firstProjected = projectNormalizedPoint(
+            first,
+            overlaySourceWidth,
+            overlaySourceHeight,
+            previewSize.width,
+            previewSize.height
+          );
+          const secondProjected = projectNormalizedPoint(
+            second,
+            overlaySourceWidth,
+            overlaySourceHeight,
+            previewSize.width,
+            previewSize.height
+          );
           return (
             <Line
               key={`${from}-${to}-${index}`}
-              x1={String(first.x * screenWidth)}
-              y1={String(first.y * screenHeight)}
-              x2={String(second.x * screenWidth)}
-              y2={String(second.y * screenHeight)}
+              x1={String(firstProjected.x)}
+              y1={String(firstProjected.y)}
+              x2={String(secondProjected.x)}
+              y2={String(secondProjected.y)}
               stroke="rgba(252, 211, 77, 0.95)"
               strokeWidth={2.2}
             />
@@ -769,15 +918,27 @@ export default function ScanBody() {
         })}
 
         {overlay.landmarks.map((point, index) => (
-          <Circle
-            key={`point-${index}`}
-            cx={String(point.x * screenWidth)}
-            cy={String(point.y * screenHeight)}
-            r={2.8}
-            fill="rgba(255,255,255,0.9)"
-          />
+          (point.visibility ?? 0) >= MIN_VISIBLE_LANDMARK_CONFIDENCE ? (() => {
+            const projected = projectNormalizedPoint(
+              point,
+              overlaySourceWidth,
+              overlaySourceHeight,
+              previewSize.width,
+              previewSize.height
+            );
+            return (
+              <Circle
+                key={`point-${index}`}
+                cx={String(projected.x)}
+                cy={String(projected.y)}
+                r={2.8}
+                fill="rgba(255,255,255,0.9)"
+              />
+            );
+          })() : null
         ))}
-      </Svg>
+        </Svg>
+      </View>
 
       <View style={styles.topHUD}>
         <View style={styles.progressCard}>
@@ -837,36 +998,65 @@ export default function ScanBody() {
         ) : null}
 
         {phase === "capture" ? (
-          <Animated.View
-            style={[
-              styles.statusCard,
-              {
-                transform: [
-                  {
-                    scale: pulseAnim.interpolate({
-                      inputRange: [0, 1],
-                      outputRange: [1, 1.03],
-                    }),
-                  },
-                ],
-              },
-            ]}
-          >
-            <Text
+          <>
+            <Animated.View
               style={[
-                styles.statusText,
-                !isDeviceLevel
-                  ? styles.statusTextTilted
-                  : overlay.readyToCapture && overlay.qualityScore >= 0.8
-                    ? styles.statusTextAligned
-                    : null,
+                styles.statusCard,
+                {
+                  transform: [
+                    {
+                      scale: pulseAnim.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [1, 1.03],
+                      }),
+                    },
+                  ],
+                },
               ]}
             >
-              {captureGuidanceText}
-            </Text>
-            <Text style={styles.qualityText}>Quality {(overlay.qualityScore * 100).toFixed(0)}%</Text>
-            {countdown !== null ? <Text style={styles.countdownText}>{countdown}</Text> : null}
-          </Animated.View>
+              <Text
+                style={[
+                  styles.statusText,
+                  gyroAssistEnabled && !isDeviceLevel
+                    ? styles.statusTextTilted
+                    : overlay.readyToCapture && overlay.qualityScore >= AUTO_CAPTURE_MIN_QUALITY
+                      ? styles.statusTextAligned
+                      : null,
+                ]}
+              >
+                {captureGuidanceText}
+              </Text>
+              <Text style={styles.qualityText}>Quality {(overlay.qualityScore * 100).toFixed(0)}%</Text>
+              {countdown !== null ? <Text style={styles.countdownText}>{countdown}</Text> : null}
+            </Animated.View>
+
+            <View style={styles.captureActionRow}>
+              <Pressable
+                style={[styles.captureNowButton, isCapturingStep ? styles.captureNowButtonDisabled : null]}
+                disabled={isCapturingStep}
+                onPress={() => void captureCurrentStep()}
+              >
+                {isCapturingStep ? (
+                  <ActivityIndicator color={Colors.textInverted} size="small" />
+                ) : (
+                  <Text style={styles.captureNowButtonText}>Capture This View</Text>
+                )}
+              </Pressable>
+
+              <Pressable
+                style={styles.gyroToggleButton}
+                onPress={() => {
+                  setGyroAssistEnabled((previous) => !previous);
+                  setCaptureTriggered(false);
+                  setStabilityFrames(0);
+                }}
+              >
+                <Text style={styles.gyroToggleText}>
+                  {gyroAssistEnabled ? "Disable Tilt Assist" : "Enable Tilt Assist"}
+                </Text>
+              </Pressable>
+            </View>
+          </>
         ) : null}
 
         {phase === "done" && result ? (
@@ -917,6 +1107,9 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: "#020617",
+  },
+  previewLayer: {
+    ...StyleSheet.absoluteFillObject,
   },
   centered: {
     flex: 1,
@@ -1093,6 +1286,39 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(2, 6, 23, 0.74)",
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.2)",
+  },
+  captureActionRow: {
+    width: "100%",
+    marginTop: 10,
+    gap: 10,
+  },
+  captureNowButton: {
+    borderRadius: Radius.full,
+    backgroundColor: "rgba(20, 184, 166, 0.92)",
+    paddingVertical: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  captureNowButtonDisabled: {
+    opacity: 0.65,
+  },
+  captureNowButtonText: {
+    fontFamily: Fonts.bodyBold,
+    color: Colors.textInverted,
+    fontSize: 14,
+  },
+  gyroToggleButton: {
+    borderRadius: Radius.full,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.28)",
+    backgroundColor: "rgba(15, 23, 42, 0.72)",
+    paddingVertical: 10,
+    alignItems: "center",
+  },
+  gyroToggleText: {
+    fontFamily: Fonts.ui,
+    color: "rgba(255,255,255,0.88)",
+    fontSize: 13,
   },
   statusText: {
     fontFamily: Fonts.bodyBold,

@@ -15,8 +15,8 @@ PoseLandmarkerOptions = vision.PoseLandmarkerOptions
 VisionRunningMode = vision.RunningMode
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "pose_landmarker_lite.task"
-SEGMENTATION_THRESHOLD = 0.35
-SILHOUETTE_POINT_LIMIT = 220
+SEGMENTATION_THRESHOLD = 0.42
+SILHOUETTE_POINT_LIMIT = 360
 
 
 def _build_landmarker() -> PoseLandmarker:
@@ -57,6 +57,9 @@ def _extract_silhouette(mask: np.ndarray) -> List[Dict[str, float]]:
         return []
 
     binary = (mask >= SEGMENTATION_THRESHOLD).astype(np.uint8) * 255
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return []
@@ -66,7 +69,7 @@ def _extract_silhouette(mask: np.ndarray) -> List[Dict[str, float]]:
         return []
 
     perimeter = cv2.arcLength(contour, True)
-    epsilon = max(1.0, perimeter * 0.0025)
+    epsilon = max(0.8, perimeter * 0.0012)
     approx = cv2.approxPolyDP(contour, epsilon, True)
     points = approx.reshape(-1, 2)
 
@@ -110,6 +113,10 @@ def detect_pose(image_path: str) -> Dict[str, Any]:
     image = cv2.imread(image_path)
     if image is None:
         raise ValueError("Image could not be loaded")
+
+    # Most scan captures are portrait; normalize orientation before landmark detection.
+    if image.shape[1] > image.shape[0]:
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
 
     height, width = image.shape[:2]
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)

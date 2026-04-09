@@ -391,6 +391,9 @@ def _estimate_position_feedback(
     pitch: Optional[float] = None,
     roll: Optional[float] = None,
 ) -> dict:
+    def _clamp(value: float, minimum: float, maximum: float) -> float:
+        return max(minimum, min(value, maximum))
+
     landmarks = view.get("landmarks") or []
     if len(landmarks) < 29:
         return {
@@ -399,13 +402,24 @@ def _estimate_position_feedback(
             "quality_score": 0.0,
         }
 
+    gyro_penalty = 0.0
+    tilt_severity = 0.0
     if pitch is not None and roll is not None:
-        if abs(float(pitch)) > 0.05 or abs(float(roll)) > 0.05:
+        try:
+            tilt_severity = max(abs(float(pitch)), abs(float(roll)))
+        except (TypeError, ValueError):
+            tilt_severity = 0.0
+
+        if tilt_severity > 0.92:
             return {
-                "instruction": "Tilt phone to align",
+                "instruction": "Reduce phone tilt",
                 "ready_to_capture": False,
-                "quality_score": 0.2,
+                "quality_score": 0.25,
             }
+        if tilt_severity > 0.75:
+            gyro_penalty = 0.06
+        elif tilt_severity > 0.60:
+            gyro_penalty = 0.03
 
     left_shoulder = landmarks[11]
     right_shoulder = landmarks[12]
@@ -420,35 +434,66 @@ def _estimate_position_feedback(
     shoulder_tilt = abs(float(left_shoulder.get("y", 0.0)) - float(right_shoulder.get("y", 0.0)))
     shoulder_span = abs(float(left_shoulder.get("x", 0.0)) - float(right_shoulder.get("x", 0.0)))
     pose_confidence = float(view.get("pose_confidence", 0.0))
+    silhouette = view.get("silhouette") or []
 
-    if body_height_px < image_height * 0.55:
+    critical_indices = (0, 11, 12, 23, 24, 27, 28)
+    visibility_scores = []
+    for index in critical_indices:
+        if index < len(landmarks):
+            visibility_scores.append(float(landmarks[index].get("visibility", 0.0)))
+    landmark_visibility = float(np.mean(visibility_scores)) if visibility_scores else 0.0
+    silhouette_score = _clamp(float(len(silhouette)) / 90.0, 0.0, 1.0)
+
+    if body_height_px < image_height * 0.48:
         return {"instruction": "Move closer", "ready_to_capture": False, "quality_score": 0.15}
-    if body_height_px > image_height * 0.92:
+    if body_height_px > image_height * 0.97:
         return {"instruction": "Move back", "ready_to_capture": False, "quality_score": 0.15}
 
-    if shoulder_mid_x < 0.4:
+    if shoulder_mid_x < 0.32:
         return {"instruction": "Move right", "ready_to_capture": False, "quality_score": 0.2}
-    if shoulder_mid_x > 0.6:
+    if shoulder_mid_x > 0.68:
         return {"instruction": "Move left", "ready_to_capture": False, "quality_score": 0.2}
 
-    if shoulder_tilt > 0.055:
+    if shoulder_tilt > 0.08:
         return {"instruction": "Stand straight", "ready_to_capture": False, "quality_score": 0.35}
 
-    if view_name == "side" and shoulder_span > 0.16:
+    if view_name == "side" and shoulder_span > 0.20:
         return {
             "instruction": "Turn 90° to your side",
             "ready_to_capture": False,
             "quality_score": 0.35,
         }
 
-    if pose_confidence < 0.6:
+    if pose_confidence < 0.45 and landmark_visibility < 0.40:
         return {
             "instruction": "Hold steady",
             "ready_to_capture": False,
-            "quality_score": max(0.35, pose_confidence),
+            "quality_score": max(0.35, pose_confidence, landmark_visibility),
         }
 
-    quality = min(1.0, 0.5 + (pose_confidence * 0.4) + (body_height * 0.2))
+    body_height_ratio = body_height_px / max(image_height, 1.0)
+    body_frame_score = _clamp(1.0 - (abs(body_height_ratio - 0.74) / 0.26), 0.0, 1.0)
+
+    quality = _clamp(
+        (0.36 * pose_confidence)
+        + (0.33 * landmark_visibility)
+        + (0.16 * silhouette_score)
+        + (0.15 * body_frame_score)
+        - gyro_penalty,
+        0.0,
+        1.0,
+    )
+
+    if quality < 0.50 or landmark_visibility < 0.38:
+        instruction = "Hold steady"
+        if tilt_severity > 0.75:
+            instruction = "Slightly level the phone"
+        return {
+            "instruction": instruction,
+            "ready_to_capture": False,
+            "quality_score": round(quality, 3),
+        }
+
     return {
         "instruction": "Good position",
         "ready_to_capture": True,
@@ -2452,6 +2497,8 @@ async def check_position(
         "landmarks": overlay["landmarks"],
         "silhouette": overlay["silhouette"],
         "pose_confidence": overlay["pose_confidence"],
+        "image_width": int(pose_view.get("image_width") or 0),
+        "image_height": int(pose_view.get("image_height") or 0),
         "height_cm": height_cm,
         "view": view.lower(),
         "pitch": pitch,
