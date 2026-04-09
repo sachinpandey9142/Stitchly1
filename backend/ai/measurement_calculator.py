@@ -24,7 +24,9 @@ TARGET_TORSO_RATIO = 0.27
 
 ANTHRO_SHOULDER_RATIO = 0.259
 ANTHRO_HIP_RATIO = 0.191
-ANTHRO_LEG_RATIO = 0.53
+ANTHRO_LEG_RATIO = 0.46
+SIDE_ORIENTATION_MIN_SIN = 0.28
+SIDE_ORIENTATION_MAX_COS = 0.95
 
 RAW_METRIC_KEYS = (
     "shoulder_width_cm",
@@ -338,15 +340,15 @@ def _select_view_with_fallback(
 
 
 def _fallback_measurements_from_height(height_cm: float) -> Dict[str, float]:
-    shoulder_width_cm = max(height_cm * 0.25, 30.0)
-    chest_cm = max(height_cm * 0.53, 70.0)
-    waist_cm = max(chest_cm * 0.85, 58.0)
-    hip_circumference_cm = max(waist_cm * 1.05, 74.0)
-    arm_length_cm = max(height_cm * 0.36, 45.0)
+    shoulder_width_cm = max(height_cm * 0.255, 30.0)
+    chest_cm = max(height_cm * 0.58, 72.0)
+    waist_cm = max(chest_cm * 0.84, 56.0)
+    hip_circumference_cm = max(max(waist_cm * 1.10, height_cm * 0.56), 74.0)
+    arm_length_cm = max(height_cm * 0.355, 45.0)
     leg_length_cm = max(height_cm * ANTHRO_LEG_RATIO, 62.0)
-    neck_cm = max(chest_cm * 0.36, 28.0)
-    hip_width_cm = max(hip_circumference_cm / (math.pi * 0.88), 30.0)
-    torso_depth_cm = max(waist_cm / (math.pi * 2.1), 14.0)
+    neck_cm = max(chest_cm * 0.38, 30.0)
+    hip_width_cm = max(hip_circumference_cm / (math.pi * 0.92), 30.0)
+    torso_depth_cm = max(waist_cm / (math.pi * 2.35), 12.5)
 
     return {
         "shoulder_width_cm": shoulder_width_cm,
@@ -364,16 +366,91 @@ def _fallback_measurements_from_height(height_cm: float) -> Dict[str, float]:
 def _height_based_measurement_ranges(height_cm: float) -> Dict[str, Tuple[float, float]]:
     h = max(float(height_cm), 120.0)
     return {
-        "shoulder_width_cm": (h * 0.17, h * 0.30),
-        "chest_cm": (h * 0.40, h * 0.68),
-        "waist_cm": (h * 0.34, h * 0.63),
-        "hip_width_cm": (h * 0.16, h * 0.33),
-        "hip_circumference_cm": (h * 0.43, h * 0.73),
-        "arm_length_cm": (h * 0.22, h * 0.43),
-        "leg_length_cm": (h * 0.40, h * 0.60),
-        "neck_cm": (h * 0.16, h * 0.28),
-        "torso_depth_cm": (h * 0.08, h * 0.20),
+        "shoulder_width_cm": (h * 0.21, h * 0.29),
+        "chest_cm": (h * 0.48, h * 0.62),
+        "waist_cm": (h * 0.40, h * 0.57),
+        "hip_width_cm": (h * 0.17, h * 0.28),
+        "hip_circumference_cm": (h * 0.50, h * 0.64),
+        "arm_length_cm": (h * 0.31, h * 0.41),
+        "leg_length_cm": (h * 0.43, h * 0.53),
+        "neck_cm": (h * 0.19, h * 0.25),
+        "torso_depth_cm": (h * 0.07, h * 0.14),
     }
+
+
+def _anthropometric_deviation_score(
+    measurements: Dict[str, float],
+    fallback: Dict[str, float],
+) -> float:
+    tracked_keys = (
+        "shoulder_width_cm",
+        "chest_cm",
+        "waist_cm",
+        "hip_circumference_cm",
+        "arm_length_cm",
+        "leg_length_cm",
+        "neck_cm",
+    )
+    deviations: List[float] = []
+    for key in tracked_keys:
+        baseline = max(float(fallback.get(key, 0.0)), 1e-6)
+        value = float(measurements.get(key, baseline) or baseline)
+        ratio = value / baseline
+        if ratio > 1.12:
+            deviations.append(ratio - 1.12)
+        elif ratio < 0.82:
+            deviations.append(0.82 - ratio)
+        else:
+            deviations.append(0.0)
+    return _clamp(_average(deviations) * 1.9, 0.0, 0.6)
+
+
+def _enforce_proportional_consistency(measurements: Dict[str, float], warnings: List[str]) -> None:
+    shoulder = float(measurements.get("shoulder_width_cm", 0.0) or 0.0)
+    chest = float(measurements.get("chest_cm", 0.0) or 0.0)
+    waist = float(measurements.get("waist_cm", 0.0) or 0.0)
+    hip_circ = float(measurements.get("hip_circumference_cm", 0.0) or 0.0)
+    neck = float(measurements.get("neck_cm", 0.0) or 0.0)
+
+    updated = False
+
+    if shoulder > 0.0 and chest > 0.0:
+        chest_min = shoulder * 1.85
+        chest_max = shoulder * 2.30
+        corrected = _clamp(chest, chest_min, chest_max)
+        if abs(corrected - chest) > 0.05:
+            measurements["chest_cm"] = corrected
+            chest = corrected
+            updated = True
+
+    if chest > 0.0 and waist > 0.0:
+        waist_min = chest * 0.70
+        waist_max = chest * 0.92
+        corrected = _clamp(waist, waist_min, waist_max)
+        if abs(corrected - waist) > 0.05:
+            measurements["waist_cm"] = corrected
+            waist = corrected
+            updated = True
+
+    if chest > 0.0 and hip_circ > 0.0:
+        hip_min = max(waist * 1.03 if waist > 0.0 else chest * 0.90, chest * 0.90)
+        hip_max = chest * 1.08
+        corrected = _clamp(hip_circ, hip_min, hip_max)
+        if abs(corrected - hip_circ) > 0.05:
+            measurements["hip_circumference_cm"] = corrected
+            hip_circ = corrected
+            updated = True
+
+    if shoulder > 0.0 and neck > 0.0:
+        neck_min = shoulder * 0.72
+        neck_max = shoulder * 0.92
+        corrected = _clamp(neck, neck_min, neck_max)
+        if abs(corrected - neck) > 0.05:
+            measurements["neck_cm"] = corrected
+            updated = True
+
+    if updated:
+        warnings.append("Body proportion consistency correction was applied.")
 
 
 def _stabilize_measurements_with_priors(
@@ -382,12 +459,14 @@ def _stabilize_measurements_with_priors(
     quality_score: float,
     warnings: List[str],
 ) -> None:
-    if quality_score >= 0.82:
-        return
-
     fallback = _fallback_measurements_from_height(height_cm)
     ranges = _height_based_measurement_ranges(height_cm)
-    blend = _clamp((0.82 - quality_score) / 0.52, 0.0, 0.55)
+    quality_blend = _clamp((0.90 - quality_score) / 0.56, 0.0, 0.50)
+    deviation_blend = _anthropometric_deviation_score(measurements, fallback)
+    blend = max(quality_blend, deviation_blend)
+
+    if blend <= 0.0:
+        return
 
     for key in RAW_METRIC_KEYS:
         current = float(measurements.get(key, fallback[key]) or fallback[key])
@@ -738,6 +817,56 @@ def _interpolated_anchors(landmarks: List[Any]) -> Dict[str, Tuple[float, float]
     }
 
 
+def _shoulder_span_normalized(landmarks: List[Any]) -> float:
+    if len(landmarks) <= 12:
+        return 0.0
+    left_x, _ = _get_xy(landmarks[11])
+    right_x, _ = _get_xy(landmarks[12])
+    return abs(float(left_x) - float(right_x))
+
+
+def _estimate_side_orientation(
+    front_landmarks: List[Any],
+    side_landmarks: List[Any],
+) -> Tuple[float, float, float]:
+    front_span = _shoulder_span_normalized(front_landmarks)
+    side_span = _shoulder_span_normalized(side_landmarks)
+
+    if front_span <= 1e-6 or side_span <= 0.0:
+        cos_theta = 0.12
+    else:
+        cos_theta = _clamp(side_span / front_span, 0.0, SIDE_ORIENTATION_MAX_COS)
+
+    sin_theta = math.sqrt(max(0.0, 1.0 - (cos_theta * cos_theta)))
+    sin_theta = max(sin_theta, SIDE_ORIENTATION_MIN_SIN)
+    return cos_theta, sin_theta, side_span
+
+
+def _perspective_corrected_depth(
+    observed_depth_px: float,
+    frontal_width_px: float,
+    fallback_depth_px: float,
+    side_turn_cos: float,
+    side_turn_sin: float,
+) -> float:
+    observed = float(observed_depth_px if observed_depth_px > 0.0 else fallback_depth_px)
+    if observed <= 0.0:
+        return 0.0
+
+    if frontal_width_px <= 0.0:
+        return observed
+
+    deprojected = (observed - (frontal_width_px * side_turn_cos)) / max(side_turn_sin, SIDE_ORIENTATION_MIN_SIN)
+    if not math.isfinite(deprojected) or deprojected <= 0.0:
+        deprojected = observed * 0.72
+
+    correction_strength = _clamp((side_turn_cos - 0.14) / 0.56, 0.0, 1.0)
+    corrected = (observed * (1.0 - correction_strength)) + (deprojected * correction_strength)
+
+    floor_value = fallback_depth_px * 0.58 if fallback_depth_px > 0.0 else 0.0
+    return max(float(corrected), float(floor_value))
+
+
 def _measurement_confidence_score(landmark_visibility_score: float, silhouette_quality_score: float, posture_score: float) -> float:
     return _clamp(
         (0.4 * landmark_visibility_score) + (0.4 * silhouette_quality_score) + (0.2 * posture_score),
@@ -822,15 +951,15 @@ def _metric_detail(
 
 def _validate_outliers(measurements: Dict[str, float], warnings: List[str]) -> None:
     ranges = {
-        "shoulder_width_cm": (28.0, 65.0),
-        "chest_cm": (60.0, 150.0),
-        "waist_cm": (45.0, 145.0),
-        "hip_width_cm": (28.0, 70.0),
-        "hip_circumference_cm": (70.0, 165.0),
+        "shoulder_width_cm": (28.0, 58.0),
+        "chest_cm": (60.0, 125.0),
+        "waist_cm": (45.0, 110.0),
+        "hip_width_cm": (28.0, 55.0),
+        "hip_circumference_cm": (70.0, 130.0),
         "arm_length_cm": (40.0, 90.0),
-        "leg_length_cm": (55.0, 130.0),
-        "neck_cm": (25.0, 55.0),
-        "torso_depth_cm": (12.0, 45.0),
+        "leg_length_cm": (55.0, 105.0),
+        "neck_cm": (25.0, 47.0),
+        "torso_depth_cm": (10.0, 28.0),
     }
 
     for key, (minimum, maximum) in ranges.items():
@@ -1028,7 +1157,7 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
             ]
         )
 
-        expected_shoulder_cm = height_cm * 0.25
+        expected_shoulder_cm = height_cm * ANTHRO_SHOULDER_RATIO
         contour_height_scale = height_cm / max(contour_height_px, 1.0)
         landmark_height_scale = height_cm / max(landmark_height_px, 1.0) if landmark_height_px > 0.0 else 0.0
         height_scale = contour_height_scale if contour_height_scale > 0.0 else landmark_height_scale
@@ -1092,7 +1221,7 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         )
 
         if chest_contour_px > 0.0 and shoulder_width_px > 0.0:
-            chest_width_px = (chest_contour_px * 0.7) + (shoulder_width_px * 0.3)
+            chest_width_px = (chest_contour_px * 0.55) + (shoulder_width_px * 0.45)
         elif chest_contour_px > 0.0:
             chest_width_px = chest_contour_px
         else:
@@ -1109,7 +1238,7 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         )
 
         if waist_contour_px > 0.0 and chest_width_px > 0.0:
-            waist_width_px = (waist_contour_px * 0.75) + ((chest_width_px * 0.85) * 0.25)
+            waist_width_px = (waist_contour_px * 0.64) + ((chest_width_px * 0.82) * 0.36)
         else:
             waist_width_px = max(waist_contour_px, chest_width_px * 0.84, hip_anchor_px * 0.9)
 
@@ -1124,9 +1253,16 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
         )
 
         if hip_contour_px > 0.0 and hip_anchor_px > 0.0:
-            hip_width_px = (hip_contour_px * 0.75) + (hip_anchor_px * 0.25)
+            hip_width_px = (hip_contour_px * 0.64) + (hip_anchor_px * 0.36)
         else:
             hip_width_px = max(hip_contour_px, hip_anchor_px)
+
+        if shoulder_width_px > 0.0 and chest_width_px > 0.0:
+            chest_width_px = min(chest_width_px, shoulder_width_px * 0.96)
+        if chest_width_px > 0.0 and waist_width_px > 0.0:
+            waist_width_px = min(waist_width_px, chest_width_px * 0.97)
+        if chest_width_px > 0.0 and hip_width_px > 0.0:
+            hip_width_px = min(hip_width_px, chest_width_px * 1.08)
 
         side_torso_depth_px = _average(
             [
@@ -1135,21 +1271,47 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
             ]
         ) * 0.42
 
+        side_turn_cos, side_turn_sin, side_shoulder_span = _estimate_side_orientation(front_landmarks_data, side_landmarks_data)
+        if side_shoulder_span > 0.0 and side_turn_cos > 0.45:
+            warnings.append("Side view was not fully 90 degrees; torso depth was perspective-corrected.")
+
         side_chest_depth_px, _, side_chest_sil = _view_width_estimate(side, chest_y)
         side_waist_depth_px, _, side_waist_sil = _view_width_estimate(side, waist_y)
         side_hip_depth_px, _, side_hip_sil = _view_width_estimate(side, hip_y)
         side_neck_depth_px, _, side_neck_sil = _view_width_estimate(side, neck_y)
 
-        chest_depth_px = side_chest_depth_px if side_chest_depth_px > 0.0 else max(side_torso_depth_px * 0.98, chest_width_px * 0.58)
-        waist_depth_px = side_waist_depth_px if side_waist_depth_px > 0.0 else max(side_torso_depth_px * 0.92, waist_width_px * 0.55)
-        hip_depth_px = side_hip_depth_px if side_hip_depth_px > 0.0 else max(side_torso_depth_px * 1.06, hip_width_px * 0.58)
+        chest_depth_fallback_px = max(side_torso_depth_px * 0.92, chest_width_px * 0.52)
+        waist_depth_fallback_px = max(side_torso_depth_px * 0.88, waist_width_px * 0.48)
+        hip_depth_fallback_px = max(side_torso_depth_px * 0.98, hip_width_px * 0.52)
+
+        chest_depth_px = _perspective_corrected_depth(
+            side_chest_depth_px,
+            chest_width_px,
+            chest_depth_fallback_px,
+            side_turn_cos,
+            side_turn_sin,
+        )
+        waist_depth_px = _perspective_corrected_depth(
+            side_waist_depth_px,
+            waist_width_px,
+            waist_depth_fallback_px,
+            side_turn_cos,
+            side_turn_sin,
+        )
+        hip_depth_px = _perspective_corrected_depth(
+            side_hip_depth_px,
+            hip_width_px,
+            hip_depth_fallback_px,
+            side_turn_cos,
+            side_turn_sin,
+        )
 
         if chest_width_px > 0.0:
-            chest_depth_px = _clamp(chest_depth_px, chest_width_px * 0.45, chest_width_px * 0.85)
+            chest_depth_px = _clamp(chest_depth_px, chest_width_px * 0.40, chest_width_px * 0.76)
         if waist_width_px > 0.0:
-            waist_depth_px = _clamp(waist_depth_px, waist_width_px * 0.45, waist_width_px * 0.82)
+            waist_depth_px = _clamp(waist_depth_px, waist_width_px * 0.38, waist_width_px * 0.72)
         if hip_width_px > 0.0:
-            hip_depth_px = _clamp(hip_depth_px, hip_width_px * 0.50, hip_width_px * 0.90)
+            hip_depth_px = _clamp(hip_depth_px, hip_width_px * 0.44, hip_width_px * 0.80)
 
         front_neck_width_px, front_neck_conf, front_neck_sil = _view_width_estimate(front, neck_y, (7, 8))
         back_neck_width_px, back_neck_conf, back_neck_sil = _view_width_estimate(back, neck_y, (7, 8))
@@ -1160,7 +1322,15 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
             ],
             fallback=max(front_neck_width_px, back_neck_width_px),
         )
-        neck_depth_px = side_neck_depth_px if side_neck_depth_px > 0.0 else max(side_torso_depth_px * 0.56, neck_width_px * 0.52)
+        neck_depth_px = _perspective_corrected_depth(
+            side_neck_depth_px,
+            neck_width_px,
+            max(side_torso_depth_px * 0.52, neck_width_px * 0.42),
+            side_turn_cos,
+            side_turn_sin,
+        )
+        if neck_width_px > 0.0:
+            neck_depth_px = _clamp(neck_depth_px, neck_width_px * 0.40, neck_width_px * 0.74)
 
         shoulder_width_cm = shoulder_width_px * pixel_to_cm
         chest_width_cm = chest_width_px * pixel_to_cm
@@ -1210,6 +1380,7 @@ def calculate_measurements(front_landmarks, side_landmarks, back_landmarks, heig
 
         _fill_missing_measurements(measurements, height_cm, warnings)
         _validate_outliers(measurements, warnings)
+        _enforce_proportional_consistency(measurements, warnings)
 
         if torso_ratio < 0.18:
             warnings.append("User appears far from camera; confidence reduced.")

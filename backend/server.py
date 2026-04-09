@@ -423,11 +423,16 @@ def _estimate_position_feedback(
 
     left_shoulder = landmarks[11]
     right_shoulder = landmarks[12]
+    left_wrist = landmarks[15] if len(landmarks) > 15 else {"x": 0.0, "y": 0.0}
+    right_wrist = landmarks[16] if len(landmarks) > 16 else {"x": 1.0, "y": 0.0}
     left_ankle = landmarks[27]
     right_ankle = landmarks[28]
     nose = landmarks[0]
 
     shoulder_mid_x = (float(left_shoulder.get("x", 0.0)) + float(right_shoulder.get("x", 0.0))) * 0.5
+    left_arm_spread = abs(float(left_wrist.get("x", 0.0)) - shoulder_mid_x)
+    right_arm_spread = abs(float(right_wrist.get("x", 1.0)) - shoulder_mid_x)
+    arm_spread = max(left_arm_spread, right_arm_spread)
     body_height = max(float(left_ankle.get("y", 0.0)), float(right_ankle.get("y", 0.0))) - float(nose.get("y", 0.0))
     image_height = float(view.get("image_height", 1.0) or 1.0)
     body_height_px = body_height * image_height
@@ -457,11 +462,18 @@ def _estimate_position_feedback(
     if shoulder_tilt > 0.08:
         return {"instruction": "Stand straight", "ready_to_capture": False, "quality_score": 0.35}
 
-    if view_name == "side" and shoulder_span > 0.20:
+    if view_name in {"front", "back"} and arm_spread > 0.31:
         return {
-            "instruction": "Turn 90° to your side",
+            "instruction": "Keep arms relaxed near torso",
             "ready_to_capture": False,
-            "quality_score": 0.35,
+            "quality_score": 0.30,
+        }
+
+    if view_name == "side" and shoulder_span > 0.16:
+        return {
+            "instruction": "Turn more sideways (about 90°)",
+            "ready_to_capture": False,
+            "quality_score": 0.28,
         }
 
     if pose_confidence < 0.45 and landmark_visibility < 0.40:

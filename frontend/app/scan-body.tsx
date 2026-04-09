@@ -15,7 +15,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Camera, useCameraDevice } from "react-native-vision-camera";
 import { DeviceMotion } from "expo-sensors";
 import { useRouter } from "expo-router";
-import Svg, { Circle, Line, Path as SvgPath } from "react-native-svg";
+import Svg, { Circle, Line, Path as SvgPath, Rect } from "react-native-svg";
 
 import { Colors, Fonts, Radius, Spacing } from "../src/utils/theme";
 
@@ -26,6 +26,7 @@ const LEVEL_BAR_TRAVEL = 80;
 const AUTO_CAPTURE_MIN_QUALITY = 0.62;
 const MIN_VISIBLE_LANDMARK_CONFIDENCE = 0.2;
 const OVERLAY_SMOOTHING_ALPHA = 0.62;
+const FIT_GUIDE_MIN_SCORE = 0.8;
 
 const { width: screenWidth, height: screenHeight } = Dimensions.get("window");
 
@@ -43,12 +44,20 @@ type SilhouettePoint = {
   y: number;
 };
 
+type FitGuideZone = {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+};
+
 type OverlayState = {
   landmarks: Landmark[];
   silhouette: SilhouettePoint[];
   instruction: string;
   readyToCapture: boolean;
   qualityScore: number;
+  fitScore: number;
   imageWidth: number;
   imageHeight: number;
 };
@@ -182,19 +191,25 @@ const CAPTURE_STEPS: Array<{ key: CaptureStep; title: string; hint: string }> = 
   {
     key: "front",
     title: "Step 1/3: Front",
-    hint: "Face camera, stand straight, keep full body visible.",
+    hint: "Face camera, stand straight, arms relaxed close to torso, stay inside frame box.",
   },
   {
     key: "side",
     title: "Step 2/3: Side",
-    hint: "Turn 90° sideways with your full body visible.",
+    hint: "Turn 90° sideways and keep full body inside the frame box.",
   },
   {
     key: "back",
     title: "Step 3/3: Back",
-    hint: "Turn your back to camera, keep shoulders level.",
+    hint: "Back to camera, shoulders level, arms close to body, stay inside frame box.",
   },
 ];
+
+const FIT_GUIDE_ZONES: Record<CaptureStep, FitGuideZone> = {
+  front: { left: 0.18, right: 0.82, top: 0.05, bottom: 0.96 },
+  side: { left: 0.24, right: 0.76, top: 0.05, bottom: 0.96 },
+  back: { left: 0.18, right: 0.82, top: 0.05, bottom: 0.96 },
+};
 
 const SKELETON_CONNECTIONS: Array<[number, number]> = [
   [11, 12],
@@ -210,6 +225,105 @@ const SKELETON_CONNECTIONS: Array<[number, number]> = [
   [24, 26],
   [26, 28],
 ];
+
+function getFitGuideZone(step?: CaptureStep): FitGuideZone {
+  if (!step) {
+    return FIT_GUIDE_ZONES.front;
+  }
+  return FIT_GUIDE_ZONES[step];
+}
+
+function projectNormalizedRect(
+  zone: FitGuideZone,
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number
+) {
+  const topLeft = projectNormalizedPoint(
+    { x: zone.left, y: zone.top },
+    sourceWidth,
+    sourceHeight,
+    targetWidth,
+    targetHeight
+  );
+  const bottomRight = projectNormalizedPoint(
+    { x: zone.right, y: zone.bottom },
+    sourceWidth,
+    sourceHeight,
+    targetWidth,
+    targetHeight
+  );
+
+  return {
+    x: Math.min(topLeft.x, bottomRight.x),
+    y: Math.min(topLeft.y, bottomRight.y),
+    width: Math.max(0, Math.abs(bottomRight.x - topLeft.x)),
+    height: Math.max(0, Math.abs(bottomRight.y - topLeft.y)),
+  };
+}
+
+function evaluateFitGuide(landmarks: Landmark[], zone: FitGuideZone): { score: number; fits: boolean; instruction?: string } {
+  if (!Array.isArray(landmarks) || landmarks.length < 29) {
+    return { score: 0, fits: false, instruction: "Move fully into frame box" };
+  }
+
+  const criticalPoints = [0, 11, 12, 23, 24, 27, 28];
+  const points = criticalPoints
+    .map((index) => landmarks[index])
+    .filter((point): point is Landmark => Boolean(point) && Number(point.visibility ?? 0) >= 0.2)
+    .map((point) => ({
+      x: clampUnit(Number(point.x ?? 0)),
+      y: clampUnit(Number(point.y ?? 0)),
+    }));
+
+  if (points.length < 4) {
+    return { score: 0, fits: false, instruction: "Hold steady in frame" };
+  }
+
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+
+  const insideRatio = points.filter(
+    (point) => point.x >= zone.left && point.x <= zone.right && point.y >= zone.top && point.y <= zone.bottom
+  ).length / points.length;
+
+  const centerX = (minX + maxX) * 0.5;
+  const centerY = (minY + maxY) * 0.5;
+  const zoneCenterX = (zone.left + zone.right) * 0.5;
+  const zoneCenterY = (zone.top + zone.bottom) * 0.5;
+
+  const centerScore =
+    clampUnit(1 - (Math.abs(centerX - zoneCenterX) / ((zone.right - zone.left) * 0.5 + 1e-6))) *
+    clampUnit(1 - (Math.abs(centerY - zoneCenterY) / ((zone.bottom - zone.top) * 0.5 + 1e-6)));
+
+  const marginLeft = clampUnit((minX - zone.left) / 0.06);
+  const marginRight = clampUnit((zone.right - maxX) / 0.06);
+  const marginTop = clampUnit((minY - zone.top) / 0.08);
+  const marginBottom = clampUnit((zone.bottom - maxY) / 0.06);
+  const containmentScore = Math.min(marginLeft, marginRight, marginTop, marginBottom);
+
+  const score = clampUnit((insideRatio * 0.62) + (centerScore * 0.20) + (containmentScore * 0.18));
+
+  if (minX < zone.left - 0.01) {
+    return { score, fits: false, instruction: "Move right inside frame box" };
+  }
+  if (maxX > zone.right + 0.01) {
+    return { score, fits: false, instruction: "Move left inside frame box" };
+  }
+  if (minY < zone.top - 0.01) {
+    return { score, fits: false, instruction: "Move back so head fits in frame" };
+  }
+  if (maxY > zone.bottom + 0.01) {
+    return { score, fits: false, instruction: "Move back so feet fit in frame" };
+  }
+
+  return { score, fits: score >= FIT_GUIDE_MIN_SCORE };
+}
 
 export default function ScanBody() {
   const router = useRouter();
@@ -249,6 +363,7 @@ export default function ScanBody() {
     instruction: "Align your body in frame",
     readyToCapture: false,
     qualityScore: 0,
+    fitScore: 0,
     imageWidth: screenWidth,
     imageHeight: screenHeight,
   });
@@ -374,6 +489,7 @@ export default function ScanBody() {
       countdown === null &&
       overlay.readyToCapture &&
       overlay.qualityScore >= AUTO_CAPTURE_MIN_QUALITY &&
+      overlay.fitScore >= FIT_GUIDE_MIN_SCORE &&
       stabilityFrames >= 2;
 
     if (canAutoCapture && !captureTriggered) {
@@ -399,7 +515,7 @@ export default function ScanBody() {
         setCaptureTriggered(false);
       }
     }
-  }, [phase, countdown, isDeviceLevel, overlay.readyToCapture, overlay.qualityScore, stabilityFrames, captureTriggered, gyroAssistEnabled]);
+  }, [phase, countdown, isDeviceLevel, overlay.readyToCapture, overlay.qualityScore, overlay.fitScore, stabilityFrames, captureTriggered, gyroAssistEnabled]);
 
   useEffect(() => {
     return () => {
@@ -419,6 +535,17 @@ export default function ScanBody() {
       previewSize.height
     );
   }, [overlay.silhouette, overlay.imageWidth, overlay.imageHeight, previewSize.width, previewSize.height]);
+
+  const fitGuideRect = useMemo(() => {
+    const zone = getFitGuideZone(currentStep?.key);
+    return projectNormalizedRect(
+      zone,
+      overlay.imageWidth,
+      overlay.imageHeight,
+      previewSize.width,
+      previewSize.height
+    );
+  }, [currentStep?.key, overlay.imageWidth, overlay.imageHeight, previewSize.width, previewSize.height]);
 
   const checkPosition = async () => {
     if (!cameraRef.current) return;
@@ -461,15 +588,20 @@ export default function ScanBody() {
       }
 
       const backendReady = Boolean(data.ready_to_capture);
-      const readyToCapture = backendReady && (!gyroAssistEnabled || isDeviceLevelRef.current);
       const qualityFromBackend = Number(data.quality_score || 0);
       const qualityPenalty = gyroAssistEnabled && !isDeviceLevelRef.current ? 0.04 : 0.0;
-      const stabilizedQuality = clampUnit(qualityFromBackend - qualityPenalty);
+      const landmarks = Array.isArray(data.landmarks) ? data.landmarks : [];
+      const fitZone = getFitGuideZone(currentStep.key);
+      const fitGuide = evaluateFitGuide(landmarks, fitZone);
+      const frameReady = fitGuide.fits;
+
+      const readyToCapture = backendReady && frameReady && (!gyroAssistEnabled || isDeviceLevelRef.current);
+      const fitPenalty = frameReady ? 0.0 : 0.09;
+      const stabilizedQuality = clampUnit(qualityFromBackend - qualityPenalty - fitPenalty);
       const uiQuality = readyToCapture
         ? clampUnit(Math.max(stabilizedQuality, AUTO_CAPTURE_MIN_QUALITY))
         : clampUnit((stabilizedQuality * 0.9) + 0.05);
 
-      const landmarks = Array.isArray(data.landmarks) ? data.landmarks : [];
       const silhouette = Array.isArray(data.silhouette) ? data.silhouette : [];
       const sourceWidth = Number(data.image_width);
       const sourceHeight = Number(data.image_height);
@@ -482,11 +614,14 @@ export default function ScanBody() {
         silhouette: smoothSilhouette(current.silhouette, silhouette, OVERLAY_SMOOTHING_ALPHA),
         instruction: readyToCapture
           ? "Good position"
+          : !frameReady
+            ? fitGuide.instruction || "Fit full body inside frame box"
           : (!gyroAssistEnabled || isDeviceLevelRef.current)
             ? data.instruction || "Adjust position"
             : "Slightly level phone for cleaner silhouette",
         readyToCapture,
         qualityScore: clampUnit((current.qualityScore * 0.35) + (uiQuality * 0.65)),
+        fitScore: clampUnit((current.fitScore * 0.35) + (fitGuide.score * 0.65)),
         imageWidth: normalizedSourceWidth,
         imageHeight: normalizedSourceHeight,
       }));
@@ -547,6 +682,7 @@ export default function ScanBody() {
           instruction: "Reposition for next view",
           readyToCapture: false,
           qualityScore: 0,
+          fitScore: 0,
           imageWidth: previewSize.width,
           imageHeight: previewSize.height,
         });
@@ -732,6 +868,7 @@ export default function ScanBody() {
       instruction: "Align your body in frame",
       readyToCapture: false,
       qualityScore: 0,
+      fitScore: 0,
       imageWidth: previewSize.width,
       imageHeight: previewSize.height,
     });
@@ -795,11 +932,14 @@ export default function ScanBody() {
   const captureGuidanceText =
     overlay.readyToCapture && overlay.qualityScore >= AUTO_CAPTURE_MIN_QUALITY
       ? "Great framing. Capturing soon..."
+      : overlay.fitScore < FIT_GUIDE_MIN_SCORE
+        ? "Fit full body inside the frame box."
       : (gyroAssistEnabled && !isDeviceLevel)
         ? "Body detected. Level phone slightly for best edges."
         : overlay.instruction;
   const overlaySourceWidth = overlay.imageWidth > 0 ? overlay.imageWidth : previewSize.width;
   const overlaySourceHeight = overlay.imageHeight > 0 ? overlay.imageHeight : previewSize.height;
+  const fitGuideReady = overlay.fitScore >= FIT_GUIDE_MIN_SCORE;
 
   if (!hasPermission) {
     return (
@@ -874,6 +1014,18 @@ export default function ScanBody() {
         )}
 
         <Svg style={StyleSheet.absoluteFill}>
+        <Rect
+          x={fitGuideRect.x}
+          y={fitGuideRect.y}
+          width={fitGuideRect.width}
+          height={fitGuideRect.height}
+          rx={24}
+          ry={24}
+          fill={fitGuideReady ? "rgba(16, 185, 129, 0.05)" : "rgba(56, 189, 248, 0.04)"}
+          stroke={fitGuideReady ? "rgba(74, 222, 128, 0.95)" : "rgba(56, 189, 248, 0.95)"}
+          strokeWidth={2.2}
+          strokeDasharray="10 8"
+        />
         {silhouettePath ? (
           <SvgPath
             d={silhouettePath}
@@ -1027,6 +1179,9 @@ export default function ScanBody() {
                 {captureGuidanceText}
               </Text>
               <Text style={styles.qualityText}>Quality {(overlay.qualityScore * 100).toFixed(0)}%</Text>
+              <Text style={[styles.fitGuideText, fitGuideReady ? styles.fitGuideTextReady : null]}>
+                Framing {(overlay.fitScore * 100).toFixed(0)}%
+              </Text>
               {countdown !== null ? <Text style={styles.countdownText}>{countdown}</Text> : null}
             </Animated.View>
 
@@ -1337,6 +1492,15 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.ui,
     color: "rgba(255,255,255,0.84)",
     fontSize: 13,
+  },
+  fitGuideText: {
+    marginTop: 2,
+    fontFamily: Fonts.ui,
+    color: "rgba(125, 211, 252, 0.92)",
+    fontSize: 12,
+  },
+  fitGuideTextReady: {
+    color: "rgba(134, 239, 172, 0.92)",
   },
   countdownText: {
     marginTop: 4,
