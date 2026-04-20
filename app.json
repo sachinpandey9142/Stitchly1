@@ -1,5 +1,10 @@
 {
   "android": {
     "package": "com.pandey_sachin11.stitchly1"
+  },
+  "extra": {
+    "eas": {
+      "projectId": "e3d3b423-0995-4fbf-bc45-286e3e8402a2"
+    }
   }
 }
