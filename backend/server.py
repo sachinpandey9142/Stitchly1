@@ -275,7 +275,7 @@ def _aggregate_measurement_candidates(candidates: List[dict]) -> dict:
     for key in MEASUREMENT_NUMERIC_KEYS:
         values = [float(candidate.get(key, 0.0)) for candidate in candidates if candidate.get(key) is not None]
         if values:
-            merged[key] = round(float(np.mean(_without_outliers(values))), 2)
+            merged[key] = round(float(np.median(_without_outliers(values))), 2)
 
     measurement_keys = set()
     for candidate in candidates:
@@ -289,7 +289,7 @@ def _aggregate_measurement_candidates(candidates: List[dict]) -> dict:
                 if (candidate.get("measurements") or {}).get(key) is not None
             ]
             if values:
-                merged["measurements"][key] = round(float(np.mean(_without_outliers(values))), 2)
+                merged["measurements"][key] = round(float(np.median(_without_outliers(values))), 2)
 
     confidence_keys = set()
     for candidate in candidates:

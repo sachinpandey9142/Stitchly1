@@ -267,7 +267,7 @@ export default function CustomerHome() {
           </View>
           <View>
             <Text style={styles.tryOnTitle}>✨ AI Try-On</Text>
-            <Text style={styles.tryOnSubtitle}>See outfits on you in real time</Text>
+            <Text style={styles.tryOnSubtitle}>Live outfit preview with guided framing</Text>
           </View>
         </View>
         <Feather name="chevron-right" size={18} color={Colors.primary} />

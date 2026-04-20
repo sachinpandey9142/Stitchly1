@@ -29,12 +29,97 @@ import {
 const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL || '';
 const DEFAULT_HEIGHT_CM = 170;
 const DETECTION_INTERVAL_MS = 320;
+const FIT_GUIDE_MIN_SCORE = 0.78;
+
+type FitGuideZone = {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+};
+
+const FIT_GUIDE_ZONE: FitGuideZone = {
+  left: 0.18,
+  right: 0.82,
+  top: 0.06,
+  bottom: 0.95,
+};
 
 type OutfitOption = {
   key: string;
   label: string;
   source: ImageSourcePropType;
 };
+
+function clampUnit(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function evaluateFitGuide(
+  landmarks: PoseLandmark[] | null,
+  zone: FitGuideZone
+): { score: number; fits: boolean; instruction?: string } {
+  if (!Array.isArray(landmarks) || landmarks.length < 29) {
+    return { score: 0, fits: false, instruction: 'Move fully into guide box' };
+  }
+
+  const criticalPoints = [0, 11, 12, 23, 24, 27, 28];
+  const points = criticalPoints
+    .map((index) => landmarks[index])
+    .filter((point): point is PoseLandmark => Boolean(point) && Number(point.visibility ?? 0) >= 0.2)
+    .map((point) => ({
+      x: clampUnit(Number(point.x ?? 0)),
+      y: clampUnit(Number(point.y ?? 0)),
+    }));
+
+  if (points.length < 4) {
+    return { score: 0, fits: false, instruction: 'Hold steady in guide box' };
+  }
+
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+
+  const insideRatio =
+    points.filter(
+      (point) => point.x >= zone.left && point.x <= zone.right && point.y >= zone.top && point.y <= zone.bottom
+    ).length / points.length;
+
+  const centerX = (minX + maxX) * 0.5;
+  const centerY = (minY + maxY) * 0.5;
+  const zoneCenterX = (zone.left + zone.right) * 0.5;
+  const zoneCenterY = (zone.top + zone.bottom) * 0.5;
+
+  const centerScore =
+    clampUnit(1 - (Math.abs(centerX - zoneCenterX) / ((zone.right - zone.left) * 0.5 + 1e-6))) *
+    clampUnit(1 - (Math.abs(centerY - zoneCenterY) / ((zone.bottom - zone.top) * 0.5 + 1e-6)));
+
+  const marginLeft = clampUnit((minX - zone.left) / 0.06);
+  const marginRight = clampUnit((zone.right - maxX) / 0.06);
+  const marginTop = clampUnit((minY - zone.top) / 0.08);
+  const marginBottom = clampUnit((zone.bottom - maxY) / 0.06);
+  const containmentScore = Math.min(marginLeft, marginRight, marginTop, marginBottom);
+
+  const score = clampUnit((insideRatio * 0.62) + (centerScore * 0.2) + (containmentScore * 0.18));
+
+  if (minX < zone.left - 0.01) {
+    return { score, fits: false, instruction: 'Move right inside guide box' };
+  }
+  if (maxX > zone.right + 0.01) {
+    return { score, fits: false, instruction: 'Move left inside guide box' };
+  }
+  if (minY < zone.top - 0.01) {
+    return { score, fits: false, instruction: 'Move back so head fits' };
+  }
+  if (maxY > zone.bottom + 0.01) {
+    return { score, fits: false, instruction: 'Move back so feet fit' };
+  }
+
+  return { score, fits: score >= FIT_GUIDE_MIN_SCORE };
+}
 
 const OUTFIT_OPTIONS: OutfitOption[] = [
   {
@@ -83,7 +168,8 @@ export default function AiTryOnScreen() {
   const [selectedOutfit, setSelectedOutfit] = useState<OutfitOption>(OUTFIT_OPTIONS[0]);
   const [overlayRect, setOverlayRect] = useState<OverlayRect | null>(null);
   const [frameSize, setFrameSize] = useState({ width: 0, height: 0 });
-  const [statusMessage, setStatusMessage] = useState('Stand in frame');
+  const [statusMessage, setStatusMessage] = useState('Fit full body inside guide box');
+  const [fitScore, setFitScore] = useState(0);
 
   const [capturedPhotoUri, setCapturedPhotoUri] = useState<string | null>(null);
   const [captureBusy, setCaptureBusy] = useState(false);
@@ -128,6 +214,7 @@ export default function AiTryOnScreen() {
   const resetTrackingState = useCallback(() => {
     setLandmarks(null);
     setOverlayRect(null);
+    setFitScore(0);
     smoothedRectRef.current = null;
   }, []);
 
@@ -165,7 +252,7 @@ export default function AiTryOnScreen() {
       const data = await response.json();
       if (!response.ok || data?.error) {
         resetTrackingState();
-        setStatusMessage('Stand in frame');
+        setStatusMessage('Fit full body inside guide box');
         return;
       }
 
@@ -173,13 +260,16 @@ export default function AiTryOnScreen() {
       const nextSilhouette = Array.isArray(data?.silhouette)
         ? (data.silhouette as PoseSilhouettePoint[])
         : undefined;
+      const fitGuide = evaluateFitGuide(nextLandmarks, FIT_GUIDE_ZONE);
+
+      setFitScore((current) => clampUnit((current * 0.35) + (fitGuide.score * 0.65)));
       setLandmarks(nextLandmarks);
 
       const anchors = extractTryOnAnchors(nextLandmarks);
       if (!anchors) {
         setOverlayRect(null);
         smoothedRectRef.current = null;
-        setStatusMessage('Stand in frame');
+        setStatusMessage(fitGuide.instruction || 'Fit full body inside guide box');
         return;
       }
 
@@ -194,10 +284,10 @@ export default function AiTryOnScreen() {
 
       smoothedRectRef.current = smoothedRect;
       setOverlayRect(smoothedRect);
-      setStatusMessage('Tracking body');
+      setStatusMessage(fitGuide.fits ? 'Tracking body' : fitGuide.instruction || 'Fit full body inside guide box');
     } catch {
       resetTrackingState();
-      setStatusMessage('Stand in frame');
+      setStatusMessage('Fit full body inside guide box');
     } finally {
       detectionBusyRef.current = false;
     }
@@ -243,7 +333,7 @@ export default function AiTryOnScreen() {
 
   const handleRetake = useCallback(() => {
     setCapturedPhotoUri(null);
-    setStatusMessage('Stand in frame');
+    setStatusMessage('Fit full body inside guide box');
     resetTrackingState();
   }, [resetTrackingState]);
 
@@ -253,10 +343,13 @@ export default function AiTryOnScreen() {
     }
 
     setCapturedPhotoUri(null);
-    setStatusMessage('Stand in frame');
+    setStatusMessage('Fit full body inside guide box');
     resetTrackingState();
     setCameraFacing((current) => (current === 'front' ? 'back' : 'front'));
   }, [canToggleCamera, captureBusy, resetTrackingState]);
+
+  const fitGuideReady = fitScore >= FIT_GUIDE_MIN_SCORE;
+  const captureEnabled = Boolean(device && overlayRect && fitGuideReady && !captureBusy);
 
   if (!permissionResolved) {
     return (
@@ -323,6 +416,11 @@ export default function AiTryOnScreen() {
           />
         ) : null}
 
+        <View
+          pointerEvents="none"
+          style={[styles.fitGuideFrame, fitGuideReady && styles.fitGuideFrameReady]}
+        />
+
         <View style={styles.topBar}>
           <View style={styles.topBarLeft}>
             <Pressable style={styles.iconButton} onPress={() => router.back()}>
@@ -339,16 +437,17 @@ export default function AiTryOnScreen() {
           </View>
 
           <View style={styles.statusPill}>
-            <Text style={styles.statusPillText}>
-              {overlayRect ? 'Tracking body' : statusMessage} {'  '}•{'  '}
+            <Text style={styles.statusPillText}>{overlayRect && fitGuideReady ? 'Tracking body' : statusMessage}</Text>
+            <Text style={styles.statusPillMeta}>
+              Framing {Math.round(fitScore * 100)}% {'  '}•{'  '}
               {device?.position === 'back' ? 'Back Cam' : 'Front Cam'}
             </Text>
           </View>
         </View>
 
-        {!overlayRect ? (
+        {!overlayRect || !fitGuideReady ? (
           <View style={styles.standInFrameHint}>
-            <Text style={styles.standInFrameText}>Stand in frame</Text>
+            <Text style={styles.standInFrameText}>Fit full body inside guide box</Text>
           </View>
         ) : null}
       </View>
@@ -394,16 +493,16 @@ export default function AiTryOnScreen() {
             </>
           ) : (
             <Pressable
-              style={styles.captureButtonOuter}
+              style={[styles.captureButtonOuter, !captureEnabled && styles.captureButtonOuterDisabled]}
               onPress={() => {
                 void handleCapture();
               }}
-              disabled={captureBusy || !device}
+              disabled={!captureEnabled}
             >
               {captureBusy ? (
                 <ActivityIndicator color={Colors.primary} />
               ) : (
-                <View style={styles.captureButtonInner} />
+                <View style={[styles.captureButtonInner, !captureEnabled && styles.captureButtonInnerDisabled]} />
               )}
             </Pressable>
           )}
@@ -496,6 +595,29 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.bodyBold,
     fontSize: 12,
     color: Colors.textInverted,
+  },
+  statusPillMeta: {
+    marginTop: 2,
+    fontFamily: Fonts.ui,
+    fontSize: 11,
+    color: Colors.textInverted,
+    opacity: 0.92,
+  },
+  fitGuideFrame: {
+    position: 'absolute',
+    left: '18%',
+    right: '18%',
+    top: '6%',
+    bottom: '5%',
+    borderRadius: 24,
+    borderWidth: 2,
+    borderColor: 'rgba(56, 189, 248, 0.95)',
+    borderStyle: 'dashed',
+    backgroundColor: 'rgba(56, 189, 248, 0.04)',
+  },
+  fitGuideFrameReady: {
+    borderColor: 'rgba(74, 222, 128, 0.95)',
+    backgroundColor: 'rgba(74, 222, 128, 0.06)',
   },
   standInFrameHint: {
     position: 'absolute',
@@ -590,11 +712,18 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  captureButtonOuterDisabled: {
+    borderColor: Colors.border,
+    opacity: 0.72,
+  },
   captureButtonInner: {
     width: 50,
     height: 50,
     borderRadius: Radius.full,
     backgroundColor: Colors.primary,
+  },
+  captureButtonInnerDisabled: {
+    backgroundColor: Colors.border,
   },
   secondaryAction: {
     flex: 1,

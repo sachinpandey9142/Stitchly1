@@ -492,24 +492,24 @@ def _apply_final_measurement_bias_correction(
     adjusted = False
 
     if shoulder > 0.0 and chest > 0.0:
-        shoulder_target = (chest / 2.10) * 0.6 + (height_cm * 0.255) * 0.4
-        corrected_shoulder = _clamp(shoulder, shoulder_target * 0.92, shoulder_target * 1.10)
+        shoulder_target = (chest / 2.24) * 0.5 + (height_cm * 0.248) * 0.5
+        corrected_shoulder = _clamp(shoulder, shoulder_target * 0.95, shoulder_target * 1.05)
         if abs(corrected_shoulder - shoulder) > 0.05:
             measurements["shoulder_width_cm"] = corrected_shoulder
             shoulder = corrected_shoulder
             adjusted = True
 
     if arm > 0.0:
-        arm_target = (height_cm * 0.355) * 0.72 + (max(shoulder, 1.0) * 1.30) * 0.28
-        corrected_arm = _clamp((arm * 0.78) + (arm_target * 0.22), height_cm * 0.33, height_cm * 0.38)
+        arm_target = (height_cm * 0.355) * 0.82 + (max(shoulder, 1.0) * 1.24) * 0.18
+        corrected_arm = _clamp((arm * 0.62) + (arm_target * 0.38), height_cm * 0.34, height_cm * 0.365)
         if abs(corrected_arm - arm) > 0.05:
             measurements["arm_length_cm"] = corrected_arm
             adjusted = True
 
     if leg > 0.0:
         # Raw hip-knee-ankle path tends to approximate outseam; normalize to inseam-like estimate.
-        inseam_estimate = leg * 0.90
-        corrected_leg = _clamp(inseam_estimate, height_cm * 0.44, height_cm * 0.49)
+        inseam_estimate = leg * 0.88
+        corrected_leg = _clamp(inseam_estimate, height_cm * 0.445, height_cm * 0.47)
         if abs(corrected_leg - leg) > 0.05:
             measurements["leg_length_cm"] = corrected_leg
             adjusted = True
