@@ -9,17 +9,28 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.stitchly.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Stitchly needs access to your camera to take measurements."
+      }
     },
     "android": {
-  "package": "com.stitchly.app",
-  "permissions": ["CAMERA"],
-  "adaptiveIcon": {
-    "foregroundImage": "./assets/images/adaptive-icon.png",
-    "backgroundColor": "#000"
-  },
-  "edgeToEdgeEnabled": true
-},
+      "package": "com.stitchly.app",
+      "versionCode": 1,
+      "permissions": [
+        "CAMERA",
+        "INTERNET",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "android.permission.CAMERA"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "backgroundColor": "#000000"
+      },
+      "edgeToEdgeEnabled": true
+    },
     "web": {
       "bundler": "metro",
       "output": "static",
@@ -33,13 +44,21 @@
           "image": "./assets/images/splash-image.png",
           "imageWidth": 200,
           "resizeMode": "contain",
-          "backgroundColor": "#000"
+          "backgroundColor": "#000000"
         }
       ],
-      "react-native-vision-camera"
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Stitchly needs access to your camera to take measurements."
+        }
+      ]
     ],
     "extra": {
-      "router": {}
+      "router": {},
+      "eas": {
+        "projectId": "352b90ea-32ac-41fc-92f9-36118a34fb29"
+      }
     }
   }
 }
