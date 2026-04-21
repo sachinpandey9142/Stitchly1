@@ -2,7 +2,6 @@
 
 # IDE and editors
 .idea/
-.vscode/
 
 # Dependencies
 node_modules/
@@ -91,8 +90,6 @@ env/
 ENV/
 
 # Environment variables
-.env
-.env.*
 
 # Temporary files
 temp/
@@ -118,3 +115,4 @@ desktop.ini
 # pytest cache
 .pytest_cache/
 pytest-cache-files-*
+config.bat
