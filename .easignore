@@ -1,5 +1,18 @@
+# Ignore local native folders (EAS will recreate them)
+/android
+/ios
+
+# Ignore heavy dependencies and caches
+node_modules/
+.expo/
+.gradle/
+.idea/
+
+# Ignore Python/Testing junk
 pytest-cache-files-*
-.pytest_cache
-__pycache__
-node_modules
-.expo
+.pytest_cache/
+__pycache__/
+
+# Ignore build artifacts
+*.aab
+*.apk
