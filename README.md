@@ -80,13 +80,13 @@ Stitchly provides a seamless end-to-end platform connecting all stakeholders thr
 
 ```mermaid
 flowchart TD
-    A[Customer] -->|1. Interactive Guided Camera Capture| B(AI Body Scanner Engine)
-    B -->|2. Multi-View Pose Estimation & Fitting| C(3D Body Mesh & Garment Measurements)
-    C -->|3. Order Placement + Measurement Spec| D[Tailor Marketplace]
-    D -->|4. Auto-Assign Logistics| E[Delivery Partner]
-    E -->|5. Fabric Pickup from Customer| D
-    D -->|6. Garment Stitching & Quality Check| E
-    E -->|7. Doorstep Garment Delivery| A
+    A["Customer"] -->|"1. Interactive Guided Camera Capture"| B["AI Body Scanner Engine"]
+    B -->|"2. Multi-View Pose Estimation & Fitting"| C["3D Body Mesh & Garment Measurements"]
+    C -->|"3. Order Placement + Measurement Spec"| D["Tailor Marketplace"]
+    D -->|"4. Auto-Assign Logistics"| E["Delivery Partner"]
+    E -->|"5. Fabric Pickup from Customer"| D
+    D -->|"6. Garment Stitching & Quality Check"| E
+    E -->|"7. Doorstep Garment Delivery"| A
 ```
 
 ### Complete End-to-End Workflow
@@ -300,45 +300,44 @@ Stitchly follows a modern decoupled architecture separating presentation layer, 
 
 ```mermaid
 graph TB
-    subgraph Mobile Client (Expo / React Native)
-        UI[Expo Router UI Layer]
-        Cam[Vision Camera Module]
-        Map[Google Maps SDK Module]
-        WV[Razorpay WebView]
-        Storage[AsyncStorage Local Auth]
+    subgraph MobileClient ["Mobile Client (Expo / React Native)"]
+        UI["Expo Router UI Layer"]
+        Cam["Vision Camera Module"]
+        Map["Google Maps SDK Module"]
+        WV["Razorpay WebView"]
+        Storage["AsyncStorage Local Auth"]
     end
 
-    subgraph Backend Infrastructure (FastAPI Engine)
-        Router[API Gateway / Routers]
-        AuthModule[JWT & Bcrypt Security]
-        OrderEngine[Order Lifecycle Manager]
-        PayModule[Razorpay HMAC Payment Service]
+    subgraph BackendInfra ["Backend Infrastructure (FastAPI Engine)"]
+        Router["API Gateway / Routers"]
+        AuthModule["JWT & Bcrypt Security"]
+        OrderEngine["Order Lifecycle Manager"]
+        PayModule["Razorpay HMAC Payment Service"]
     end
 
-    subgraph AI Computer Vision Core
-        MP[MediaPipe Pose Estimator]
-        Smooth[Sliding Buffer & EMA]
-        Calc[Ramanujan Measurement Engine]
-        Mesh[SMPL-X / Trimesh 3D Generator]
+    subgraph AICore ["AI Computer Vision Core"]
+        MP["MediaPipe Pose Estimator"]
+        Smooth["Sliding Buffer & EMA"]
+        Calc["Ramanujan Measurement Engine"]
+        Mesh["SMPL-X / Trimesh 3D Generator"]
     end
 
-    subgraph Persistence Layer
-        Mongo[(MongoDB Motor Async)]
-        Disk[(Local Staging / Output Filesystem)]
+    subgraph Persistence ["Persistence Layer"]
+        Mongo[("MongoDB Motor Async")]
+        Disk[("Local Staging / Output Filesystem")]
     end
 
-    UI -->|HTTP / REST| Router
-    Cam -->|Image Streams| Router
-    Map -->|Geospatial Queries| Router
-    WV -->|PostMessage Events| UI
+    UI -->|"HTTP / REST"| Router
+    Cam -->|"Image Streams"| Router
+    Map -->|"Geospatial Queries"| Router
+    WV -->|"PostMessage Events"| UI
     Storage --> UI
 
     Router --> AuthModule
     Router --> OrderEngine
     Router --> PayModule
-    Router --> AI Computer Vision Core
+    Router --> MP
 
-    AI Computer Vision Core --> MP
     MP --> Smooth
     Smooth --> Calc
     Calc --> Mesh
@@ -499,13 +498,13 @@ erDiagram
         string email UK
         string password_hash
         string name
-        string role "customer | tailor | delivery | admin"
+        string role
         string city
         string pincode
         string address
         float rating
         int rating_count
-        string status "active | pending | blocked"
+        string status
         array specialities
         object working_hours
     }
@@ -526,8 +525,8 @@ erDiagram
         string service_type
         float price
         float commission_amount
-        string status "11 lifecycle states"
-        string payment_status "pending | completed | cod | failed"
+        string status
+        string payment_status
         string razorpay_order_id
         string razorpay_payment_id
     }
@@ -545,7 +544,7 @@ erDiagram
         string id PK
         string tailor_id FK
         float amount
-        string status "pending | approved"
+        string status
     }
 
     BODY_SCANS {
